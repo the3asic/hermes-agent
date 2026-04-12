@@ -6,7 +6,7 @@ Built-in TTS providers:
 - Edge TTS (default, free, no API key): Microsoft Edge neural voices
 - ElevenLabs (premium): High-quality voices, needs ELEVENLABS_API_KEY
 - OpenAI TTS: Good quality, needs OPENAI_API_KEY
-- MiniMax TTS: High-quality with voice cloning, needs MINIMAX_API_KEY
+- MiniMax TTS: High-quality with voice cloning, needs MINIMAX_API_KEY or MINIMAX_CN_API_KEY
 - Mistral (Voxtral TTS): Multilingual, native Opus, needs MISTRAL_API_KEY
 - Google Gemini TTS: Controllable, 30 prebuilt voices, needs GEMINI_API_KEY
 - xAI TTS: Grok voices, uses xAI Grok OAuth credentials or XAI_API_KEY
@@ -360,6 +360,39 @@ def _get_provider(tts_config: Dict[str, Any]) -> str:
     ``hermes tools``); otherwise the historical Edge backend remains active.
     """
     return (tts_config.get("provider") or DEFAULT_PROVIDER).lower().strip()
+
+
+def _resolve_minimax_tts_api_key() -> str:
+    """Resolve MiniMax TTS API key, supporting both global and CN env vars."""
+    return (
+        (get_env_value("MINIMAX_API_KEY") or "").strip()
+        or (get_env_value("MINIMAX_CN_API_KEY") or "").strip()
+    )
+
+
+def _normalize_minimax_tts_base_url(base_url: str) -> str:
+    """Normalize a MiniMax base URL to the concrete TTS endpoint."""
+    normalized = (base_url or "").strip().rstrip("/")
+    if not normalized:
+        return DEFAULT_MINIMAX_BASE_URL
+    base, separator, query = normalized.partition("?")
+    if not base.endswith("/t2a_v2"):
+        base = f"{base.rstrip('/')}/t2a_v2"
+    return f"{base}{separator}{query}" if separator else base
+
+
+def _resolve_minimax_tts_base_url(tts_config: Dict[str, Any]) -> str:
+    """Resolve MiniMax TTS endpoint, honoring explicit config and CN env overrides."""
+    mm_config = tts_config.get("minimax", {})
+    configured = (mm_config.get("base_url") or "").strip()
+    if configured:
+        return _normalize_minimax_tts_base_url(configured)
+
+    cn_base = (get_env_value("MINIMAX_CN_BASE_URL") or "").strip()
+    if cn_base:
+        return _normalize_minimax_tts_base_url(cn_base)
+
+    return DEFAULT_MINIMAX_BASE_URL
 
 
 # ===========================================================================
@@ -1436,14 +1469,17 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any
     """
     import requests
 
-    api_key = (get_env_value("MINIMAX_API_KEY") or "")
+    api_key = _resolve_minimax_tts_api_key()
     if not api_key:
-        raise ValueError("MINIMAX_API_KEY not set. Get one at https://platform.minimax.io/")
+        raise ValueError(
+            "MINIMAX_API_KEY / MINIMAX_CN_API_KEY not set. "
+            "Get one at https://platform.minimax.io/ or https://www.minimaxi.com/"
+        )
 
     mm_config = tts_config.get("minimax", {})
     model = mm_config.get("model", DEFAULT_MINIMAX_MODEL)
     voice_id = mm_config.get("voice_id", DEFAULT_MINIMAX_VOICE_ID)
-    base_url = mm_config.get("base_url", DEFAULT_MINIMAX_BASE_URL)
+    base_url = _resolve_minimax_tts_base_url(tts_config)
     speed = mm_config.get("speed", 1.0)
     vol = mm_config.get("vol", 1.0)
     pitch = mm_config.get("pitch", 0)
@@ -2645,7 +2681,7 @@ def check_tts_requirements() -> bool:
             return False
         return bool(get_env_value("DEEPINFRA_API_KEY"))
     if provider == "minimax":
-        return bool(get_env_value("MINIMAX_API_KEY"))
+        return bool(_resolve_minimax_tts_api_key())
     if provider == "xai":
         try:
             from tools.xai_http import resolve_xai_http_credentials
@@ -2981,7 +3017,10 @@ if __name__ == "__main__":
         "    API Key:  "
         f"{'set' if resolve_openai_audio_api_key() else 'not set (VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY)'}"
     )
-    print(f"  MiniMax:    {'API key set' if get_env_value('MINIMAX_API_KEY') else 'not set (MINIMAX_API_KEY)'}")
+    print(
+        "  MiniMax:    "
+        f"{'API key set' if _resolve_minimax_tts_api_key() else 'not set (MINIMAX_API_KEY or MINIMAX_CN_API_KEY)'}"
+    )
     print(f"  Piper:      {'installed' if _check_piper_available() else 'not installed (pip install piper-tts)'}")
     print(f"  ffmpeg:     {'✅ found' if _has_ffmpeg() else '❌ not found (needed for Telegram Opus)'}")
     print(f"\n  Output dir: {DEFAULT_OUTPUT_DIR}")
