@@ -944,6 +944,56 @@ def test_discord_auto_thread_config_bridge(monkeypatch, tmp_path):
     assert os.getenv("DISCORD_AUTO_THREAD") == "true"
 
 
+def test_discord_slash_echo_extra_config_bridge(monkeypatch, tmp_path):
+    """platforms.discord.extra.slash_echo should also reach the adapter env bridge."""
+    import os
+    import yaml
+    from pathlib import Path
+
+    hermes_dir = tmp_path / ".hermes"
+    hermes_dir.mkdir()
+    config_path = hermes_dir / "config.yaml"
+    config_path.write_text(yaml.dump({
+        "platforms": {"discord": {"extra": {"slash_echo": "all"}}},
+    }))
+
+    monkeypatch.delenv("HERMES_DISCORD_SLASH_ECHO", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_dir))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    from gateway.config import load_gateway_config
+    load_gateway_config()
+
+    assert os.getenv("HERMES_DISCORD_SLASH_ECHO") == "all"
+
+
+def test_discord_history_backfill_free_response_config_bridge(monkeypatch, tmp_path):
+    """discord.history_backfill_free_response must reach the adapter runtime.
+
+    The adapter reads this flag from DISCORD_HISTORY_BACKFILL_FREE_RESPONSE
+    unless tests seed config.extra directly, so the real config.yaml path needs
+    its own bridge coverage.
+    """
+    import os
+    import yaml
+    from pathlib import Path
+
+    hermes_dir = tmp_path / ".hermes"
+    hermes_dir.mkdir()
+    (hermes_dir / "config.yaml").write_text(yaml.dump({
+        "discord": {"history_backfill_free_response": True},
+    }))
+
+    monkeypatch.delenv("DISCORD_HISTORY_BACKFILL_FREE_RESPONSE", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_dir))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    from gateway.config import load_gateway_config
+    load_gateway_config()
+
+    assert os.getenv("DISCORD_HISTORY_BACKFILL_FREE_RESPONSE") == "true"
+
+
 # ------------------------------------------------------------------
 # /skill command registration (flat + autocomplete)
 # ------------------------------------------------------------------
@@ -1022,10 +1072,10 @@ def test_register_skill_command_callback_dispatches_by_name(adapter):
     assert skill_cmd.callback is not None
 
     # Stub out _run_simple_slash so we can verify the dispatched text.
-    dispatched: list[str] = []
+    dispatched: list[tuple[str, str | None]] = []
 
-    async def fake_run(_interaction, text):
-        dispatched.append(text)
+    async def fake_run(_interaction, text, **kwargs):
+        dispatched.append((text, kwargs.get("echo_text")))
 
     adapter._run_simple_slash = fake_run
 
@@ -1037,7 +1087,10 @@ def test_register_skill_command_callback_dispatches_by_name(adapter):
     # dogfood with args
     asyncio.run(skill_cmd.callback(fake_interaction, name="dogfood", args="my test"))
 
-    assert dispatched == ["/gif-search", "/dogfood my test"]
+    assert dispatched == [
+        ("/gif-search", "/skill gif-search"),
+        ("/dogfood my test", "/skill dogfood my test"),
+    ]
 
 
 def test_register_skill_command_handles_unknown_skill_gracefully(adapter):
@@ -1145,3 +1198,144 @@ def test_register_skill_command_autocomplete_filters_by_name_and_description(ada
     # (covered in other tests). The autocomplete filter itself is exercised
     # via direct function call in the real-discord integration path.
     assert skill_cmd.callback is not None
+
+
+# ------------------------------------------------------------------
+# Discord native slash echo — visible task command anchors
+# ------------------------------------------------------------------
+
+
+def test_slash_echo_mode_defaults_off(adapter, monkeypatch):
+    monkeypatch.delenv("HERMES_DISCORD_SLASH_ECHO", raising=False)
+    adapter.config.extra.pop("slash_echo", None)
+
+    assert adapter._resolve_slash_echo_mode() == "off"
+
+
+def test_slash_echo_mode_accepts_config_and_env(adapter, monkeypatch):
+    monkeypatch.delenv("HERMES_DISCORD_SLASH_ECHO", raising=False)
+    adapter.config.extra["slash_echo"] = "task"
+    assert adapter._resolve_slash_echo_mode() == "task"
+
+    monkeypatch.setenv("HERMES_DISCORD_SLASH_ECHO", "all")
+    assert adapter._resolve_slash_echo_mode() == "all"
+
+
+@pytest.mark.parametrize(
+    ("mode", "text", "expected"),
+    [
+        ("off", "/moa hello", False),
+        ("task", "/moa hello", True),
+        ("task", "/skill hermes-agent", True),
+        ("task", "/status", False),
+        ("task", "/approve abc", False),
+        ("all", "/status", True),
+    ],
+)
+def test_should_echo_slash_command_classifies_task_commands(adapter, mode, text, expected):
+    adapter._slash_echo_mode = mode
+    assert adapter._should_echo_slash_command(text) is expected
+
+
+def test_format_slash_echo_truncates(adapter):
+    text = "/moa " + ("x" * 3000)
+    formatted = adapter._format_slash_echo(text)
+    assert formatted.startswith("↪ /moa ")
+    assert formatted.endswith("…")
+    assert len(formatted) <= 2 + 1 + 1800
+
+
+@pytest.mark.asyncio
+async def test_run_simple_slash_echo_off_does_not_post(adapter):
+    adapter._slash_echo_mode = "off"
+    adapter.handle_message = AsyncMock()
+    interaction = SimpleNamespace(
+        channel=_FakeTextChannel(channel_id=123, name="general"),
+        channel_id=123,
+        user=SimpleNamespace(display_name="Jezza", id=42, name="jezza"),
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+        guild_id=456,
+    )
+    interaction.channel.send = AsyncMock(return_value=SimpleNamespace(id=9876))
+
+    await adapter._run_simple_slash(interaction, "/moa hello")
+
+    interaction.channel.send.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_simple_slash_echo_task_posts_and_anchors_event(adapter):
+    adapter._slash_echo_mode = "task"
+    adapter._nonconversational_messages = SimpleNamespace(mark_many=MagicMock())
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    adapter.handle_message = capture
+    interaction = SimpleNamespace(
+        channel=_FakeTextChannel(channel_id=123, name="general"),
+        channel_id=123,
+        user=SimpleNamespace(display_name="Jezza", id=42, name="jezza"),
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+        guild_id=456,
+    )
+    interaction.channel.send = AsyncMock(return_value=SimpleNamespace(id=9876))
+
+    await adapter._run_simple_slash(interaction, "/moa hello")
+
+    interaction.channel.send.assert_awaited_once()
+    _args, kwargs = interaction.channel.send.await_args
+    assert kwargs["content"] == "↪ /moa hello"
+    adapter._nonconversational_messages.mark_many.assert_called_once_with(["9876"])
+    assert captured[0].message_id == "9876"
+    assert captured[0].text == "/moa hello"
+
+
+@pytest.mark.asyncio
+async def test_run_simple_slash_echo_task_skips_control_command(adapter):
+    adapter._slash_echo_mode = "task"
+    adapter.handle_message = AsyncMock()
+    interaction = SimpleNamespace(
+        channel=_FakeTextChannel(channel_id=123, name="general"),
+        channel_id=123,
+        user=SimpleNamespace(display_name="Jezza", id=42, name="jezza"),
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+        guild_id=456,
+    )
+    interaction.channel.send = AsyncMock(return_value=SimpleNamespace(id=9876))
+
+    await adapter._run_simple_slash(interaction, "/status")
+
+    interaction.channel.send.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_skill_slash_echo_uses_user_facing_skill_command(adapter, monkeypatch):
+    adapter._run_simple_slash = AsyncMock()
+
+    def fake_refresh():
+        adapter._skill_entries = [("hermes-agent", "Hermes", "/skillcmd:hermes-agent")]
+        adapter._skill_lookup = {"hermes-agent": ("Hermes", "/skillcmd:hermes-agent")}
+        adapter._skill_group_hidden_count = 0
+
+    monkeypatch.setattr(adapter, "_refresh_skill_catalog_state", fake_refresh)
+    adapter._register_skill_group(adapter._client.tree)
+
+    command = adapter._client.tree.commands["skill"]
+    interaction = SimpleNamespace()
+    await command.callback(interaction, name="hermes-agent", args="check slash echo")
+
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction,
+        "/skillcmd:hermes-agent check slash echo",
+        echo_text="/skill hermes-agent check slash echo",
+    )
