@@ -73,6 +73,21 @@ _DISCORD_NONCONVERSATIONAL_METADATA_KEYS = frozenset({
 # status bumps emitted by an older gateway version that pre-dates the marking,
 # so they don't partition history after an upgrade. New emitters should set the
 # metadata flag, not rely on a regex here.
+_DISCORD_TASK_SLASH_ECHO_COMMANDS = frozenset({
+    # User-task / agent-work commands.  Control-plane commands (/status,
+    # /model, /approve, /deny, /sethome, /restart, …) stay private in
+    # slash_echo=task mode so Discord slash commands remain safe by default.
+    "moa",
+    "skill",
+    "learn",
+    "blueprint",
+    "queue",
+    "background",
+    "btw",
+    "steer",
+})
+_DISCORD_SLASH_ECHO_MAX_CHARS = 1800
+
 _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS = (
     re.compile(r"^\s*💾\s*Self-improvement review:\s+\S[\s\S]*$", re.IGNORECASE),
     # Legacy/background-review test doubles used this shorter form before the
@@ -926,6 +941,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
+        self._slash_echo_mode: str = self._resolve_slash_echo_mode()
         # In-memory cache of the bot's last message ID per channel, used by
         # history backfill to skip the full scan on hot paths.  Falls back to
         # scanning channel.history() on cache miss (cold start / restart).
@@ -4867,18 +4883,107 @@ class DiscordAdapter(BasePlatformAdapter):
             return content
         return convert_table_to_bullets(content)
 
+    def _resolve_slash_echo_mode(self) -> str:
+        """Return Discord native-slash public echo mode: off | task | all."""
+        raw = os.getenv("HERMES_DISCORD_SLASH_ECHO", "").strip().lower()
+        if not raw:
+            raw_value = self.config.extra.get("slash_echo") if getattr(self.config, "extra", None) else None
+            raw = str(raw_value or "off").strip().lower()
+        aliases = {
+            "false": "off",
+            "0": "off",
+            "no": "off",
+            "true": "task",
+            "1": "task",
+            "yes": "task",
+        }
+        mode = aliases.get(raw, raw)
+        if mode not in {"off", "task", "all"}:
+            logger.warning("[%s] Invalid Discord slash_echo=%r; falling back to 'off'", self.name, raw)
+            return "off"
+        return mode
+
+    @staticmethod
+    def _slash_command_name(text: str) -> str:
+        text = (text or "").strip()
+        if text.startswith("/"):
+            text = text[1:]
+        return text.split(None, 1)[0].lower() if text else ""
+
+    def _should_echo_slash_command(self, command_text: str, echo_text: str | None = None) -> bool:
+        mode = getattr(self, "_slash_echo_mode", "off")
+        if mode == "off":
+            return False
+        if mode == "all":
+            return True
+        name = self._slash_command_name(echo_text or command_text)
+        return name in _DISCORD_TASK_SLASH_ECHO_COMMANDS
+
+    def _format_slash_echo(self, text: str) -> str:
+        text = (text or "").strip()
+        if len(text) > _DISCORD_SLASH_ECHO_MAX_CHARS:
+            text = text[: _DISCORD_SLASH_ECHO_MAX_CHARS - 1].rstrip() + "…"
+        return f"↪ {text}" if text else "↪ /"
+
+    async def _send_slash_echo(
+        self,
+        interaction: Any,
+        command_text: str,
+        echo_text: str | None = None,
+    ) -> str | None:
+        """Send a visible non-conversational record of task-like slash input."""
+        display_text = echo_text or command_text
+        if not self._should_echo_slash_command(command_text, display_text):
+            return None
+        channel = getattr(interaction, "channel", None)
+        if channel is None or not hasattr(channel, "send"):
+            return None
+        send_kwargs: dict[str, Any] = {
+            "content": self._format_slash_echo(display_text),
+            "suppress_embeds": True,
+        }
+        try:
+            allowed_mentions_cls = getattr(discord, "AllowedMentions", None)
+            if allowed_mentions_cls is not None:
+                send_kwargs["allowed_mentions"] = allowed_mentions_cls.none()
+        except Exception:
+            pass
+        try:
+            msg = await channel.send(**send_kwargs)
+            message_id = str(getattr(msg, "id", "") or "")
+            if message_id:
+                self._nonconversational_messages.mark_many([message_id])
+                return message_id
+        except TypeError:
+            # Older/test Messageable.send() implementations may reject
+            # suppress_embeds. Retry once without the optional kwarg.
+            send_kwargs.pop("suppress_embeds", None)
+            try:
+                msg = await channel.send(**send_kwargs)
+                message_id = str(getattr(msg, "id", "") or "")
+                if message_id:
+                    self._nonconversational_messages.mark_many([message_id])
+                    return message_id
+            except Exception as exc:
+                logger.debug("Discord slash echo failed for %r: %s", display_text, exc)
+        except Exception as exc:
+            logger.debug("Discord slash echo failed for %r: %s", display_text, exc)
+        return None
+
     async def _run_simple_slash(
         self,
         interaction: discord.Interaction,
         command_text: str,
         followup_msg: str | None = None,
+        echo_text: str | None = None,
     ) -> None:
         """Common handler for simple slash commands that dispatch a command string.
 
-        Defers the interaction (shows "thinking..."), dispatches the command,
-        then cleans up the deferred response.  If *followup_msg* is provided
-        the "thinking..." indicator is replaced with that text; otherwise it
-        is deleted so the channel isn't cluttered.
+        Defers the interaction (shows "thinking..."), optionally emits a
+        visible non-conversational echo for task-like slash commands, dispatches
+        the command, then cleans up the deferred response.  If *followup_msg* is
+        provided the "thinking..." indicator is replaced with that text;
+        otherwise it is deleted so the channel isn't cluttered.
         """
         # Log the invoker so ghost-command reports can be triaged.  Discord
         # native slash invocations are always user-initiated (no bot can fire
@@ -4915,7 +5020,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 "Executing command anyway, skipping interaction followup.",
                 command_text,
             )
+
+        echo_message_id = None
+        if deferred_response:
+            echo_message_id = await self._send_slash_echo(
+                interaction,
+                command_text,
+                echo_text=echo_text,
+            )
         event = self._build_slash_event(interaction, command_text)
+        if echo_message_id:
+            event.message_id = echo_message_id
         await self.handle_message(event)
         if not deferred_response:
             return
@@ -5394,7 +5509,9 @@ class DiscordAdapter(BasePlatformAdapter):
                     return
                 _desc, cmd_key = entry
                 await self._run_simple_slash(
-                    interaction, f"{cmd_key} {args}".strip()
+                    interaction,
+                    f"{cmd_key} {args}".strip(),
+                    echo_text=f"/skill {name} {args}".strip(),
                 )
 
             cmd = discord.app_commands.Command(
@@ -9295,7 +9412,9 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     ``DISCORD_NO_THREAD_CHANNELS``, ``DISCORD_HISTORY_BACKFILL``,
     ``DISCORD_HISTORY_BACKFILL_LIMIT``, ``DISCORD_ALLOW_MENTION_*``,
     ``DISCORD_REPLY_TO_MODE``, ``DISCORD_THREAD_REQUIRE_MENTION``,
-    ``DISCORD_BOTS_REQUIRE_INLINE_MENTION``).
+    ``DISCORD_REPLY_TO_MODE``, ``DISCORD_THREAD_REQUIRE_MENTION``,
+    ``DISCORD_BOTS_REQUIRE_INLINE_MENTION``,
+    ``HERMES_DISCORD_SLASH_ECHO``).
     Rather than rewrite ~50 call sites inside the adapter to read from
     ``PlatformConfig.extra`` instead, this hook keeps the existing
     env-driven model and merely owns the YAML→env translation here, next to
@@ -9320,6 +9439,13 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             candidate_extra = discord_platform_cfg.get("extra")
             if isinstance(candidate_extra, dict):
                 platform_extra_cfg = candidate_extra
+    slash_echo_cfg = None
+    if "slash_echo" in discord_cfg:
+        slash_echo_cfg = discord_cfg.get("slash_echo")
+    elif "slash_echo" in platform_extra_cfg:
+        slash_echo_cfg = platform_extra_cfg.get("slash_echo")
+    if slash_echo_cfg is not None and not os.getenv("HERMES_DISCORD_SLASH_ECHO"):
+        os.environ["HERMES_DISCORD_SLASH_ECHO"] = str(slash_echo_cfg).lower()
     allowed_users_cfg = (
         discord_cfg["allow_from"] if "allow_from" in discord_cfg
         else platform_extra_cfg.get("allow_from")
