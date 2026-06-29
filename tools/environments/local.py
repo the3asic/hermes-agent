@@ -832,7 +832,11 @@ class LocalEnvironment(BaseEnvironment):
 
         _popen_cwd = self.cwd
 
-        _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        _popen_kwargs = (
+            {"creationflags": windows_hide_flags()}
+            if _IS_WINDOWS
+            else {"start_new_session": True}
+        )
 
         proc = subprocess.Popen(
             args,
@@ -843,7 +847,6 @@ class LocalEnvironment(BaseEnvironment):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            start_new_session=True,
             cwd=_popen_cwd,
             **_popen_kwargs,
         )

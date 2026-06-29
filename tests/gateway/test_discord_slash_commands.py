@@ -721,6 +721,7 @@ async def test_auto_thread_creates_thread_and_redirects(adapter, monkeypatch):
     """When DISCORD_AUTO_THREAD=true, a new thread is created and the event routes there."""
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    adapter.config.extra["require_mention"] = False
 
     thread = SimpleNamespace(id=999, name="Hello")
     adapter._auto_create_thread = AsyncMock(return_value=thread)
@@ -749,6 +750,7 @@ async def test_auto_thread_enabled_by_default_slash_commands(adapter, monkeypatc
     """Without DISCORD_AUTO_THREAD env var, auto-threading is enabled (default: true)."""
     monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    adapter.config.extra["require_mention"] = False
 
     fake_thread = _FakeThreadChannel(channel_id=999, name="auto-thread")
     adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
@@ -775,6 +777,7 @@ async def test_auto_thread_can_be_disabled(adapter, monkeypatch):
     """Setting DISCORD_AUTO_THREAD=false keeps messages in the channel."""
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    adapter.config.extra["require_mention"] = False
 
     adapter._auto_create_thread = AsyncMock()
 
@@ -799,6 +802,7 @@ async def test_auto_thread_skips_threads_and_dms(adapter, monkeypatch):
     """Auto-thread should not create threads inside existing threads."""
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    adapter.config.extra["require_mention"] = False
 
     adapter._auto_create_thread = AsyncMock()
 
@@ -843,6 +847,33 @@ def test_discord_auto_thread_config_bridge(monkeypatch, tmp_path):
 
     import os
     assert os.getenv("DISCORD_AUTO_THREAD") == "true"
+
+
+def test_discord_history_backfill_free_response_config_bridge(monkeypatch, tmp_path):
+    """discord.history_backfill_free_response must reach the adapter runtime.
+
+    The adapter reads this flag from DISCORD_HISTORY_BACKFILL_FREE_RESPONSE
+    unless tests seed config.extra directly, so the real config.yaml path needs
+    its own bridge coverage.
+    """
+    import os
+    import yaml
+    from pathlib import Path
+
+    hermes_dir = tmp_path / ".hermes"
+    hermes_dir.mkdir()
+    (hermes_dir / "config.yaml").write_text(yaml.dump({
+        "discord": {"history_backfill_free_response": True},
+    }))
+
+    monkeypatch.delenv("DISCORD_HISTORY_BACKFILL_FREE_RESPONSE", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_dir))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    from gateway.config import load_gateway_config
+    load_gateway_config()
+
+    assert os.getenv("DISCORD_HISTORY_BACKFILL_FREE_RESPONSE") == "true"
 
 
 # ------------------------------------------------------------------

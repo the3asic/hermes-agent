@@ -1285,6 +1285,11 @@ def execute_code(
         _child_cwd = _resolve_child_cwd(_mode, tmpdir)
         _script_path = os.path.join(tmpdir, "script.py")
 
+        _popen_kwargs = (
+            {"creationflags": subprocess.CREATE_NO_WINDOW}
+            if _IS_WINDOWS
+            else {"start_new_session": True}
+        )
         proc = subprocess.Popen(
             [_child_python, _script_path],
             cwd=_child_cwd,
@@ -1292,8 +1297,7 @@ def execute_code(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            **_popen_kwargs,
         )
 
         # --- Poll loop: watch for exit, timeout, and interrupt ---

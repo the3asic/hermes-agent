@@ -68,6 +68,7 @@ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+_SESSION_ENV_MESSAGE_ID_UNSET = object()
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -1661,6 +1662,7 @@ from gateway.session import (
     SessionContext,
     build_session_context,
     build_session_context_prompt,
+    build_recall_scope_key,
     build_session_key,
     is_shared_multi_user_session,
 )
@@ -4779,6 +4781,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             effective_mode = "queue"
         steered = False
+        # Steer is text-only. Media-bearing events (Discord voice notes,
+        # images, documents, etc.) must go through the normal queued inbound
+        # pipeline so STT/vision/document handling sees media_urls. If we steer
+        # a captionless voice note here, the agent only receives Discord's
+        # "message with no text content" placeholder and the cached audio is
+        # effectively lost.
+        event_has_media = bool(getattr(event, "media_urls", None))
+        if effective_mode == "steer" and event_has_media:
+            effective_mode = "queue"
+
         if effective_mode == "steer":
             steer_text = (event.text or "").strip()
             can_steer = (
@@ -9687,8 +9699,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Build session context
         context = build_session_context(source, self.config, session_entry)
         
-        # Set session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
+        # Set session context variables for tools (task-local, concurrency-safe).
+        # Use the actual current event reply anchor, not persisted session-origin
+        # metadata, so nested background watchers cannot inherit a stale Discord
+        # message id from sessions.json.
+        _event_message_id = self._reply_anchor_for_event(event)
+        _set_env = self._set_session_env
+        try:
+            _set_env_params = inspect.signature(_set_env).parameters
+        except (TypeError, ValueError):
+            _set_env_params = {}
+        _set_env_accepts_message_id = (
+            "message_id" in _set_env_params
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in _set_env_params.values())
+        )
+        if _set_env_accepts_message_id:
+            _session_env_tokens = _set_env(context, message_id=_event_message_id)
+        else:
+            # Focused tests sometimes monkeypatch _set_session_env with the old
+            # one-arg signature.  Branch on the callable signature instead of
+            # catching TypeError from the real gateway path.
+            _session_env_tokens = _set_env(context)
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -10327,6 +10358,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 session_id=session_entry.session_id,
                 session_key=session_key,
+                recall_scope_key=context.recall_scope_key,
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
@@ -13492,16 +13524,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return delivered
 
-    def _set_session_env(self, context: SessionContext) -> list:
+    def _set_session_env(
+        self,
+        context: SessionContext,
+        *,
+        message_id: Any = _SESSION_ENV_MESSAGE_ID_UNSET,
+    ) -> list:
         """Set session context variables for the current async task.
 
         Uses ``contextvars`` instead of ``os.environ`` so that concurrent
         gateway messages cannot overwrite each other's session state.
 
+        ``HERMES_SESSION_MESSAGE_ID`` is per-turn reply-anchor state, not
+        stable session-origin state.  Prefer the actual current event anchor
+        supplied by the caller; fall back to ``context.source.message_id`` for
+        older call sites/tests.  This prevents synthetic background-process
+        turns from leaking a persisted session-origin message id into nested
+        ``notify_on_complete`` watchers.
+
         Returns a list of reset tokens; pass them to ``_clear_session_env``
         in a ``finally`` block.
         """
         from gateway.session_context import set_session_vars
+
         # Propagate the adapter's async-delivery capability so async tools
         # (terminal notify_on_complete / watch_patterns, delegate_task
         # background=True) know whether this channel can wake a later turn.
@@ -13512,6 +13557,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+
+        if message_id is _SESSION_ENV_MESSAGE_ID_UNSET:
+            effective_message_id = (
+                str(context.source.message_id).strip()
+                if context.source.message_id
+                else ""
+            )
+        else:
+            # Explicit None/empty means "clear the per-turn anchor"; only the
+            # sentinel path above inherits from context.source.message_id.
+            effective_message_id = str(message_id or "").strip()
+
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -13520,7 +13577,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
-            message_id=str(context.source.message_id) if context.source.message_id else "",
+            recall_scope_key=context.recall_scope_key,
+            message_id=effective_message_id,
             async_delivery=_async_delivery,
         )
 
@@ -13848,16 +13906,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from gateway.session import SessionSource
 
         session_key = str(evt.get("session_key") or "").strip()
+        event_message_id = str(evt.get("message_id") or "").strip() or None
         derived_platform = ""
         derived_chat_type = ""
         derived_chat_id = ""
+
+        def _source_for_process_event(source: SessionSource) -> SessionSource:
+            """Return a copy whose message_id belongs to this synthetic event.
+
+            Session-store origins are session-scoped routing records; their
+            ``message_id`` can be the first message that created a long-lived
+            Discord session.  Reusing that id inside a synthetic process event
+            poisons ``HERMES_SESSION_MESSAGE_ID`` for nested background tools.
+            """
+            return dataclasses.replace(source, message_id=event_message_id)
 
         if session_key:
             try:
                 self.session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
                 if entry and getattr(entry, "origin", None):
-                    return entry.origin
+                    return _source_for_process_event(entry.origin)
             except Exception as exc:
                 logger.debug(
                     "Synthetic process-event session-store lookup failed for %s: %s",
@@ -13867,7 +13936,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             cached_source = self._get_cached_session_source(session_key)
             if cached_source is not None:
-                return cached_source
+                return _source_for_process_event(cached_source)
 
             _parsed = _parse_session_key(session_key)
             if _parsed:
@@ -13907,6 +13976,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_id=str(evt.get("thread_id") or "").strip() or None,
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
+            message_id=event_message_id,
         )
 
     async def _inject_watch_notification(self, synth_text: str, evt: dict) -> None:
@@ -14109,6 +14179,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "thread_id": thread_id,
                         "user_id": user_id,
                         "user_name": user_name,
+                        "message_id": message_id,
                     })
                     if not source:
                         logger.warning(
@@ -15195,6 +15266,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         session_id: str,
         session_key: str = None,
+        recall_scope_key: str = None,
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
@@ -15215,7 +15287,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
+                session_key=session_key, recall_scope_key=recall_scope_key,
+                run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
@@ -15226,7 +15299,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         with _profile_runtime_scope(profile_home):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
+                session_key=session_key, recall_scope_key=recall_scope_key,
+                run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
@@ -15256,6 +15330,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         session_id: str,
         session_key: str = None,
+        recall_scope_key: str = None,
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
@@ -15291,6 +15366,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         from run_agent import AIAgent
         import queue
+
+        if not recall_scope_key:
+            _profile = None
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                _profile = source.profile
+            recall_scope_key = build_recall_scope_key(source, profile=_profile)
 
         def _run_still_current() -> bool:
             if run_generation is None or not session_key:
@@ -16102,20 +16183,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # `_resolve_turn_agent_config(message, …)`.
             nonlocal message
 
-            # session_key is propagated via contextvars in _set_session_env()
-            # (_SESSION_KEY) and via set_current_session_key() (_approval_session_key)
-            # below — both concurrency-safe and inherited by tool worker threads.
-            # We deliberately do NOT write os.environ["HERMES_SESSION_KEY"] here:
-            # os.environ is process-global, so concurrent gateway sessions (e.g.
-            # two Discord threads) would clobber each other's value, and a tool
-            # thread whose contextvar is unset would fall back to os.environ and
-            # read the wrong session key — misrouting command-approval prompts to
-            # the wrong thread (#24100). The non-gateway surfaces don't depend on
-            # this write: CLI and cron bind the session via contextvars
-            # (set_current_session_key / session context), and only the TUI
-            # slash-worker *subprocess* exports HERMES_SESSION_KEY (from its own
-            # --session-key argv, a separate process) — so removing this in-process
-            # gateway write does not affect any of them.
+            # session_key and recall_scope_key are propagated via contextvars in
+            # _set_session_env() (_SESSION_KEY / _RECALL_SCOPE_KEY) and session_key
+            # is also bound for approvals via set_current_session_key() below — both
+            # paths are concurrency-safe and inherited by tool worker threads.
+            #
+            # Deliberately do NOT write HERMES_SESSION_KEY or HERMES_RECALL_SCOPE_KEY
+            # into the process-global environment here: concurrent gateway sessions
+            # (e.g. two Discord threads) would clobber each other's values, and a
+            # tool thread whose contextvar is unset could read the wrong scope and
+            # route approvals/session_search to the wrong chat (#24100). CLI/cron
+            # bind session state outside this gateway path; the TUI slash-worker
+            # subprocess exports its own session env from argv in a separate process.
 
             # Map platform enum to the platform hint key the agent understands.
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
@@ -16355,6 +16434,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             # Refresh agent max_iterations from current config
                             # (cached agent may have been created with old config)
                             agent.max_iterations = max_iterations
+                            agent._gateway_recall_scope_key = recall_scope_key
                             logger.debug("Reusing cached agent for session %s", session_key)
 
             # Lock released — now schedule cleanup of any cross-process-evicted
@@ -16408,6 +16488,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
+                    gateway_recall_scope_key=recall_scope_key,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )

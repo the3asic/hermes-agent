@@ -14,6 +14,7 @@ GUARDED_FILES = [
     "tools/process_registry.py",
     "tools/code_execution_tool.py",
     "gateway/platforms/whatsapp.py",
+    "plugins/platforms/whatsapp/adapter.py",
 ]
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -46,22 +47,20 @@ class TestNoUnconditionalSetsid:
             )
 
 
-class TestStartNewSession:
-    """All guarded files must use start_new_session=True instead of preexec_fn."""
+class TestNoPreexecFn:
+    """Process launchers must avoid preexec_fn in multi-threaded processes."""
 
     @pytest.mark.parametrize("relpath", GUARDED_FILES)
-    def test_uses_start_new_session(self, relpath):
-        """Each guarded file must use start_new_session=True for process isolation."""
+    def test_no_preexec_fn(self, relpath):
         filepath = PROJECT_ROOT / relpath
         if not filepath.exists():
             pytest.skip(f"{relpath} not found")
         source = filepath.read_text(encoding="utf-8")
-        # Files should use start_new_session=True, not preexec_fn
         assert "preexec_fn" not in source, (
             f"{relpath} still uses preexec_fn; use start_new_session=True instead"
         )
-        assert "start_new_session=True" in source, (
-            f"{relpath} missing start_new_session=True in Popen call"
+        assert "start_new_session=True" in source or '"start_new_session": True' in source, (
+            f"{relpath} missing POSIX start_new_session=True in Popen path"
         )
 
 

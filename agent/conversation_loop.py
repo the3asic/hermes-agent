@@ -60,7 +60,10 @@ from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import adaptive_rate_limit_backoff, jittered_backoff
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
-from hermes_constants import PARTIAL_STREAM_STUB_ID
+from hermes_constants import (
+    get_hermes_home,
+    PARTIAL_STREAM_STUB_ID,
+)
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
@@ -71,6 +74,44 @@ logger = logging.getLogger(__name__)
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
+
+
+def _ensure_context_engine_session_for_turn(agent: Any) -> None:
+    """Bind a shared context-engine instance to this agent before each turn.
+
+    Plugin context engines are registered once per Hermes process, then reused by
+    cached gateway agents and cron agents. A cron run can therefore leave the
+    singleton bound to ``cron_*`` even though the next Telegram turn resumes a
+    cached foreground agent. Rebind here before the per-turn prologue (including
+    preflight compression and context-engine tool payloads), otherwise current
+    LCM ingest can be written under the previous agent's session/source.
+    """
+    engine = getattr(agent, "context_compressor", None)
+    if not engine or not hasattr(engine, "on_session_start"):
+        return
+
+    session_id = str(getattr(agent, "session_id", "") or "")
+    if not session_id:
+        return
+
+    bound_session_id = str(getattr(engine, "_session_id", "") or "")
+    if not bound_session_id:
+        bound_session_id = str(getattr(engine, "current_session_id", "") or "")
+    if bound_session_id == session_id:
+        return
+
+    transition = getattr(agent, "_transition_context_engine_session", None)
+    if not callable(transition):
+        return
+
+    try:
+        transition(
+            new_session_id=session_id,
+            reset_engine=False,
+            hermes_home=str(get_hermes_home()),
+        )
+    except Exception as exc:
+        logger.debug("context engine per-turn session bind failed: %s", exc)
 
 
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
@@ -547,6 +588,8 @@ def run_conversation(
     # ``build_turn_context``.  It mutates ``agent`` exactly as the inline code
     # did and returns the locals the loop below reads back.  See
     # ``agent/turn_context.py``.
+    _ensure_context_engine_session_for_turn(agent)
+
     _ctx = build_turn_context(
         agent,
         user_message,
@@ -2637,31 +2680,66 @@ def run_conversation(
                     )
                     continue
 
-                # ── Invalid encrypted reasoning replay recovery ───────
+                # Invalid encrypted reasoning replay recovery.
                 # OpenAI Responses API surfaces (and some compatible relays)
-                # return HTTP 400 ``invalid_encrypted_content`` when a
-                # replayed ``codex_reasoning_items`` blob from a previous
-                # turn fails verification (provider rotated the encryption
-                # key, the route doesn't actually persist reasoning state,
-                # etc.).  Recovery: disable replay for the rest of the
-                # session, strip cached items from history, retry once.
-                # One-shot — if a second 400 fires we fall through to the
-                # normal retry/backoff path.  Only fires for codex_responses
-                # mode with at least one assistant message that has cached
-                # ``codex_reasoning_items``; without replay state, the
-                # error is unrelated to our cache so the normal retry path
-                # handles it (the provider is rejecting something else).
+                # return HTTP 400 ``invalid_encrypted_content`` when a replayed
+                # ``codex_reasoning_items`` blob from a previous turn fails
+                # verification. Some ChatGPT Codex backend deployments collapse
+                # the same failure to a generic 400 ``Unsupported content type``.
+                # Recovery: disable replay for the rest of the session, strip
+                # cached items from history, retry once.
+                _request_has_codex_reasoning_replay = False
+                if isinstance(api_kwargs, dict):
+                    _request_input = api_kwargs.get("input")
+                    if isinstance(_request_input, list):
+                        _request_has_codex_reasoning_replay = any(
+                            isinstance(_item, dict)
+                            and _item.get("type") == "reasoning"
+                            and bool(_item.get("encrypted_content"))
+                            for _item in _request_input
+                        )
+
+                _history_has_codex_reasoning_replay = any(
+                    isinstance(_m, dict)
+                    and _m.get("role") == "assistant"
+                    and isinstance(_m.get("codex_reasoning_items"), list)
+                    and _m.get("codex_reasoning_items")
+                    for _m in messages
+                )
+                _request_base_url_lower = str(getattr(agent, "base_url", "") or "").lower()
+                _is_chatgpt_codex_backend = (
+                    str(getattr(agent, "provider", "") or "") == "openai-codex"
+                    or (
+                        base_url_host_matches(_request_base_url_lower, "chatgpt.com")
+                        and "/backend-api/codex" in _request_base_url_lower
+                    )
+                )
+                _looks_like_chatgpt_codex_unsupported_content_type = (
+                    status_code == 400
+                    and agent.api_mode == "codex_responses"
+                    and _is_chatgpt_codex_backend
+                    and "unsupported content type" in _err_lower
+                )
+                _looks_like_codex_reasoning_content_rejection = (
+                    _looks_like_chatgpt_codex_unsupported_content_type
+                    and _request_has_codex_reasoning_replay
+                )
+                _retry_chatgpt_codex_transient_content_type_400 = (
+                    _looks_like_chatgpt_codex_unsupported_content_type
+                    and _retry.invalid_encrypted_content_retry_attempted
+                    and not _request_has_codex_reasoning_replay
+                )
                 if (
-                    classified.reason == FailoverReason.invalid_encrypted_content
+                    (
+                        classified.reason == FailoverReason.invalid_encrypted_content
+                        or _looks_like_codex_reasoning_content_rejection
+                    )
                     and not _retry.invalid_encrypted_content_retry_attempted
                     and agent.api_mode == "codex_responses"
                     and bool(getattr(agent, "_codex_reasoning_replay_enabled", True))
-                    and any(
-                        isinstance(_m, dict)
-                        and _m.get("role") == "assistant"
-                        and isinstance(_m.get("codex_reasoning_items"), list)
-                        and _m.get("codex_reasoning_items")
-                        for _m in messages
+                    and (
+                        _history_has_codex_reasoning_replay
+                        or _request_has_codex_reasoning_replay
                     )
                 ):
                     _retry.invalid_encrypted_content_retry_attempted = True
@@ -3392,7 +3470,9 @@ def run_conversation(
                             FailoverReason.thinking_signature,
                         }
                     )
-                ) and not is_context_length_error
+                ) and not is_context_length_error and not (
+                    _retry_chatgpt_codex_transient_content_type_400
+                )
 
                 if is_client_error:
                     # Try fallback before aborting — a different provider may

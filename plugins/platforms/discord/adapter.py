@@ -4386,6 +4386,23 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_HISTORY_BACKFILL", "true").lower() in {"true", "1", "yes"}
 
+    def _discord_history_backfill_free_response(self) -> bool:
+        """Return whether free-response channel triggers should include scrollback.
+
+        Free-response channels are convenient private rooms where users do not
+        mention the bot, but short follow-ups like "so write that into the
+        weekly doc?" still rely on nearby Discord context. Keep this opt-in so
+        public/noisy deployments can avoid extra context load, while private
+        assistant rooms can preserve the same recovery behavior mention-gated
+        channels already get.
+        """
+        configured = self.config.extra.get("history_backfill_free_response")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in {"false", "0", "no", "off"}
+            return bool(configured)
+        return os.getenv("DISCORD_HISTORY_BACKFILL_FREE_RESPONSE", "false").lower() in {"true", "1", "yes"}
+
     def _discord_history_backfill_limit(self) -> int:
         """Return the max number of messages to scan backwards for context.
 
@@ -4411,12 +4428,22 @@ class DiscordAdapter(BasePlatformAdapter):
         channel: Any,
         before: "DiscordMessage",
         reply_target: Optional[Any] = None,
+        include_self_boundary: bool = False,
     ) -> str:
         """Fetch recent channel messages for conversational context.
 
         Scans backwards from *before* and collects messages until it hits
         a message sent by this bot (the natural partition point between
         bot turns) or reaches ``history_backfill_limit``.
+
+        When ``include_self_boundary`` is true, include the most recent
+        conversational self-authored turn instead of treating it as an
+        immediate hard stop.  This is intentionally only for private
+        free-response rooms: short follow-ups in a fresh agent session often
+        refer to the assistant's last Discord-visible answer, which is not yet
+        present in the new session transcript.  The scan still stops at the
+        previous self-authored turn, so it captures one recent exchange rather
+        than the whole channel.
 
         When ``reply_target`` is provided (the user replied to a specific
         message), a second backward scan is run ending at that target so the
@@ -4445,6 +4472,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # If we know our last message ID in this channel, pass it as `after`
         # to avoid scanning the full limit.  Falls back to scanning on cache
         # miss (cold start / restart).
+        #
+        # Free-response recovery is the exception: it may need the cached
+        # self-authored boundary message itself (the assistant answer the user
+        # is following up on), so do not pass `after=` in that mode.
+        #
         # Guard: only use the cache when it's chronologically before the
         # trigger — Discord snowflake IDs are monotonically increasing, so
         # a simple int comparison suffices.
@@ -4452,7 +4484,11 @@ class DiscordAdapter(BasePlatformAdapter):
         _cached_id = self._last_self_message_id.get(channel_id)
         _after_obj = None
         try:
-            if _cached_id and int(_cached_id) < int(before.id):
+            if (
+                _cached_id
+                and not include_self_boundary
+                and int(_cached_id) < int(before.id)
+            ):
                 _after_obj = discord.Object(id=int(_cached_id))
         except (ValueError, TypeError):
             pass  # Malformed cache entry — fall back to cold-start scan
@@ -4499,6 +4535,8 @@ class DiscordAdapter(BasePlatformAdapter):
             # ── Primary window: recent channel activity since the last bot turn ──
             collected: List[Tuple[str, str]] = []  # (message_id, line)
             seen_ids: set = set()
+            included_self_boundary = False
+            seen_nonself_after_included_self = False
             # IMPORTANT: pass oldest_first=False explicitly.  discord.py 2.x
             # silently flips the default to True when `after=` is supplied,
             # which would select the *earliest* N messages after our last
@@ -4523,12 +4561,32 @@ class DiscordAdapter(BasePlatformAdapter):
                     or _looks_like_nonconversational_history_message(_content)
                 ):
                     continue
-                # Stop at our own (conversational) message — this is the
-                # partition point.  Everything before this is already in the
-                # session transcript.  (Redundant when _after_obj is set, but
-                # needed for cold start.)
+                # Stop at our own (conversational) message — this is usually
+                # the partition point.  Everything before this is already in
+                # the session transcript.  (Redundant when _after_obj is set,
+                # but needed for cold start.)
+                #
+                # Private free-response backfill can opt into including the
+                # most recent self-authored turn because a fresh agent session
+                # may not have the assistant's previous Discord answer in its
+                # transcript.  Include consecutive self chunks from that turn,
+                # then one preceding human/other-bot exchange, and stop at the
+                # previous self-authored turn.
                 if msg.author == self._client.user:
-                    break
+                    if not include_self_boundary:
+                        break
+                    if included_self_boundary and seen_nonself_after_included_self:
+                        break
+                    line = _keep(msg)
+                    if line is not None:
+                        mid = str(getattr(msg, "id", ""))
+                        collected.append((mid, line))
+                        if mid:
+                            seen_ids.add(mid)
+                    included_self_boundary = True
+                    continue
+                if included_self_boundary:
+                    seen_nonself_after_included_self = True
                 line = _keep(msg)
                 if line is None:
                     continue
@@ -5371,14 +5429,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel_ids.add(parent_channel_id)
 
             require_mention = self._discord_require_mention()
+            is_configured_free_response_channel = (
+                "*" in free_channels
+                or bool(channel_ids & free_channels)
+            )
             # Voice-linked text channels act as free-response while voice is active.
             # Only the exact bound channel gets the exemption, not sibling threads.
             voice_linked_ids = {str(ch_id) for ch_id in self._voice_text_channels.values()}
             current_channel_id = str(message.channel.id)
             is_voice_linked_channel = current_channel_id in voice_linked_ids
             is_free_channel = (
-                "*" in free_channels
-                or bool(channel_ids & free_channels)
+                is_configured_free_response_channel
                 or is_voice_linked_channel
             )
 
@@ -5688,9 +5749,23 @@ class DiscordAdapter(BasePlatformAdapter):
                         with suppress(ValueError, TypeError):
                             _reply_target = _Snowflake(int(_ref_mid))
 
-            if (_has_mention_gap or is_thread or _is_reply) and auto_threaded_channel is None:
+            _is_free_response_trigger = (
+                is_configured_free_response_channel
+                and msg_type != MessageType.COMMAND
+                and self._discord_history_backfill_free_response()
+            )
+
+            if (
+                _has_mention_gap
+                or is_thread
+                or _is_reply
+                or _is_free_response_trigger
+            ) and auto_threaded_channel is None:
                 _backfill_text = await self._fetch_channel_context(
-                    message.channel, before=message, reply_target=_reply_target,
+                    message.channel,
+                    before=message,
+                    reply_target=_reply_target,
+                    include_self_boundary=_is_free_response_trigger,
                 )
                 if _backfill_text:
                     _channel_context = _backfill_text
@@ -7156,6 +7231,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     ``DISCORD_AUTO_THREAD``, ``DISCORD_REACTIONS``,
     ``DISCORD_IGNORED_CHANNELS``, ``DISCORD_ALLOWED_CHANNELS``,
     ``DISCORD_NO_THREAD_CHANNELS``, ``DISCORD_HISTORY_BACKFILL``,
+    ``DISCORD_HISTORY_BACKFILL_FREE_RESPONSE``,
     ``DISCORD_HISTORY_BACKFILL_LIMIT``, ``DISCORD_ALLOW_MENTION_*``,
     ``DISCORD_REPLY_TO_MODE``, ``DISCORD_THREAD_REQUIRE_MENTION``).
     Rather than rewrite ~50 call sites inside the adapter to read from
@@ -7220,6 +7296,12 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     # and prepends them to the user message for context.
     if "history_backfill" in discord_cfg and not os.getenv("DISCORD_HISTORY_BACKFILL"):
         os.environ["DISCORD_HISTORY_BACKFILL"] = str(discord_cfg["history_backfill"]).lower()
+    if "history_backfill_free_response" in discord_cfg and not os.getenv(
+        "DISCORD_HISTORY_BACKFILL_FREE_RESPONSE"
+    ):
+        os.environ["DISCORD_HISTORY_BACKFILL_FREE_RESPONSE"] = str(
+            discord_cfg["history_backfill_free_response"]
+        ).lower()
     hbl = discord_cfg.get("history_backfill_limit")
     if hbl is not None and not os.getenv("DISCORD_HISTORY_BACKFILL_LIMIT"):
         os.environ["DISCORD_HISTORY_BACKFILL_LIMIT"] = str(hbl)

@@ -114,6 +114,7 @@ def adapter(monkeypatch):
         "DISCORD_ALLOWED_CHANNELS",
         "DISCORD_IGNORED_CHANNELS",
         "DISCORD_HISTORY_BACKFILL",
+        "DISCORD_HISTORY_BACKFILL_FREE_RESPONSE",
         "DISCORD_HISTORY_BACKFILL_LIMIT",
         "DISCORD_ALLOW_BOTS",
     ):
@@ -291,6 +292,144 @@ async def test_discord_free_response_channel_can_come_from_config_extra(adapter,
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "allowed from config"
+
+
+@pytest.mark.asyncio
+async def test_discord_free_response_can_opt_into_history_backfill(adapter, monkeypatch):
+    """Private free-response rooms can still hydrate nearby channel context.
+
+    Without this opt-in, a short follow-up in a no-mention channel can arrive
+    in a fresh session with no access to the previous Discord scrollback.
+    """
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    adapter.config.extra["free_response_channels"] = ["789"]
+    adapter.config.extra["history_backfill_free_response"] = True
+    adapter.config.extra["history_backfill_limit"] = 10
+
+    human = SimpleNamespace(id=56, display_name="Alice", name="Alice", bot=False)
+    channel = FakeHistoryChannel(
+        [make_history_message(author=human, content="previous weekly-doc draft", msg_id=100)],
+        channel_id=789,
+    )
+    message = make_message(channel=channel, content="so write it?", msg_type=discord_platform.discord.MessageType.default)
+    message.id = 123
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.channel_context == (
+        "[Recent channel messages]\n"
+        "[Alice] previous weekly-doc draft"
+    )
+    assert event.text == "so write it?"
+
+
+@pytest.mark.asyncio
+async def test_discord_free_response_backfill_includes_previous_self_turn(adapter, monkeypatch):
+    """Short free-response follow-ups often refer to the assistant's last answer.
+
+    The generic history backfill partition stops at our own previous message,
+    which is correct for mention-gated shared sessions.  In private
+    free-response rooms, a fresh agent session may not have that previous
+    Discord-visible assistant answer in its transcript, so include the most
+    recent self-authored turn (including split Discord chunks) plus the prompt
+    that led to it.
+    """
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    adapter.config.extra["free_response_channels"] = ["789"]
+    adapter.config.extra["history_backfill_free_response"] = True
+    adapter.config.extra["history_backfill_limit"] = 10
+    adapter._client.user = SimpleNamespace(id=999, display_name="Hermes", name="Hermes", bot=True)
+
+    human = SimpleNamespace(id=56, display_name="ABM", name="ABM", bot=False)
+    channel = FakeHistoryChannel(
+        [
+            make_history_message(author=human, content="older unrelated", msg_id=97),
+            make_history_message(author=adapter._client.user, content="older assistant turn", msg_id=98),
+            make_history_message(author=human, content="请写事实版周文档", msg_id=100),
+            make_history_message(author=adapter._client.user, content="事实版周文档草稿 part 1", msg_id=101),
+            make_history_message(author=adapter._client.user, content="事实版周文档草稿 part 2", msg_id=102),
+        ],
+        channel_id=789,
+    )
+    # Hot-path cache used to exclude the boundary self message.  Free-response
+    # recovery must ignore this optimization so the previous assistant turn can
+    # be included.
+    adapter._last_self_message_id["789"] = "102"
+    message = make_message(channel=channel, content="所以周文档？", msg_type=discord_platform.discord.MessageType.default)
+    message.id = 103
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.channel_context == (
+        "[Recent channel messages]\n"
+        "[ABM] 请写事实版周文档\n"
+        "[Hermes [bot]] 事实版周文档草稿 part 1\n"
+        "[Hermes [bot]] 事实版周文档草稿 part 2"
+    )
+    assert "older assistant turn" not in event.channel_context
+    assert "older unrelated" not in event.channel_context
+    assert event.text == "所以周文档？"
+
+
+@pytest.mark.asyncio
+async def test_discord_free_response_history_backfill_skips_commands(adapter, monkeypatch):
+    """Slash/command messages in free-response rooms should not drag old context."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    adapter.config.extra["free_response_channels"] = ["789"]
+    adapter.config.extra["history_backfill_free_response"] = True
+    adapter.config.extra["history_backfill_limit"] = 10
+    adapter._client.user = SimpleNamespace(id=999, display_name="Hermes", name="Hermes", bot=True)
+
+    human = SimpleNamespace(id=56, display_name="ABM", name="ABM", bot=False)
+    channel = FakeHistoryChannel(
+        [
+            make_history_message(author=human, content="old private context", msg_id=100),
+            make_history_message(author=adapter._client.user, content="old assistant answer", msg_id=101),
+        ],
+        channel_id=789,
+    )
+    message = make_message(channel=channel, content="/status", msg_type=discord_platform.discord.MessageType.default)
+    message.id = 102
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "/status"
+    assert event.message_type == discord_platform.MessageType.COMMAND
+    assert event.channel_context is None
+
+
+@pytest.mark.asyncio
+async def test_discord_voice_linked_channel_does_not_enable_history_backfill(adapter, monkeypatch):
+    """Voice-linked free-response is transient and should not hydrate scrollback."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    adapter.config.extra["history_backfill_free_response"] = True
+    adapter.config.extra["history_backfill_limit"] = 10
+    adapter._voice_text_channels[1234] = 789
+
+    human = SimpleNamespace(id=56, display_name="ABM", name="ABM", bot=False)
+    channel = FakeHistoryChannel(
+        [make_history_message(author=human, content="old voice-room context", msg_id=100)],
+        channel_id=789,
+    )
+    message = make_message(channel=channel, content="voice-linked follow-up", msg_type=discord_platform.discord.MessageType.default)
+    message.id = 101
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "voice-linked follow-up"
+    assert event.channel_context is None
 
 
 def test_discord_free_response_channels_bare_int(adapter, monkeypatch):

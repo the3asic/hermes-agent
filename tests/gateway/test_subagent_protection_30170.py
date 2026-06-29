@@ -323,6 +323,42 @@ class TestBusyHandlerDemotesInterruptForSubagents:
         parent.interrupt.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_steer_mode_queues_media_instead_of_dropping_attachment(
+        self,
+    ) -> None:
+        """Media-bearing follow-ups must not use text-only steer.
+
+        A captionless Discord voice note has empty text plus an audio
+        attachment. If steer consumes only ``event.text``, the agent sees the
+        placeholder "message with no text content" and STT never sees the
+        cached audio. Queueing preserves media_urls for the normal inbound
+        STT/vision/document pipeline.
+        """
+        runner = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter()
+        event = _make_event(text="(The user sent a message with no text content)")
+        event.message_type = MessageType.VOICE
+        event.media_urls = ["/tmp/voice.ogg"]
+        event.media_types = ["audio/ogg"]
+        sk = build_session_key(event.source)
+        parent = _make_parent_with_subagents()
+        parent.steer = MagicMock(return_value=True)
+        runner._running_agents[sk] = parent
+        runner.adapters[event.source.platform] = adapter
+
+        with patch.object(runner, "_queue_or_replace_pending_event") as queue_mock:
+            await runner._handle_active_session_busy_message(event, sk)
+
+        parent.steer.assert_not_called()
+        parent.interrupt.assert_not_called()
+        queue_mock.assert_called_once_with(sk, event)
+        queued_event = queue_mock.call_args.args[1]
+        assert queued_event.media_urls == ["/tmp/voice.ogg"]
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "Queued for the next turn" in content
+
+    @pytest.mark.asyncio
     async def test_pending_sentinel_does_not_demote(self) -> None:
         """The placeholder ``_AGENT_PENDING_SENTINEL`` is not a real
         agent — the guard must not treat it as having subagents.

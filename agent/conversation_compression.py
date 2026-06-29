@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, Optional, Tuple
 
 from agent.model_metadata import estimate_request_tokens_rough
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -729,8 +730,11 @@ def compress_context(
                 agent.session_id or "",
                 boundary_reason="compression",
                 old_session_id=_boundary_parent,
-                platform=getattr(agent, "platform", None) or "cli",
+                platform=getattr(agent, "platform", None) or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                 conversation_id=getattr(agent, "_gateway_session_key", None),
+                hermes_home=str(get_hermes_home()),
+                model=getattr(agent, "model", ""),
+                context_length=getattr(agent.context_compressor, "context_length", 0),
             )
     except Exception as _ce_err:
         logger.debug("context engine on_session_start (compression): %s", _ce_err)

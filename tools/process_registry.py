@@ -739,7 +739,11 @@ class ProcessRegistry:
         # stdout is a pipe, hiding output from process(action="poll")).
         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
         bg_env["PYTHONUNBUFFERED"] = "1"
-        _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        _popen_kwargs = (
+            {"creationflags": windows_hide_flags()}
+            if _IS_WINDOWS
+            else {"start_new_session": True}
+        )
 
         proc = subprocess.Popen(
             [user_shell, "-lic", f"set +m; {command}"],
@@ -751,7 +755,6 @@ class ProcessRegistry:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
-            start_new_session=True,
             **_popen_kwargs,
         )
 

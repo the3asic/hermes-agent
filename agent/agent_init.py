@@ -222,6 +222,7 @@ def init_agent(
     chat_type: str = None,
     thread_id: str = None,
     gateway_session_key: str = None,
+    gateway_recall_scope_key: str = None,
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
@@ -307,6 +308,7 @@ def init_agent(
     agent._chat_type = chat_type
     agent._thread_id = thread_id
     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+    agent._gateway_recall_scope_key = gateway_recall_scope_key  # Stable current-chat/thread recall scope; excludes per-user isolation.
     # Pluggable print function — CLI replaces this with _cprint so that
     # raw ANSI status lines are routed through prompt_toolkit's renderer
     # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -1272,6 +1274,8 @@ def init_agent(
                     # Thread gateway session key for stable per-chat Honcho session isolation
                     if agent._gateway_session_key:
                         _init_kwargs["gateway_session_key"] = agent._gateway_session_key
+                    if agent._gateway_recall_scope_key:
+                        _init_kwargs["gateway_recall_scope_key"] = agent._gateway_recall_scope_key
                     # Profile identity for per-profile provider scoping
                     try:
                         from hermes_cli.profiles import get_active_profile_name
@@ -1373,6 +1377,9 @@ def init_agent(
     # tells the user what changed and how to revert.
     _codex_gpt55_autoraise = str(
         _compression_cfg.get("codex_gpt55_autoraise", True)
+    ).lower() in {"true", "1", "yes"}
+    _codex_gpt55_autoraise_notice = str(
+        _compression_cfg.get("codex_gpt55_autoraise_notice", True)
     ).lower() in {"true", "1", "yes"}
     agent._compression_threshold_autoraised = None
     try:
@@ -1574,6 +1581,7 @@ def init_agent(
     # 4. Fall back to built-in ContextCompressor
     _selected_engine = None
     _copy_failed = False
+    _selected_engine_agent_scoped = False
     _engine_name = "compressor"  # default
     try:
         _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
@@ -1598,26 +1606,45 @@ def init_agent(
             except Exception:
                 _candidate = None
             if _candidate is not None and _candidate.name == _engine_name:
-                # Deep-copy the shared plugin singleton so a child agent's
-                # update_model() can't mutate the parent's compressor (#42449).
-                # Copy can fail for engines holding uncopyable state (locks, DB
-                # connections, clients); in that case fall back to the built-in
-                # compressor with an ACCURATE message rather than silently
-                # mislabelling it "not found".
-                import copy
-                try:
-                    _selected_engine = copy.deepcopy(_candidate)
-                except Exception as _copy_err:
-                    _copy_failed = True
-                    _ra().logger.warning(
-                        "Context engine '%s' could not be safely copied for this "
-                        "agent (%s) — falling back to built-in compressor. Plugin "
-                        "engines that hold uncopyable state (locks, DB connections) "
-                        "should implement __deepcopy__ to copy only mutable budget "
-                        "state.",
-                        _engine_name, _copy_err,
-                    )
-                    _selected_engine = None
+                # The plugin registry keeps a process-wide engine singleton.  If
+                # the engine offers an explicit per-agent clone hook, use it
+                # before attempting generic deepcopy: LCM owns SQLite handles and
+                # threading locks that intentionally are not deepcopy-able.
+                _clone_for_agent = getattr(_candidate, "clone_for_agent", None)
+                if callable(_clone_for_agent):
+                    try:
+                        _selected_engine = _clone_for_agent()
+                        if _selected_engine is not _candidate:
+                            setattr(_selected_engine, "_hermes_agent_owned_context_engine", True)
+                            _selected_engine_agent_scoped = True
+                    except Exception as _ce_clone_err:
+                        _ra().logger.warning(
+                            "Context engine '%s' failed to clone per agent — using registered instance: %s",
+                            getattr(_candidate, "name", _engine_name),
+                            _ce_clone_err,
+                        )
+                        _selected_engine = _candidate
+                else:
+                    # Deep-copy shared plugin engines so a child agent's
+                    # update_model() can't mutate the parent's compressor (#42449).
+                    # Copy can fail for engines holding uncopyable state (locks, DB
+                    # connections, clients); in that case fall back to the built-in
+                    # compressor with an ACCURATE message rather than silently
+                    # mislabelling it "not found".
+                    import copy
+                    try:
+                        _selected_engine = copy.deepcopy(_candidate)
+                    except Exception as _copy_err:
+                        _copy_failed = True
+                        _ra().logger.warning(
+                            "Context engine '%s' could not be safely copied for this "
+                            "agent (%s) — falling back to built-in compressor. Plugin "
+                            "engines that hold uncopyable state (locks, DB connections) "
+                            "should implement clone_for_agent() or __deepcopy__ to copy "
+                            "only mutable budget state.",
+                            _engine_name, _copy_err,
+                        )
+                        _selected_engine = None
 
         if _selected_engine is None and not _copy_failed:
             _ra().logger.warning(
@@ -1627,6 +1654,20 @@ def init_agent(
     # else: config says "compressor" — use built-in, don't auto-activate plugins
 
     if _selected_engine is not None:
+        _clone_for_agent = getattr(_selected_engine, "clone_for_agent", None)
+        if callable(_clone_for_agent) and not _selected_engine_agent_scoped:
+            try:
+                _engine_prototype = _selected_engine
+                _selected_engine = _clone_for_agent()
+                if _selected_engine is not _engine_prototype:
+                    setattr(_selected_engine, "_hermes_agent_owned_context_engine", True)
+            except Exception as _ce_clone_err:
+                _ra().logger.warning(
+                    "Context engine '%s' failed to clone per agent — using registered instance: %s",
+                    getattr(_selected_engine, "name", _engine_name),
+                    _ce_clone_err,
+                )
+
         agent.context_compressor = _selected_engine
         # Resolve context_length for plugin engines — mirrors switch_model() path
         from agent.model_metadata import get_model_context_length
@@ -1825,7 +1866,7 @@ def init_agent(
         # gateway users get the same text replayed via _compression_warning on
         # turn 1 (set below, after the warning slot is initialized).
         _autoraise = getattr(agent, "_compression_threshold_autoraised", None)
-        if _autoraise and compression_enabled:
+        if _autoraise and compression_enabled and _codex_gpt55_autoraise_notice:
             print(_build_codex_gpt55_autoraise_notice(_autoraise))
 
     # Check immediately so CLI users see the warning at startup.
@@ -1836,7 +1877,7 @@ def init_agent(
     # above only reaches the CLI, so stash the same text here to be replayed
     # through status_callback on the first turn (Telegram/Discord/Slack/etc.).
     _autoraise = getattr(agent, "_compression_threshold_autoraised", None)
-    if _autoraise and compression_enabled:
+    if _autoraise and compression_enabled and _codex_gpt55_autoraise_notice:
         agent._compression_warning = _build_codex_gpt55_autoraise_notice(_autoraise)
     # Lazy feasibility check: deferred to the first turn that approaches the
     # compression threshold. Running it eagerly here costs ~400ms cold (network

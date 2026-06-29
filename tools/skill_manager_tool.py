@@ -106,7 +106,9 @@ import yaml
 
 # All skills live in ~/.hermes/skills/ (single source of truth)
 HERMES_HOME = get_hermes_home()
-SKILLS_DIR = HERMES_HOME / "skills"
+# ABM local policy: agent-authored durable skills go straight into
+# the shared agentkit repo so Codex/Claude/OpenCode/Hermes see one source.
+SKILLS_DIR = Path.home() / "the3asic-agentkit" / "skills"
 
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024

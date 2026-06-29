@@ -593,6 +593,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             bridge_env["HERMES_AUDIO_CACHE_DIR"] = str(_get_audio_dir())
             bridge_env["HERMES_DOCUMENT_CACHE_DIR"] = str(_get_doc_dir())
 
+            _popen_kwargs = {} if _IS_WINDOWS else {"start_new_session": True}
             self._bridge_process = subprocess.Popen(
                 [
                     find_node_executable("node") or "node",
@@ -603,8 +604,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 ],
                 stdout=bridge_log_fh,
                 stderr=bridge_log_fh,
-                start_new_session=True,
                 env=bridge_env,
+                **_popen_kwargs,
             )
             _write_bridge_pidfile(self._session_path, self._bridge_process.pid)
             
