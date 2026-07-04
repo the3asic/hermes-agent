@@ -2948,6 +2948,68 @@ class AIAgent:
             self._pending_steer = None
         return text
 
+    @staticmethod
+    def _file_mutation_path_fingerprint(path: str) -> Dict[str, Any]:
+        """Return a cheap filesystem fingerprint for verifier recovery.
+
+        The file-mutation verifier normally clears failures when a later
+        ``write_file``/``patch`` result proves the same path landed. Some
+        legitimate recoveries happen through a different tool, usually
+        ``terminal`` or ``execute_code`` after ``write_file`` refuses a
+        sensitive system path. Capturing the path state at failure time lets
+        the turn finalizer suppress a stale warning only when the filesystem
+        itself proves the target changed afterward.
+        """
+        try:
+            candidate = Path(path).expanduser()
+            if not candidate.is_absolute():
+                candidate = Path.cwd() / candidate
+            stat = candidate.stat()
+            return {
+                "exists": True,
+                "path": str(candidate),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "mode": stat.st_mode,
+            }
+        except FileNotFoundError:
+            try:
+                candidate = Path(path).expanduser()
+                if not candidate.is_absolute():
+                    candidate = Path.cwd() / candidate
+                normalized = str(candidate)
+            except Exception:
+                normalized = str(path)
+            return {"exists": False, "path": normalized}
+        except OSError as exc:
+            return {
+                "exists": None,
+                "path": str(path),
+                "error": exc.__class__.__name__,
+            }
+
+    def _prune_landed_file_mutation_failures(self) -> None:
+        """Clear failed mutation warnings when an external fallback landed.
+
+        This is intentionally conservative: entries are removed only when the
+        target path's current fingerprint differs from the fingerprint captured
+        at the failed ``write_file``/``patch`` attempt. Unchanged paths remain
+        in the warning footer so true failed patches are still surfaced.
+        """
+        state = getattr(self, "_turn_failed_file_mutations", None)
+        if not state:
+            return
+        changed = getattr(self, "_turn_file_mutation_paths", None)
+        for path, info in list(state.items()):
+            before = info.get("pre_fingerprint") if isinstance(info, dict) else None
+            if before is None:
+                continue
+            after = self._file_mutation_path_fingerprint(path)
+            if after != before:
+                state.pop(path, None)
+                if changed is not None:
+                    changed.add(path)
+
     def _record_file_mutation_result(
         self,
         tool_name: str,
@@ -2963,10 +3025,11 @@ class AIAgent:
         state dict hasn't been initialised yet (e.g. a tool dispatched
         outside ``run_conversation``).
         """
-        if tool_name not in _FILE_MUTATING_TOOLS:
-            return
         state = getattr(self, "_turn_failed_file_mutations", None)
         if state is None:
+            return
+
+        if tool_name not in _FILE_MUTATING_TOOLS:
             return
         targets = _extract_file_mutation_targets(tool_name, args)
         if not targets:
@@ -2986,6 +3049,7 @@ class AIAgent:
                     state[path] = {
                         "tool": tool_name,
                         "error_preview": preview,
+                        "pre_fingerprint": self._file_mutation_path_fingerprint(path),
                     }
         else:
             for path in targets:
