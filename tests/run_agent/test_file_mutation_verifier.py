@@ -169,6 +169,46 @@ class TestRecordFileMutationResult:
         assert agent._turn_failed_file_mutations == {}
         assert agent._turn_file_mutation_paths == {"/tmp/a.md"}
 
+    def test_external_same_turn_write_clears_prior_failed_mutation(self, tmp_path):
+        """A terminal/execute_code fallback may land a sensitive-path write.
+
+        The verifier should stay enabled, but it should not claim a file was
+        NOT modified when the filesystem changed after the failed write_file
+        attempt.
+        """
+        agent = _bare_agent()
+        path = tmp_path / "hermes-dashboard-oidc.conf"
+
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": str(path), "content": "[Service]\nRestartForceExitStatus=SIGTERM\n"},
+            json.dumps({"error": "Refusing to write to sensitive system path"}),
+            is_error=True,
+        )
+        assert str(path) in agent._turn_failed_file_mutations
+
+        path.write_text("[Service]\nRestartForceExitStatus=SIGTERM\n")
+        agent._prune_landed_file_mutation_failures()
+
+        assert agent._turn_failed_file_mutations == {}
+        assert agent._turn_file_mutation_paths == {str(path)}
+
+    def test_external_unchanged_path_keeps_prior_failed_mutation(self, tmp_path):
+        """A failed patch against an unchanged existing file remains actionable."""
+        agent = _bare_agent()
+        path = tmp_path / "app.py"
+        path.write_text("print('before')\n")
+
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": str(path), "old_string": "missing", "new_string": "after"},
+            json.dumps({"error": "Could not find old_string"}),
+            is_error=True,
+        )
+        agent._prune_landed_file_mutation_failures()
+
+        assert str(path) in agent._turn_failed_file_mutations
+
     def test_success_records_landed_paths_for_verify_on_stop(self):
         agent = _bare_agent()
 
