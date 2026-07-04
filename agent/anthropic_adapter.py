@@ -559,6 +559,13 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
     if not normalized:
         return False
     normalized = normalized.rstrip("/").lower()
+    parsed = urlparse(normalized)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    path = (parsed.path or "").rstrip("/")
+    is_local_zhipu_shim = (
+        host in {"127.0.0.1", "localhost", "::1"}
+        and path == "/api/anthropic"
+    )
     return (
         normalized.startswith(("https://api.minimax.io/anthropic", "https://api.minimaxi.com/anthropic"))
         or "azure.com" in normalized
@@ -567,6 +574,8 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
         # Hostname match (not substring) so e.g. evil.com/palantirfoundry
         # paths don't trigger Bearer auth.
         or base_url_host_matches(normalized, "palantirfoundry.com")
+        or normalized.startswith("https://open.bigmodel.cn/api/anthropic")
+        or is_local_zhipu_shim
     )
 
 
