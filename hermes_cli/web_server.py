@@ -4213,6 +4213,13 @@ def _strip_session_list_rows(sessions: List[Dict[str, Any]]) -> List[Dict[str, A
     return sessions
 
 
+def _strip_internal_session_fields(session: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove routing/debug fields that are internal to server-side scoping."""
+    session.pop("scope_key", None)
+    session.pop("origin_json", None)
+    return session
+
+
 @app.get("/api/sessions")
 def get_sessions(
     limit: int = 20,
@@ -4300,6 +4307,7 @@ def get_sessions(
                     s["is_default_profile"] = profile_name == "default"
                 # SQLite stores the flag as 0/1; expose a real JSON boolean.
                 s["archived"] = bool(s.get("archived"))
+                _strip_internal_session_fields(s)
             if not full:
                 _strip_session_list_rows(sessions)
             return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
@@ -4418,6 +4426,7 @@ def get_profiles_sessions(
                     and (now - s.get("last_active", s.get("started_at", 0))) < 300
                 )
                 s["archived"] = bool(s.get("archived"))
+                _strip_internal_session_fields(s)
                 merged.append(s)
         except Exception as exc:
             errors.append({"profile": name, "error": str(exc)})
@@ -10931,7 +10940,7 @@ async def get_session_detail(session_id: str, profile: Optional[str] = None):
             raise HTTPException(status_code=404, detail="Session not found")
         if profile:
             session["profile"] = _cron_profile_home(profile)[0]
-        return session
+        return _strip_internal_session_fields(session)
     finally:
         db.close()
 
