@@ -195,6 +195,29 @@ class TestIncomingDocumentHandling:
         assert event.text.index("[Content of") < event.text.index("summarize this")
 
     @pytest.mark.asyncio
+    async def test_txt_content_not_injected_when_disabled(self, adapter):
+        """Raw-only mode caches text attachments without exposing bytes to the model."""
+        adapter.config.extra["inline_text_attachments"] = False
+        file_content = b"CLOUDFLARE_TOKEN_SHOULD_STAY_ONLY_IN_CACHE"
+
+        with _mock_aiohttp_download(file_content):
+            msg = make_message(
+                attachments=[make_attachment(filename="cloudflare-token.txt", content_type="text/plain")],
+                content="save this credential",
+            )
+            await adapter._handle_message(msg)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert "[Content of cloudflare-token.txt]:" not in event.text
+        assert "CLOUDFLARE_TOKEN" not in event.text
+        assert "save this credential" in event.text
+        assert len(event.media_urls) == 1
+        assert os.path.exists(event.media_urls[0])
+        with open(event.media_urls[0], "rb") as fh:
+            assert fh.read() == file_content
+        assert event.media_types == ["text/plain"]
+
+    @pytest.mark.asyncio
     async def test_md_content_injected(self, adapter):
         """.md file under 100KB should have its content injected."""
         file_content = b"# Title\nSome markdown content"
