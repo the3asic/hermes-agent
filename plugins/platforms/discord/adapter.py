@@ -4892,6 +4892,23 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_ALLOW_ANY_ATTACHMENT", "false").lower() in {"true", "1", "yes", "on"}
 
+    def _discord_inline_text_attachments(self) -> bool:
+        """Return whether small text documents are inlined into the user turn.
+
+        Default True preserves historical behaviour. Set
+        ``discord.inline_text_attachments: false`` or
+        ``DISCORD_INLINE_TEXT_ATTACHMENTS=false`` to keep text/zone/token files
+        raw-only: the attachment is still cached and surfaced by path, but its
+        bytes are not copied into the model-visible message text. This avoids
+        corrupting credential-bearing uploads via display/session redaction.
+        """
+        configured = self.config.extra.get("inline_text_attachments")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in {"false", "0", "no", "off", ""}
+            return bool(configured)
+        return os.getenv("DISCORD_INLINE_TEXT_ATTACHMENTS", "true").lower() not in {"false", "0", "no", "off", ""}
+
     def _discord_max_attachment_bytes(self) -> int:
         """Return the per-attachment byte cap. 0 means unlimited.
 
@@ -6558,7 +6575,7 @@ class DiscordAdapter(BasePlatformAdapter):
                             ext in _TEXT_INJECT_EXTENSIONS
                             or (content_type or "").startswith("text/")
                         )
-                        if _is_text and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                        if self._discord_inline_text_attachments() and _is_text and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
                             try:
                                 text_content = raw_bytes.decode("utf-8")
                                 display_name = att.filename or f"document{ext or '.txt'}"
