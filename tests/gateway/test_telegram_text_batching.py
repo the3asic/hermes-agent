@@ -43,6 +43,7 @@ def _make_adapter():
     adapter._set_status_indicator = AsyncMock()
     adapter._release_platform_lock = lambda: None
     adapter._text_batch_delay_seconds = 0.1  # fast for tests
+    adapter._text_batch_split_delay_seconds = 0.1
     adapter._active_sessions = {}
     adapter._pending_messages = {}
     adapter._message_handler = AsyncMock()
@@ -50,11 +51,18 @@ def _make_adapter():
     return adapter
 
 
-def _make_event(text: str, chat_id: str = "12345") -> MessageEvent:
+def _make_event(
+    text: str,
+    chat_id: str = "12345",
+    reply_to_message_id: str | None = None,
+    reply_to_text: str | None = None,
+) -> MessageEvent:
     return MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
         source=SessionSource(platform=Platform.TELEGRAM, chat_id=chat_id, chat_type="dm"),
+        reply_to_message_id=reply_to_message_id,
+        reply_to_text=reply_to_text,
     )
 
 
@@ -326,3 +334,81 @@ class TestTextBatching:
         assert adapter._media_group_events == {}
         assert adapter._media_group_tasks == {}
         assert adapter._polling_error_task is None
+
+    @pytest.mark.asyncio
+    async def test_incompatible_reply_context_not_merged_plain_then_reply(self):
+        """A rapid reply after a plain message must keep its quote context."""
+        adapter = _make_adapter()
+
+        adapter._enqueue_text_event(_make_event("plain"))
+        await asyncio.sleep(0.02)
+        adapter._enqueue_text_event(
+            _make_event(
+                "reply",
+                reply_to_message_id="42",
+                reply_to_text="quoted context",
+            )
+        )
+
+        await asyncio.sleep(0.25)
+
+        assert adapter.handle_message.call_count == 2
+        first = adapter.handle_message.call_args_list[0][0][0]
+        second = adapter.handle_message.call_args_list[1][0][0]
+        assert first.text == "plain"
+        assert first.reply_to_message_id is None
+        assert first.reply_to_text is None
+        assert second.text == "reply"
+        assert second.reply_to_message_id == "42"
+        assert second.reply_to_text == "quoted context"
+
+    @pytest.mark.asyncio
+    async def test_incompatible_reply_context_not_merged_reply_then_plain(self):
+        """A rapid plain message after a reply must not inherit the quote."""
+        adapter = _make_adapter()
+
+        adapter._enqueue_text_event(
+            _make_event(
+                "reply",
+                reply_to_message_id="42",
+                reply_to_text="quoted context",
+            )
+        )
+        await asyncio.sleep(0.02)
+        adapter._enqueue_text_event(_make_event("plain"))
+
+        await asyncio.sleep(0.25)
+
+        assert adapter.handle_message.call_count == 2
+        first = adapter.handle_message.call_args_list[0][0][0]
+        second = adapter.handle_message.call_args_list[1][0][0]
+        assert first.text == "reply"
+        assert first.reply_to_message_id == "42"
+        assert first.reply_to_text == "quoted context"
+        assert second.text == "plain"
+        assert second.reply_to_message_id is None
+        assert second.reply_to_text is None
+
+    @pytest.mark.asyncio
+    async def test_long_reply_split_continuation_preserves_reply_context(self):
+        """Near-limit reply chunks may be followed by no-reply continuations."""
+        adapter = _make_adapter()
+        first_chunk = "x" * adapter._SPLIT_THRESHOLD
+
+        adapter._enqueue_text_event(
+            _make_event(
+                first_chunk,
+                reply_to_message_id="42",
+                reply_to_text="quoted context",
+            )
+        )
+        await asyncio.sleep(0.02)
+        adapter._enqueue_text_event(_make_event("continuation"))
+
+        await asyncio.sleep(0.25)
+
+        adapter.handle_message.assert_called_once()
+        dispatched = adapter.handle_message.call_args[0][0]
+        assert dispatched.text == f"{first_chunk}\ncontinuation"
+        assert dispatched.reply_to_message_id == "42"
+        assert dispatched.reply_to_text == "quoted context"

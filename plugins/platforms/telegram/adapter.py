@@ -7628,6 +7628,31 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
 
+    def _text_batch_context_compatible(self, existing: MessageEvent, incoming: MessageEvent) -> bool:
+        """Return True when two text updates can be safely coalesced.
+
+        Telegram text batching exists to stitch together client-side splits of
+        one long message.  It must not merge unrelated rapid messages that have
+        different reply/quote context: doing so either drops the incoming
+        reply-to pointer or incorrectly applies an earlier quote to later text.
+
+        Preserve the long-message split case by allowing a no-reply continuation
+        after a near-4096-character chunk; Telegram clients may only attach the
+        reply metadata to the first chunk.
+        """
+        if (
+            existing.reply_to_message_id == incoming.reply_to_message_id
+            and existing.reply_to_text == incoming.reply_to_text
+        ):
+            return True
+
+        incoming_has_reply_context = bool(incoming.reply_to_message_id or incoming.reply_to_text)
+        existing_last_len = getattr(existing, "_last_chunk_len", len(existing.text or ""))
+        if existing_last_len >= self._SPLIT_THRESHOLD and not incoming_has_reply_context:
+            return True
+
+        return False
+
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
 
@@ -7643,6 +7668,19 @@ class TelegramAdapter(BasePlatformAdapter):
         key = self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
         chunk_len = len(event.text or "")
+        if existing is not None and not self._text_batch_context_compatible(existing, event):
+            prior_task = self._pending_text_batch_tasks.pop(key, None)
+            if prior_task and not prior_task.done():
+                prior_task.cancel()
+            self._pending_text_batches.pop(key, None)
+            logger.info(
+                "[Telegram] Flushing text batch %s before incompatible reply context (%d chars)",
+                key,
+                len(existing.text or ""),
+            )
+            asyncio.create_task(self.handle_message(existing))
+            existing = None
+
         if existing is None:
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
