@@ -490,7 +490,6 @@ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = _API_KEY_PROVIDER_AUX_MODELS_FALL
 # "exotic provider" branch checks this before falling back to the main model.
 _PROVIDER_VISION_MODELS: Dict[str, str] = {
     "xiaomi": "mimo-v2.5",
-    "zai": "glm-5v-turbo",
 }
 
 
@@ -526,13 +525,15 @@ def _resolve_provider_vision_default(provider: str) -> Optional[str]:
 # it must skip straight to the aggregator chain instead of returning a client
 # that will 404 on every vision request.
 #
-# kimi-coding / kimi-coding-cn: the Kimi Coding Plan routes through
-# api.kimi.com/coding (Anthropic Messages wire) which Kimi's own docs
-# describe as having no image_in capability. Vision lives on the separate
-# Kimi Platform (api.moonshot.ai, OpenAI-wire, pay-as-you-go).  See #17076.
+# Kimi Coding Plan routes through a text-only `/coding` endpoint; ZAI's
+# current auto mapping would pick GLM-5V-Turbo, which is not included in some
+# coding-plan subscriptions and fails with 1311.  Keep these providers
+# explicit-only for vision so auto can fall through to aggregator/native
+# vision backends instead of making a known-bad image request.
 _PROVIDERS_WITHOUT_VISION: frozenset = frozenset({
     "kimi-coding",
     "kimi-coding-cn",
+    "zai",
 })
 
 # OpenRouter app attribution headers (base — always sent).
@@ -2975,6 +2976,16 @@ def _is_timeout_error(exc: Exception) -> bool:
     if "Timeout" in type(exc).__name__:
         return True
     return "timed out" in str(exc).lower()
+
+def _is_codex_usage_limit_error(exc: Exception) -> bool:
+    """True for ChatGPT/Codex subscription usage-limit responses.
+
+    These limits can be model-specific (for example a Codex Spark quota) while
+    other Codex models on the same OAuth credential still work. Do not mark the
+    whole openai-codex credential pool exhausted for this auxiliary failure.
+    """
+    err_lower = str(exc).lower()
+    return "usage_limit_reached" in err_lower or "usage limit has been reached" in err_lower
 
 
 def _is_connection_error(exc: Exception) -> bool:
@@ -6863,7 +6874,10 @@ def call_llm(
                     if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
                         raise
                     recovery_err = retry_err
-            if _recover_provider_pool(pool_provider, recovery_err, failed_api_key=_client_api_key):
+            skip_pool_recovery = (
+                pool_provider == "openai-codex" and _is_codex_usage_limit_error(recovery_err)
+            )
+            if not skip_pool_recovery and _recover_provider_pool(pool_provider, recovery_err, failed_api_key=_client_api_key):
                 logger.info(
                     "Auxiliary %s: recovered %s via credential-pool rotation after %s",
                     task or "call", pool_provider, type(recovery_err).__name__,
@@ -6893,7 +6907,11 @@ def call_llm(
                     # alternative providers can still serve the request.
                     if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
                             or _is_rate_limit_error(retry2_err)):
-                        _recover_provider_pool(pool_provider, retry2_err)
+                        skip_retry2_recovery = (
+                            pool_provider == "openai-codex" and _is_codex_usage_limit_error(retry2_err)
+                        )
+                        if not skip_retry2_recovery:
+                            _recover_provider_pool(pool_provider, retry2_err)
                         first_err = retry2_err
                     else:
                         raise
@@ -7406,7 +7424,10 @@ async def async_call_llm(
                     if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
                         raise
                     recovery_err = retry_err
-            if _recover_provider_pool(pool_provider, recovery_err, failed_api_key=_client_api_key):
+            skip_pool_recovery = (
+                pool_provider == "openai-codex" and _is_codex_usage_limit_error(recovery_err)
+            )
+            if not skip_pool_recovery and _recover_provider_pool(pool_provider, recovery_err, failed_api_key=_client_api_key):
                 logger.info(
                     "Auxiliary %s (async): recovered %s via credential-pool rotation after %s",
                     task or "call", pool_provider, type(recovery_err).__name__,
@@ -7430,7 +7451,11 @@ async def async_call_llm(
                 except Exception as retry2_err:
                     if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
                             or _is_rate_limit_error(retry2_err)):
-                        _recover_provider_pool(pool_provider, retry2_err)
+                        skip_retry2_recovery = (
+                            pool_provider == "openai-codex" and _is_codex_usage_limit_error(retry2_err)
+                        )
+                        if not skip_retry2_recovery:
+                            _recover_provider_pool(pool_provider, retry2_err)
                         first_err = retry2_err
                     else:
                         raise

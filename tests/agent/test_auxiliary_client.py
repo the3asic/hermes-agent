@@ -2538,6 +2538,44 @@ class TestAuxiliaryFallbackLayering:
         mock_main.assert_not_called()
 
 
+    def test_codex_usage_limit_uses_fallback_without_exhausting_pool(self, monkeypatch):
+        """Codex model usage-limit in auxiliary calls must not poison OAuth pool.
+
+        A Spark quota wall can be model-specific while another Codex model on
+        the same OAuth credential still works. The auxiliary path should fall
+        through to configured fallback providers without marking the whole
+        ``openai-codex`` credential pool exhausted.
+        """
+        primary_client = MagicMock()
+        usage_err = Exception(
+            "Error code: 429 - {'error': {'type': 'usage_limit_reached', "
+            "'message': 'The usage limit has been reached'}}"
+        )
+        usage_err.status_code = 429
+        primary_client.chat.completions.create.side_effect = usage_err
+
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from glm fallback"))
+        ])
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gpt-5.3-codex-spark")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("openai-codex", "gpt-5.3-codex-spark", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(fallback_client, "glm-5.2", "fallback_chain[0](zai)")) as mock_chain, \
+             patch("agent.auxiliary_client._recover_provider_pool") as mock_recover:
+            result = call_llm(
+                task="kanban_decomposer",
+                messages=[{"role": "user", "content": "decompose this"}],
+            )
+
+        assert result.choices[0].message.content == "from glm fallback"
+        mock_chain.assert_called()
+        fallback_client.chat.completions.create.assert_called()
+        mock_recover.assert_not_called()
+
     def test_warning_emitted_when_all_fallbacks_exhausted(self, monkeypatch, caplog):
         """When chain AND main model both fail, a user-visible warning fires before re-raise."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
@@ -4142,10 +4180,9 @@ class TestCodexAdapterGithubResponsesMessageIdDrop:
 
 
 class TestVisionAutoSkipsKimiCoding:
-    """_resolve_auto vision branch skips providers that have no vision on
-    their main endpoint (e.g. Kimi Coding Plan /coding) and falls through
-    to the aggregator chain instead of handing back a client that will 404
-    on every request (#17076).
+    """_resolve_auto vision branch skips providers that have no usable vision on
+    their main endpoint and falls through to the aggregator chain instead of
+    handing back a client that will fail on every request (#17076).
     """
 
     def test_kimi_coding_skipped_falls_through_to_openrouter(self, monkeypatch):
@@ -4241,6 +4278,7 @@ class TestVisionAutoSkipsKimiCoding:
         assert _PROVIDERS_WITHOUT_VISION == frozenset({
             "kimi-coding",
             "kimi-coding-cn",
+            "zai",
         })
 
 

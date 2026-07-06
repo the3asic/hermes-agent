@@ -230,28 +230,46 @@ class TestResolveProviderClientModelNormalization:
 
 
 class TestResolveVisionProviderClientModelNormalization:
-    """Vision auto-routing should reuse the same provider-specific normalization."""
+    """Vision auto-routing should avoid provider-specific known-bad image routes."""
 
-    def test_vision_auto_strips_matching_main_provider_prefix(self, tmp_path):
+    def test_vision_auto_skips_zai_instead_of_requesting_glm_5v_turbo(self, tmp_path):
         _write_config(tmp_path, {
             "model": {"default": "zai/glm-5.1", "provider": "zai"},
         })
+        fake_or_client = MagicMock(name="openrouter_client")
         with (
-            patch("agent.auxiliary_client._read_nous_auth", return_value=None),
-            patch("hermes_cli.auth.resolve_api_key_provider_credentials", return_value={
-                "api_key": "glm-key",
-                "base_url": "https://api.z.ai/api/paas/v4",
-            }),
-            patch("agent.auxiliary_client.OpenAI") as mock_openai,
+            patch("agent.auxiliary_client.resolve_provider_client", side_effect=AssertionError(
+                "vision auto must not build a zai client or request glm-5v-turbo"
+            )),
+            patch("agent.auxiliary_client._resolve_strict_vision_backend",
+                  side_effect=lambda p, m=None: (fake_or_client, "google/gemini-3-flash-preview")
+                  if p == "openrouter" else (None, None)),
         ):
-            mock_openai.return_value = MagicMock()
             from agent.auxiliary_client import resolve_vision_provider_client
 
             provider, client, model = resolve_vision_provider_client()
 
+        assert provider == "openrouter"
+        assert client is fake_or_client
+        assert model == "google/gemini-3-flash-preview"
+
+    def test_explicit_zai_vision_override_still_honored(self, tmp_path):
+        _write_config(tmp_path, {
+            "model": {"default": "gpt-5.5", "provider": "openai-codex"},
+        })
+        fake_zai_client = MagicMock(name="zai_client")
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(fake_zai_client, "glm-5v-turbo")) as cached:
+            from agent.auxiliary_client import resolve_vision_provider_client
+
+            provider, client, model = resolve_vision_provider_client(
+                provider="zai", model="glm-5v-turbo"
+            )
+
         assert provider == "zai"
-        assert client is not None
-        assert model == "glm-5v-turbo"  # zai has dedicated vision model in _PROVIDER_VISION_MODELS
+        assert client is fake_zai_client
+        assert model == "glm-5v-turbo"
+        assert cached.call_args.kwargs.get("is_vision") is True
 
 
 class TestVisionPathApiMode:
