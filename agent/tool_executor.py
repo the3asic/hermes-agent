@@ -902,6 +902,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 try:
                     agent._record_file_mutation_result(
                         function_name, function_args, function_result, is_error,
+                        task_id=effective_task_id,
                     )
                 except Exception as _ver_err:
                     logging.debug("file-mutation verifier record failed: %s", _ver_err)
@@ -1606,6 +1607,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 agent._record_file_mutation_result(
                     function_name, function_args, function_result, _is_error_result,
+                    task_id=effective_task_id,
                 )
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)

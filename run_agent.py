@@ -2812,7 +2812,33 @@ class AIAgent:
         return text
 
     @staticmethod
-    def _file_mutation_path_fingerprint(path: str) -> Dict[str, Any]:
+    def _canonical_file_mutation_path(path: str, task_id: str = "default") -> str:
+        """Return the verifier key for a file-mutation path.
+
+        Tool calls may name the same file with a relative path in the failed
+        attempt (``skills/x.md``) and an absolute ``resolved_path`` /
+        ``files_modified`` path in the later successful attempt.  The verifier
+        must key both forms to the same file.  Prefer the file tool's task-aware
+        resolver so relative paths are anchored to the active workspace, not the
+        Hermes process cwd; fall back to a cwd-based absolute path only when the
+        resolver is unavailable (unit tests, early startup, or unusual callers).
+        """
+        text = str(path)
+        try:
+            from tools.file_tools import _resolve_path_for_task
+
+            return str(_resolve_path_for_task(text, task_id))
+        except Exception:
+            try:
+                candidate = Path(text).expanduser()
+                if not candidate.is_absolute():
+                    candidate = Path.cwd() / candidate
+                return str(candidate.resolve(strict=False))
+            except Exception:
+                return text
+
+    @classmethod
+    def _file_mutation_path_fingerprint(cls, path: str, task_id: str = "default") -> Dict[str, Any]:
         """Return a cheap filesystem fingerprint for verifier recovery.
 
         The file-mutation verifier normally clears failures when a later
@@ -2823,10 +2849,9 @@ class AIAgent:
         the turn finalizer suppress a stale warning only when the filesystem
         itself proves the target changed afterward.
         """
+        normalized = cls._canonical_file_mutation_path(path, task_id)
         try:
-            candidate = Path(path).expanduser()
-            if not candidate.is_absolute():
-                candidate = Path.cwd() / candidate
+            candidate = Path(normalized)
             stat = candidate.stat()
             return {
                 "exists": True,
@@ -2836,27 +2861,43 @@ class AIAgent:
                 "mode": stat.st_mode,
             }
         except FileNotFoundError:
-            try:
-                candidate = Path(path).expanduser()
-                if not candidate.is_absolute():
-                    candidate = Path.cwd() / candidate
-                normalized = str(candidate)
-            except Exception:
-                normalized = str(path)
             return {"exists": False, "path": normalized}
         except OSError as exc:
             return {
                 "exists": None,
-                "path": str(path),
+                "path": normalized,
                 "error": exc.__class__.__name__,
             }
 
-    def _prune_landed_file_mutation_failures(self) -> None:
-        """Clear failed mutation warnings when an external fallback landed.
+    def _pop_file_mutation_failures_for_keys(
+        self,
+        state: Dict[str, Dict[str, Any]],
+        keys: set[str],
+        *,
+        task_id: str = "default",
+    ) -> None:
+        """Remove failed-mutation entries that refer to any canonical key.
 
-        This is intentionally conservative: entries are removed only when the
-        target path's current fingerprint differs from the fingerprint captured
-        at the failed ``write_file``/``patch`` attempt. Unchanged paths remain
+        New entries are stored with canonical keys, but this helper also clears
+        legacy/raw keys defensively.  That keeps a successful absolute-path
+        patch from leaving behind an older relative-path failure if a future
+        caller bypasses canonical insertion.
+        """
+        if not state or not keys:
+            return
+        for existing in list(state.keys()):
+            if existing in keys or self._canonical_file_mutation_path(existing, task_id) in keys:
+                state.pop(existing, None)
+
+    def _prune_landed_file_mutation_failures(self, *, task_id: str = "default") -> None:
+        """Clear failed mutation warnings only when the file actually changed.
+
+        Successful ``write_file``/``patch`` calls clear older failures
+        immediately in ``_record_file_mutation_result``.  The finalizer must
+        not use the turn-wide landed-path accumulator to clear warnings because
+        that loses ordering: a file can succeed earlier in the turn and fail
+        later.  Here we only prune when the current fingerprint differs from
+        the fingerprint captured at the failed attempt.  Unchanged paths remain
         in the warning footer so true failed patches are still surfaced.
         """
         state = getattr(self, "_turn_failed_file_mutations", None)
@@ -2864,14 +2905,15 @@ class AIAgent:
             return
         changed = getattr(self, "_turn_file_mutation_paths", None)
         for path, info in list(state.items()):
+            key = self._canonical_file_mutation_path(path, task_id)
             before = info.get("pre_fingerprint") if isinstance(info, dict) else None
             if before is None:
                 continue
-            after = self._file_mutation_path_fingerprint(path)
+            after = self._file_mutation_path_fingerprint(path, task_id)
             if after != before:
                 state.pop(path, None)
                 if changed is not None:
-                    changed.add(path)
+                    changed.add(key)
 
     def _record_file_mutation_result(
         self,
@@ -2879,13 +2921,15 @@ class AIAgent:
         args: Dict[str, Any],
         result: Any,
         is_error: bool,
+        *,
+        task_id: str = "default",
     ) -> None:
         """Record a ``write_file`` / ``patch`` outcome for the turn-end verifier.
 
-        On failure, store ``{path: {error_preview, tool}}`` entries.  On
-        success, remove any prior failure entries for the same paths (the
-        model recovered within the turn).  Silently no-ops if the per-turn
-        state dict hasn't been initialised yet (e.g. a tool dispatched
+        On failure, store ``{canonical_path: {error_preview, tool}}`` entries.
+        On success, remove any prior failure entries for the same canonical
+        paths (the model recovered within the turn).  Silently no-ops if the
+        per-turn state dict hasn't been initialised yet (e.g. a tool dispatched
         outside ``run_conversation``).
         """
         state = getattr(self, "_turn_failed_file_mutations", None)
@@ -2897,26 +2941,48 @@ class AIAgent:
         targets = _extract_file_mutation_targets(tool_name, args)
         if not targets:
             return
+        target_keys = {
+            self._canonical_file_mutation_path(path, task_id)
+            for path in targets
+        }
         landed = file_mutation_result_landed(tool_name, result)
         if landed:
+            landed_paths = _extract_landed_file_mutation_paths(tool_name, args, result)
+            landed_keys = {
+                self._canonical_file_mutation_path(path, task_id)
+                for path in landed_paths
+            }
+            clear_keys = target_keys | landed_keys
             changed = getattr(self, "_turn_file_mutation_paths", None)
             if changed is not None:
-                changed.update(_extract_landed_file_mutation_paths(tool_name, args, result))
+                changed.update(landed_keys or target_keys)
+            self._pop_file_mutation_failures_for_keys(
+                state,
+                clear_keys,
+                task_id=task_id,
+            )
         if is_error and not landed:
             preview = _extract_error_preview(result)
             for path in targets:
+                key = self._canonical_file_mutation_path(path, task_id)
                 # Keep the FIRST error we saw for a given path unless we
                 # later see success.  A repeated failure with a different
                 # message shouldn't silently overwrite the original.
-                if path not in state:
-                    state[path] = {
+                if key not in state:
+                    state[key] = {
                         "tool": tool_name,
                         "error_preview": preview,
-                        "pre_fingerprint": self._file_mutation_path_fingerprint(path),
+                        "display_path": path,
+                        "pre_fingerprint": self._file_mutation_path_fingerprint(path, task_id),
                     }
+        elif not landed:
+            for key in target_keys:
+                state.pop(key, None)
         else:
-            for path in targets:
-                state.pop(path, None)
+            # Landed branch already cleared both call-arg targets and concrete
+            # result paths.  Keep this branch explicit so future edits do not
+            # accidentally fall back to raw path keys.
+            pass
 
     def _file_mutation_verifier_enabled(self) -> bool:
         """Check whether the per-turn file-mutation verifier footer is on.
@@ -3002,10 +3068,11 @@ class AIAgent:
                 break
             preview = (info.get("error_preview") or "").strip()
             tool = info.get("tool") or "patch"
+            display_path = info.get("display_path") or path
             if preview:
-                lines.append(f"  • `{path}` — [{tool}] {preview}")
+                lines.append(f"  • `{display_path}` — [{tool}] {preview}")
             else:
-                lines.append(f"  • `{path}` — [{tool}] failed")
+                lines.append(f"  • `{display_path}` — [{tool}] failed")
             shown += 1
         remaining = len(failed) - shown
         if remaining > 0:

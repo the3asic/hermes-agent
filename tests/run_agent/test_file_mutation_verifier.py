@@ -233,6 +233,228 @@ class TestRecordFileMutationResult:
 
         assert paths == ["/tmp/project/src/app.py"]
 
+    def test_canonical_key_normalization_relative_and_absolute(self, monkeypatch, tmp_path):
+        from pathlib import Path
+        import tools.file_tools as file_tools
+
+        root = tmp_path / "repo"
+        rel = "skills/shuorenhua/SKILL.md"
+        target = root / rel
+        target.parent.mkdir(parents=True)
+        target.write_text("before", encoding="utf-8")
+
+        def fake_resolve(path, task_id="default"):
+            p = Path(path)
+            return p if p.is_absolute() else root / p
+
+        monkeypatch.setattr(file_tools, "_resolve_path_for_task", fake_resolve)
+
+        assert AIAgent._canonical_file_mutation_path(rel, "task-1") == str(target)
+        assert AIAgent._canonical_file_mutation_path(str(target), "task-1") == str(target)
+
+    def test_relative_failure_cleared_by_absolute_success(self, monkeypatch, tmp_path):
+        from pathlib import Path
+        import tools.file_tools as file_tools
+
+        root = tmp_path / "repo"
+        rel = "skills/shuorenhua/SKILL.md"
+        target = root / rel
+        target.parent.mkdir(parents=True)
+        target.write_text("before", encoding="utf-8")
+
+        def fake_resolve(path, task_id="default"):
+            p = Path(path)
+            return p if p.is_absolute() else root / p
+
+        monkeypatch.setattr(file_tools, "_resolve_path_for_task", fake_resolve)
+
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": rel, "old_string": "x", "new_string": "y"},
+            json.dumps({"error": "old_string and new_string are identical"}),
+            is_error=True,
+            task_id="task-1",
+        )
+        assert set(agent._turn_failed_file_mutations) == {str(target)}
+
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": str(target), "old_string": "before", "new_string": "after"},
+            json.dumps({"success": True, "files_modified": [str(target)]}),
+            is_error=False,
+            task_id="task-1",
+        )
+
+        assert agent._turn_failed_file_mutations == {}
+
+    def test_relative_failure_cleared_by_external_fingerprint_change(self, monkeypatch, tmp_path):
+        from pathlib import Path
+        import tools.file_tools as file_tools
+
+        root = tmp_path / "repo"
+        rel = "skills/shuorenhua/SKILL.md"
+        target = root / rel
+        target.parent.mkdir(parents=True)
+        target.write_text("before", encoding="utf-8")
+
+        def fake_resolve(path, task_id="default"):
+            p = Path(path)
+            return p if p.is_absolute() else root / p
+
+        monkeypatch.setattr(file_tools, "_resolve_path_for_task", fake_resolve)
+
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": rel, "old_string": "missing", "new_string": "after"},
+            json.dumps({"error": "Could not find old_string"}),
+            is_error=True,
+            task_id="task-1",
+        )
+
+        target.write_text("after", encoding="utf-8")
+        agent._prune_landed_file_mutation_failures(task_id="task-1")
+
+        assert agent._turn_failed_file_mutations == {}
+
+    def test_relative_failure_unchanged_path_still_warns(self, monkeypatch, tmp_path):
+        from pathlib import Path
+        import tools.file_tools as file_tools
+
+        root = tmp_path / "repo"
+        rel = "skills/shuorenhua/SKILL.md"
+        target = root / rel
+        target.parent.mkdir(parents=True)
+        target.write_text("before", encoding="utf-8")
+
+        def fake_resolve(path, task_id="default"):
+            p = Path(path)
+            return p if p.is_absolute() else root / p
+
+        monkeypatch.setattr(file_tools, "_resolve_path_for_task", fake_resolve)
+
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": rel, "old_string": "missing", "new_string": "after"},
+            json.dumps({"error": "Could not find old_string"}),
+            is_error=True,
+            task_id="task-1",
+        )
+
+        agent._prune_landed_file_mutation_failures(task_id="task-1")
+
+        assert set(agent._turn_failed_file_mutations) == {str(target)}
+
+    def test_success_clears_legacy_relative_state_key(self, monkeypatch, tmp_path):
+        from pathlib import Path
+        import tools.file_tools as file_tools
+
+        root = tmp_path / "repo"
+        rel = "skills/shuorenhua/SKILL.md"
+        target = root / rel
+        target.parent.mkdir(parents=True)
+        target.write_text("before", encoding="utf-8")
+
+        def fake_resolve(path, task_id="default"):
+            p = Path(path)
+            return p if p.is_absolute() else root / p
+
+        monkeypatch.setattr(file_tools, "_resolve_path_for_task", fake_resolve)
+
+        agent = _bare_agent()
+        agent._turn_failed_file_mutations[rel] = {
+            "tool": "patch",
+            "error_preview": "old failure",
+            "pre_fingerprint": agent._file_mutation_path_fingerprint(rel, "task-1"),
+        }
+
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": str(target), "old_string": "before", "new_string": "after"},
+            json.dumps({"success": True, "files_modified": [str(target)]}),
+            is_error=False,
+            task_id="task-1",
+        )
+
+        assert agent._turn_failed_file_mutations == {}
+
+    def test_v4a_batch_failure_cleared_by_later_individual_successes(self, monkeypatch, tmp_path):
+        from pathlib import Path
+        import tools.file_tools as file_tools
+
+        root = tmp_path / "repo"
+        rel_a = "skills/shuorenhua/SKILL.md"
+        rel_b = "skills/now/SKILL.md"
+        target_a = root / rel_a
+        target_b = root / rel_b
+        target_a.parent.mkdir(parents=True)
+        target_b.parent.mkdir(parents=True)
+        target_a.write_text("before a", encoding="utf-8")
+        target_b.write_text("before b", encoding="utf-8")
+
+        def fake_resolve(path, task_id="default"):
+            p = Path(path)
+            return p if p.is_absolute() else root / p
+
+        monkeypatch.setattr(file_tools, "_resolve_path_for_task", fake_resolve)
+
+        body = (
+            "*** Begin Patch\n"
+            f"*** Update File: {rel_a}\n@@ @@\n-a\n+A\n"
+            f"*** Update File: {rel_b}\n@@ @@\n-b\n+B\n"
+            "*** End Patch\n"
+        )
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "patch", {"mode": "patch", "patch": body},
+            json.dumps({"error": "Patch validation failed: shuorenhua hunk not found"}),
+            is_error=True,
+            task_id="task-1",
+        )
+        assert set(agent._turn_failed_file_mutations) == {str(target_a), str(target_b)}
+
+        for target, before, after in (
+            (target_a, "before a", "after a"),
+            (target_b, "before b", "after b"),
+        ):
+            agent._record_file_mutation_result(
+                "patch",
+                {"mode": "replace", "path": str(target), "old_string": before, "new_string": after},
+                json.dumps({"success": True, "files_modified": [str(target)]}),
+                is_error=False,
+                task_id="task-1",
+            )
+
+        assert agent._turn_failed_file_mutations == {}
+
+    def test_success_before_failure_not_cleared_by_finalizer_landed_set(self, tmp_path):
+        path = tmp_path / "app.py"
+        path.write_text("before\n", encoding="utf-8")
+        agent = _bare_agent()
+
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": str(path), "content": "after\n"},
+            json.dumps({"bytes_written": 6, "files_modified": [str(path)]}),
+            is_error=False,
+        )
+        path.write_text("after\n", encoding="utf-8")
+        assert agent._turn_file_mutation_paths == {str(path)}
+
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": str(path), "old_string": "missing", "new_string": "later"},
+            json.dumps({"error": "Could not find old_string"}),
+            is_error=True,
+        )
+        assert str(path) in agent._turn_failed_file_mutations
+
+        agent._prune_landed_file_mutation_failures()
+
+        assert str(path) in agent._turn_failed_file_mutations
+
     def test_write_file_with_lint_error_counts_as_landed(self):
         agent = _bare_agent()
         agent._record_file_mutation_result(
