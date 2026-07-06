@@ -2213,16 +2213,20 @@ class TestGeneratedUnitUsesDetectedVenv:
         dot_venv = tmp_path / ".venv"
         dot_venv.mkdir()
         (dot_venv / "bin").mkdir()
+        legacy_venv = tmp_path / "venv"
+        legacy_venv.mkdir()
+        (legacy_venv / "bin").mkdir()
 
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(gateway_cli, "_detect_venv_dir", lambda: dot_venv)
         monkeypatch.setattr(gateway_cli, "get_python_path", lambda: str(dot_venv / "bin" / "python"))
 
         unit = gateway_cli.generate_systemd_unit(system=False)
+        path_line = next(line for line in unit.splitlines() if line.startswith('Environment="PATH='))
 
         assert f"VIRTUAL_ENV={dot_venv}" in unit
-        assert f"{dot_venv}/bin" in unit
-        # Must NOT contain a hardcoded /venv/ path
-        assert "/venv/" not in unit or "/.venv/" in unit
+        assert f"{dot_venv}/bin" in path_line
+        assert f"{legacy_venv}/bin" not in path_line
 
 
 class TestGeneratedUnitIncludesLocalBin:

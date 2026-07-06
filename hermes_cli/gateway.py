@@ -2663,11 +2663,18 @@ def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
 
     candidates = []
 
-    venv_bin = project_root / "venv" / "bin"
-    if _is_dir(venv_bin):
-        candidates.append(str(venv_bin))
-    elif sys.prefix != sys.base_prefix:
-        candidates.append(str(Path(sys.prefix) / "bin"))
+    venv_roots: list[Path] = []
+    detected_venv = _detect_venv_dir()
+    if detected_venv is not None:
+        venv_roots.append(detected_venv)
+    venv_roots.extend([project_root / ".venv", project_root / "venv"])
+    if sys.prefix != sys.base_prefix:
+        venv_roots.append(Path(sys.prefix))
+    for venv_root in venv_roots:
+        venv_bin = venv_root / ("Scripts" if is_windows() else "bin")
+        if _is_dir(venv_bin):
+            candidates.append(str(venv_bin))
+            break
 
     node_bin = project_root / "node_modules" / ".bin"
     if _is_dir(node_bin):
