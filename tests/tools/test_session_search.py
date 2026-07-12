@@ -85,6 +85,13 @@ class TestSchema:
         params = SESSION_SEARCH_SCHEMA["parameters"]["properties"]
         assert params["sort"]["enum"] == ["newest", "oldest"]
 
+    def test_scope_defaults_to_current_with_explicit_all_opt_in(self):
+        params = SESSION_SEARCH_SCHEMA["parameters"]["properties"]
+        assert params["scope"]["enum"] == ["current", "all"]
+        assert params["scope"]["default"] == "current"
+        assert "Telegram topics" in SESSION_SEARCH_SCHEMA["description"]
+        assert 'scope="all"' in SESSION_SEARCH_SCHEMA["description"]
+
     def test_schema_description_teaches_scroll(self):
         desc = SESSION_SEARCH_SCHEMA["description"]
         assert "SCROLL" in desc
@@ -253,6 +260,351 @@ class TestDiscoveryShape:
         result = json.loads(session_search(query="modpack", db=db, current_session_id="s_newest"))
         sids = [r["session_id"] for r in result["results"]]
         assert "s_newest" not in sids
+
+
+class TestGatewayCurrentScope:
+    @staticmethod
+    def _seed(
+        db,
+        session_id,
+        *,
+        source,
+        chat_id=None,
+        thread_id=None,
+        content="scopeprobe 记忆范围",
+        title=None,
+        parent_session_id=None,
+        origin_json=None,
+    ):
+        db.create_session(
+            session_id,
+            source=source,
+            chat_id=chat_id,
+            chat_type="thread" if thread_id else "group",
+            thread_id=thread_id,
+            parent_session_id=parent_session_id,
+        )
+        if title:
+            db.set_session_title(session_id, title)
+        if origin_json:
+            db._conn.execute(
+                "UPDATE sessions SET origin_json = ? WHERE id = ?",
+                (json.dumps(origin_json), session_id),
+            )
+        message_id = db.append_message(session_id, role="user", content=content)
+        db._conn.commit()
+        return message_id
+
+    @pytest.mark.parametrize("query", ["scopeprobe", "范围", "记忆范围"])
+    def test_telegram_topic_discovery_is_sql_scoped(self, db, query):
+        self._seed(
+            db,
+            "tg_current",
+            source="telegram",
+            chat_id="chat-a",
+            thread_id="topic-1",
+            content="current turn",
+        )
+        self._seed(
+            db,
+            "tg_same_topic",
+            source="telegram",
+            chat_id="chat-a",
+            thread_id="topic-1",
+        )
+        self._seed(
+            db,
+            "tg_other_topic",
+            source="telegram",
+            chat_id="chat-a",
+            thread_id="topic-2",
+        )
+        self._seed(
+            db,
+            "tg_other_chat",
+            source="telegram",
+            chat_id="chat-b",
+            thread_id="topic-1",
+        )
+        self._seed(
+            db,
+            "discord_same_ids",
+            source="discord",
+            chat_id="chat-a",
+            thread_id="topic-1",
+        )
+
+        scoped = json.loads(session_search(
+            query=query,
+            current_session_id="tg_current",
+            limit=10,
+            db=db,
+        ))
+        assert [row["session_id"] for row in scoped["results"]] == ["tg_same_topic"]
+
+        profile_wide = json.loads(session_search(
+            query=query,
+            current_session_id="tg_current",
+            scope="all",
+            limit=10,
+            db=db,
+        ))
+        assert {
+            "tg_same_topic",
+            "tg_other_topic",
+            "tg_other_chat",
+            "discord_same_ids",
+        }.issubset({row["session_id"] for row in profile_wide["results"]})
+
+    def test_telegram_chat_without_topic_includes_its_topics(self, db):
+        self._seed(
+            db,
+            "tg_current",
+            source="telegram",
+            chat_id="chat-a",
+            content="current turn",
+        )
+        self._seed(
+            db,
+            "tg_root",
+            source="telegram",
+            chat_id="chat-a",
+        )
+        self._seed(
+            db,
+            "tg_topic",
+            source="telegram",
+            chat_id="chat-a",
+            thread_id="topic-1",
+        )
+        self._seed(
+            db,
+            "tg_other_chat",
+            source="telegram",
+            chat_id="chat-b",
+        )
+
+        result = json.loads(session_search(
+            query="scopeprobe",
+            current_session_id="tg_current",
+            limit=10,
+            db=db,
+        ))
+        assert {row["session_id"] for row in result["results"]} == {"tg_root", "tg_topic"}
+
+    def test_discord_thread_uses_its_independent_chat_id(self, db):
+        self._seed(
+            db,
+            "discord_current",
+            source="discord",
+            chat_id="thread-a",
+            thread_id="thread-a",
+            content="current turn",
+        )
+        self._seed(
+            db,
+            "discord_same_thread",
+            source="discord",
+            chat_id="thread-a",
+            thread_id="thread-a",
+        )
+        self._seed(
+            db,
+            "discord_sibling_thread",
+            source="discord",
+            chat_id="thread-b",
+            thread_id="thread-b",
+        )
+        self._seed(
+            db,
+            "discord_parent_channel",
+            source="discord",
+            chat_id="parent-channel",
+        )
+
+        result = json.loads(session_search(
+            query="scopeprobe",
+            current_session_id="discord_current",
+            limit=10,
+            db=db,
+        ))
+        assert [row["session_id"] for row in result["results"]] == ["discord_same_thread"]
+
+    def test_browse_and_title_match_stay_in_current_topic(self, db):
+        self._seed(
+            db,
+            "tg_current",
+            source="telegram",
+            chat_id="chat-a",
+            thread_id="topic-1",
+            content="current turn",
+        )
+        self._seed(
+            db,
+            "tg_same_topic",
+            source="telegram",
+            chat_id="chat-a",
+            thread_id="topic-1",
+            content="same topic",
+        )
+        self._seed(
+            db,
+            "tg_other_topic",
+            source="telegram",
+            chat_id="chat-a",
+            thread_id="topic-2",
+            content="other topic",
+            title="other-topic-title",
+        )
+
+        browse = json.loads(session_search(current_session_id="tg_current", db=db))
+        assert [row["session_id"] for row in browse["results"]] == ["tg_same_topic"]
+
+        title = json.loads(session_search(
+            query="other-topic-title",
+            current_session_id="tg_current",
+            db=db,
+        ))
+        assert title["results"] == []
+
+    def test_read_and_scroll_reject_wrong_scope_without_message_content(self, db):
+        self._seed(
+            db,
+            "tg_current",
+            source="telegram",
+            chat_id="chat-a",
+            thread_id="topic-1",
+            content="current turn",
+        )
+        blocked_id = self._seed(
+            db,
+            "tg_other_topic",
+            source="telegram",
+            chat_id="chat-a",
+            thread_id="topic-2",
+            content="wrong scope fixture payload",
+        )
+        self._seed(
+            db,
+            "tg_same_topic",
+            source="telegram",
+            chat_id="chat-a",
+            thread_id="topic-1",
+            content="same scope fixture payload",
+        )
+
+        read_raw = session_search(
+            session_id="tg_other_topic",
+            current_session_id="tg_current",
+            db=db,
+        )
+        read = json.loads(read_raw)
+        assert read["success"] is False
+        assert "wrong scope fixture payload" not in read_raw
+
+        scroll_raw = session_search(
+            session_id="tg_other_topic",
+            around_message_id=blocked_id,
+            current_session_id="tg_current",
+            db=db,
+        )
+        scroll = json.loads(scroll_raw)
+        assert scroll["success"] is False
+        assert "wrong scope fixture payload" not in scroll_raw
+
+        mixed_scroll_raw = session_search(
+            session_id="tg_same_topic",
+            around_message_id=blocked_id,
+            current_session_id="tg_current",
+            db=db,
+        )
+        assert json.loads(mixed_scroll_raw)["success"] is False
+        assert "wrong scope fixture payload" not in mixed_scroll_raw
+
+        read_all = json.loads(session_search(
+            session_id="tg_other_topic",
+            current_session_id="tg_current",
+            scope="all",
+            db=db,
+        ))
+        assert read_all["success"] is True
+        assert read_all["messages"][0]["content"] == "wrong scope fixture payload"
+
+        scroll_all = json.loads(session_search(
+            session_id="tg_other_topic",
+            around_message_id=blocked_id,
+            current_session_id="tg_current",
+            scope="all",
+            db=db,
+        ))
+        assert scroll_all["success"] is True
+        assert scroll_all["messages"][0]["content"] == "wrong scope fixture payload"
+
+    def test_legacy_compression_child_recovers_origin_scope_from_parent(self, db):
+        self._seed(
+            db,
+            "tg_parent",
+            source="gateway",
+            content="parent turn",
+            origin_json={
+                "platform": "telegram",
+                "chat_id": "chat-a",
+                "thread_id": "topic-1",
+            },
+        )
+        self._seed(
+            db,
+            "tg_current_child",
+            source="telegram",
+            parent_session_id="tg_parent",
+            content="current child turn",
+        )
+        self._seed(
+            db,
+            "tg_same_topic",
+            source="telegram",
+            chat_id="chat-a",
+            thread_id="topic-1",
+        )
+        self._seed(
+            db,
+            "tg_other_topic",
+            source="telegram",
+            chat_id="chat-a",
+            thread_id="topic-2",
+        )
+
+        result = json.loads(session_search(
+            query="scopeprobe",
+            current_session_id="tg_current_child",
+            limit=10,
+            db=db,
+        ))
+        assert [row["session_id"] for row in result["results"]] == ["tg_same_topic"]
+
+    def test_gateway_session_without_peer_metadata_fails_closed(self, db):
+        self._seed(
+            db,
+            "tg_current_unknown_peer",
+            source="telegram",
+            content="current turn",
+        )
+        self._seed(
+            db,
+            "tg_elsewhere",
+            source="telegram",
+            chat_id="other-chat",
+            content="must not leak from another chat",
+        )
+
+        raw = session_search(
+            query="leak",
+            current_session_id="tg_current_unknown_peer",
+            db=db,
+        )
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert "must not leak from another chat" not in raw
 
 
 class TestDiscoverySort:
@@ -502,6 +854,12 @@ class TestCrossProfileRead:
         monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: home)
 
     def test_profile_param_reads_other_db(self, db, tmp_path, monkeypatch):
+        db.create_session(
+            "tg_current",
+            source="telegram",
+            chat_id="current-chat",
+            thread_id="current-topic",
+        )
         other_home = tmp_path / "other_home"
         other_home.mkdir()
         other = SessionDB(other_home / "state.db")
@@ -515,7 +873,12 @@ class TestCrossProfileRead:
         self._patch_profiles(monkeypatch, other_home)
 
         # s_other lives only in the other profile; the current `db` lacks it.
-        result = json.loads(session_search(session_id="s_other", profile="other", db=db))
+        result = json.loads(session_search(
+            session_id="s_other",
+            profile="other",
+            current_session_id="tg_current",
+            db=db,
+        ))
         assert result["success"] is True
         assert result["mode"] == "read"
         assert result["session_meta"]["title"] == "Other Profile Chat"

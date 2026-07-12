@@ -55,6 +55,76 @@ _DEMOTED_SESSION_SOURCES = ("cron",)
 # the handful of distinct sessions a typical query returns.
 _DISCOVER_SCAN_LIMIT = 300
 
+_CURRENT_SCOPE_SOURCES = ("telegram", "discord")
+
+
+def _current_gateway_scope(
+    db, current_session_id: Optional[str]
+) -> Optional[Dict[str, str]]:
+    """Recover the current Telegram/Discord peer from durable session metadata.
+
+    Legacy compression continuations may have only ``source`` and
+    ``parent_session_id`` on the child row. Walk toward the lineage root until a
+    row has a reliable chat id; ``origin_json`` is a fallback for rows written
+    before the dedicated peer columns were populated.
+    """
+    if not current_session_id:
+        return None
+
+    visited = set()
+    sid = current_session_id
+    while sid and sid not in visited:
+        visited.add(sid)
+        try:
+            meta = db.get_session(sid) or {}
+        except Exception:
+            logging.debug("Could not load current session scope for %s", sid, exc_info=True)
+            return None
+        if not meta:
+            return None
+
+        origin: Dict[str, Any] = {}
+        raw_origin = meta.get("origin_json")
+        if isinstance(raw_origin, str) and raw_origin:
+            try:
+                decoded = json.loads(raw_origin)
+                if isinstance(decoded, dict):
+                    origin = decoded
+            except (TypeError, ValueError):
+                pass
+
+        source = str(meta.get("source") or "").strip().lower()
+        origin_source = str(origin.get("platform") or "").strip().lower()
+        if source not in _CURRENT_SCOPE_SOURCES:
+            source = origin_source
+        chat_id = meta.get("chat_id")
+        if chat_id in (None, ""):
+            chat_id = origin.get("chat_id")
+
+        if source in _CURRENT_SCOPE_SOURCES and chat_id not in (None, ""):
+            scope = {"source": source, "chat_id": str(chat_id)}
+            # Telegram topics share one chat_id, so an active topic needs the
+            # extra discriminator. Discord persists a thread's own id as chat_id.
+            if source == "telegram":
+                thread_id = meta.get("thread_id")
+                if thread_id in (None, ""):
+                    thread_id = origin.get("thread_id")
+                if thread_id not in (None, ""):
+                    scope["thread_id"] = str(thread_id)
+            return scope
+
+        sid = meta.get("parent_session_id")
+
+    return None
+
+
+def _scope_not_found_error() -> str:
+    return tool_error(
+        "session_id not found in the current gateway scope; pass scope='all' "
+        "only for an explicit profile-wide read",
+        success=False,
+    )
+
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     """Convert a Unix timestamp (float/int) or ISO string to a human-readable date.
@@ -208,7 +278,13 @@ def _locate_session_db(session_id: str):
     return None, None
 
 
-def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
+def _read_session(
+    db,
+    session_id: str,
+    head: int = 20,
+    tail: int = 10,
+    scope_filter: Optional[Dict[str, str]] = None,
+) -> str:
     """Read shape: dump a whole session by id (head + tail when large).
 
     Serves the linked-session case — the user dropped an @session reference and
@@ -217,11 +293,13 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
     pointer to scroll the middle.
     """
     try:
-        meta = db.get_session(session_id) or {}
+        meta = db.get_session(session_id, **(scope_filter or {})) or {}
     except Exception as e:
         logging.debug("get_session failed for %s: %s", session_id, e, exc_info=True)
         meta = {}
     if not meta:
+        if scope_filter:
+            return _scope_not_found_error()
         return tool_error(f"session_id not found: {session_id}", success=False)
 
     try:
@@ -257,10 +335,18 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
     return json.dumps(response, ensure_ascii=False)
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
+def _list_recent_sessions(
+    db,
+    limit: int,
+    current_session_id: Optional[str] = None,
+    scope_filter: Optional[Dict[str, str]] = None,
+) -> str:
     """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
     try:
         sessions = db.list_sessions_rich(
+            source=scope_filter.get("source") if scope_filter else None,
+            chat_id=scope_filter.get("chat_id") if scope_filter else None,
+            thread_id=scope_filter.get("thread_id") if scope_filter else None,
             limit=limit + 5,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             order_by_last_active=True,
@@ -305,7 +391,8 @@ def _scroll(
     session_id: str,
     around_message_id: int,
     window: int = 5,
-    current_session_id: str = None,
+    current_session_id: Optional[str] = None,
+    scope_filter: Optional[Dict[str, str]] = None,
 ) -> str:
     """Scroll shape: return a window of messages centered on an anchor.
 
@@ -330,6 +417,18 @@ def _scroll(
             window = 5
     window = max(1, min(window, 20))
 
+    # Session existence + gateway-scope check. Do this before the lineage guard
+    # so a wrong-scope id cannot reveal how it relates to the active session.
+    try:
+        session_meta = db.get_session(session_id, **(scope_filter or {})) or {}
+    except Exception as e:
+        logging.debug("get_session failed for %s: %s", session_id, e, exc_info=True)
+        session_meta = {}
+    if not session_meta:
+        if scope_filter:
+            return _scope_not_found_error()
+        return tool_error(f"session_id not found: {session_id}", success=False)
+
     # Reject scrolling inside the active session lineage — those messages are
     # already in context.
     if current_session_id:
@@ -340,15 +439,6 @@ def _scroll(
                 "scroll rejected: anchor lives in the current session lineage (already in your active context)",
                 success=False,
             )
-
-    # Session existence check
-    try:
-        session_meta = db.get_session(session_id) or {}
-    except Exception as e:
-        logging.debug("get_session failed for %s: %s", session_id, e, exc_info=True)
-        session_meta = {}
-    if not session_meta:
-        return tool_error(f"session_id not found: {session_id}", success=False)
 
     # Fetch the window
     try:
@@ -379,7 +469,11 @@ def _scroll(
         if owning and owning != session_id:
             a_root = _resolve_to_parent(db, session_id)
             o_root = _resolve_to_parent(db, owning)
-            if a_root and o_root and a_root == o_root:
+            try:
+                owning_meta = db.get_session(owning, **(scope_filter or {})) or {}
+            except Exception:
+                owning_meta = {}
+            if owning_meta and a_root and o_root and a_root == o_root:
                 try:
                     rebind_view = db.get_messages_around(owning, around_message_id, window=window)
                     messages = rebind_view.get("window") or []
@@ -389,10 +483,7 @@ def _scroll(
                             f"around_message_id {around_message_id} lives in {owning} "
                             f"(child of {session_id}); rebound transparently"
                         )
-                        try:
-                            session_meta = db.get_session(owning) or session_meta
-                        except Exception:
-                            pass
+                        session_meta = owning_meta
                         session_id = owning
                 except Exception as e:
                     logging.debug("rebind get_messages_around failed: %s", e, exc_info=True)
@@ -433,6 +524,7 @@ def _title_match_result(
     db,
     query: str,
     current_lineage_root: Optional[str],
+    scope_filter: Optional[Dict[str, str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return a discovery-shaped result when the query matches a session title."""
     title_query = _normalize_title_query(query)
@@ -440,7 +532,7 @@ def _title_match_result(
         return None
 
     try:
-        session_id = db.resolve_session_by_title(title_query)
+        session_id = db.resolve_session_by_title(title_query, **(scope_filter or {}))
     except Exception:
         logging.debug("resolve_session_by_title failed for %r", title_query, exc_info=True)
         return None
@@ -452,7 +544,11 @@ def _title_match_result(
         return None
 
     try:
-        session_meta = db.get_session(lineage_root) or db.get_session(session_id) or {}
+        session_meta = (
+            db.get_session(lineage_root, **(scope_filter or {}))
+            or db.get_session(session_id, **(scope_filter or {}))
+            or {}
+        )
     except Exception:
         logging.debug("get_session failed for title match %s", session_id, exc_info=True)
         session_meta = {}
@@ -502,16 +598,25 @@ def _discover(
     role_filter: Optional[List[str]],
     limit: int,
     sort: Optional[str],
-    current_session_id: str = None,
+    current_session_id: Optional[str] = None,
+    scope_filter: Optional[Dict[str, str]] = None,
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
     current_lineage_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
-    title_result = _title_match_result(db, query, current_lineage_root)
+    title_result = _title_match_result(
+        db,
+        query,
+        current_lineage_root,
+        scope_filter=scope_filter,
+    )
 
     try:
         raw_results = db.search_messages(
             query=query,
+            source_filter=[scope_filter["source"]] if scope_filter else None,
+            chat_id=scope_filter.get("chat_id") if scope_filter else None,
+            thread_id=scope_filter.get("thread_id") if scope_filter else None,
             role_filter=role_list,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             limit=_DISCOVER_SCAN_LIMIT,  # widen so dedup-by-lineage can find
@@ -581,7 +686,11 @@ def _discover(
             continue
 
         try:
-            session_meta = db.get_session(lineage_root) or {}
+            session_meta = (
+                db.get_session(lineage_root, **(scope_filter or {}))
+                or db.get_session(hit_sid, **(scope_filter or {}))
+                or {}
+            )
         except Exception:
             session_meta = {}
 
@@ -621,7 +730,7 @@ def session_search(
     role_filter: str = None,
     limit: int = 3,
     db=None,
-    current_session_id: str = None,
+    current_session_id: Optional[str] = None,
     # Scroll shape
     session_id: str = None,
     around_message_id: int = None,
@@ -630,6 +739,8 @@ def session_search(
     sort: str = None,
     # Cross-profile (any shape)
     profile: str = None,
+    # Gateway search boundary
+    scope: str = "current",
 ) -> str:
     """Single-shape tool. Mode inferred from which args are set.
 
@@ -640,7 +751,9 @@ def session_search(
 
     Pass ``profile`` to read another profile's sessions (e.g. resolving an
     ``@session:<profile>/<id>`` link). Scroll wins over read/discovery when an
-    anchor is set — the agent has asked for a specific slice.
+    anchor is set — the agent has asked for a specific slice. Telegram and
+    Discord gateway calls default to the current chat/thread; pass
+    ``scope="all"`` for an explicit profile-wide lookup.
     """
     if db is None:
         try:
@@ -650,6 +763,15 @@ def session_search(
             logging.debug("SessionDB unavailable for session_search", exc_info=True)
             from hermes_state import format_session_db_unavailable
             return tool_error(format_session_db_unavailable(), success=False)
+
+    if not isinstance(scope, str) or scope.strip().lower() not in ("current", "all"):
+        return tool_error("scope must be 'current' or 'all'", success=False)
+    scope_norm = scope.strip().lower()
+    scope_filter = (
+        None
+        if scope_norm == "all"
+        else _current_gateway_scope(db, current_session_id)
+    )
 
     # Normalise a raw `@session:<profile>/<id>` link value passed as session_id.
     # Session ids never contain "/", so a slash unambiguously means profile/id —
@@ -674,6 +796,24 @@ def session_search(
         if profile_db is not None:
             db = profile_db
             current_session_id = None
+            # Naming another profile is already an explicit cross-profile action.
+            # Do not carry the origin profile's chat/thread filter into that DB.
+            scope_filter = None
+
+    # A known Telegram/Discord session without reliable peer metadata must not
+    # silently widen to profile-global recall. CLI/local sessions keep the
+    # historical global behavior because their source is outside this boundary.
+    if scope_norm == "current" and current_session_id and scope_filter is None:
+        try:
+            current_meta = db.get_session(current_session_id) or {}
+        except Exception:
+            current_meta = {}
+        if str(current_meta.get("source") or "").strip().lower() in _CURRENT_SCOPE_SOURCES:
+            return tool_error(
+                "current gateway session has no reliable chat/thread scope; "
+                "refusing profile-wide session search",
+                success=False,
+            )
 
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
@@ -683,19 +823,20 @@ def session_search(
             around_message_id=around_message_id,
             window=window,
             current_session_id=current_session_id,
+            scope_filter=scope_filter,
         )
 
     # Read shape: a session_id with no anchor → dump the whole session.
     if isinstance(session_id, str) and session_id.strip():
         sid = session_id.strip()
-        result = _read_session(db, sid)
+        result = _read_session(db, sid, scope_filter=scope_filter)
         if json.loads(result).get("success"):
             return result
 
         # Miss in the target profile — the model may have dropped the owning
         # profile from the link. Scan every profile and read it from wherever
         # it lives, tagging the profile it was found in.
-        located, owner = _locate_session_db(sid)
+        located, owner = _locate_session_db(sid) if scope_filter is None else (None, None)
         if located is not None:
             try:
                 found = json.loads(_read_session(located, sid))
@@ -716,7 +857,12 @@ def session_search(
 
     # Browse shape: no query → recent sessions.
     if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id)
+        return _list_recent_sessions(
+            db,
+            limit,
+            current_session_id,
+            scope_filter=scope_filter,
+        )
 
     # Parse role_filter
     role_list: Optional[List[str]] = None
@@ -737,6 +883,7 @@ def session_search(
         limit=limit,
         sort=sort_norm,
         current_session_id=current_session_id,
+        scope_filter=scope_filter,
     )
 
 
@@ -755,6 +902,13 @@ SESSION_SEARCH_SCHEMA = {
         "Search past sessions stored in the local session DB, or scroll inside one. "
         "FTS5-backed retrieval over the SQLite message store. No LLM calls — every "
         "shape returns actual messages from the DB.\n\n"
+        "GATEWAY SCOPE\n\n"
+        "  In Telegram and Discord conversations, discovery, browse, read, and "
+        "scroll default to the current chat. Telegram topics are further limited "
+        "to the current topic; Discord threads already persist their own thread id "
+        "as chat_id. Set scope=\"all\" only when the user explicitly asks to search "
+        "or read across the whole current profile. CLI and contexts without a "
+        "reliable gateway peer keep profile-wide behavior.\n\n"
         "SOURCE-FIRST LIMIT\n\n"
         "  This tool searches Hermes conversation history only. It is not evidence "
         "about the current contents of external sources. If the user provided a "
@@ -891,6 +1045,18 @@ SESSION_SEARCH_SCHEMA = {
                     "Omit to use the current profile."
                 ),
             },
+            "scope": {
+                "type": "string",
+                "enum": ["current", "all"],
+                "description": (
+                    "Gateway search boundary. Defaults to 'current': Telegram is "
+                    "limited to the current chat and, when present, topic; Discord "
+                    "is limited to the current channel/thread. Use 'all' only for "
+                    "an explicit profile-wide search or read. CLI/non-gateway "
+                    "contexts remain profile-wide."
+                ),
+                "default": "current",
+            },
         },
         "required": [],
     },
@@ -913,6 +1079,7 @@ registry.register(
         window=args.get("window", 5),
         sort=args.get("sort"),
         profile=args.get("profile"),
+        scope=args.get("scope", "current"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
     ),

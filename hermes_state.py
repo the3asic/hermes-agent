@@ -2824,11 +2824,29 @@ class SessionDB:
 
         return self._execute_write(_do) or 0
 
-    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Get a session by ID."""
+    def get_session(
+        self,
+        session_id: str,
+        *,
+        source: str = None,
+        chat_id: str = None,
+        thread_id: str = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Get a session by ID, optionally constrained to a gateway peer."""
+        clauses = ["id = ?"]
+        params: List[Any] = [session_id]
+        if source is not None:
+            clauses.append("source = ?")
+            params.append(source)
+        if chat_id is not None:
+            clauses.append("chat_id = ?")
+            params.append(str(chat_id))
+        if thread_id is not None:
+            clauses.append("thread_id = ?")
+            params.append(str(thread_id))
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT * FROM sessions WHERE id = ?", (session_id,)
+                f"SELECT * FROM sessions WHERE {' AND '.join(clauses)}", params
             )
             row = cursor.fetchone()
         return dict(row) if row else None
@@ -3052,16 +3070,41 @@ class SessionDB:
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
-        """Look up a session by exact title. Returns session dict or None."""
+    def get_session_by_title(
+        self,
+        title: str,
+        *,
+        source: str = None,
+        chat_id: str = None,
+        thread_id: str = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Look up an exact title, optionally constrained to a gateway peer."""
+        clauses = ["title = ?"]
+        params: List[Any] = [title]
+        if source is not None:
+            clauses.append("source = ?")
+            params.append(source)
+        if chat_id is not None:
+            clauses.append("chat_id = ?")
+            params.append(str(chat_id))
+        if thread_id is not None:
+            clauses.append("thread_id = ?")
+            params.append(str(thread_id))
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT * FROM sessions WHERE title = ?", (title,)
+                f"SELECT * FROM sessions WHERE {' AND '.join(clauses)}", params
             )
             row = cursor.fetchone()
         return dict(row) if row else None
 
-    def resolve_session_by_title(self, title: str) -> Optional[str]:
+    def resolve_session_by_title(
+        self,
+        title: str,
+        *,
+        source: str = None,
+        chat_id: str = None,
+        thread_id: str = None,
+    ) -> Optional[str]:
         """Resolve a title to a session ID, preferring the latest in a lineage.
 
         If the exact title exists, returns that session's ID.
@@ -3070,16 +3113,32 @@ class SessionDB:
         latest numbered variant (the most recent continuation).
         """
         # First try exact match
-        exact = self.get_session_by_title(title)
+        exact = self.get_session_by_title(
+            title,
+            source=source,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
 
         # Also search for numbered variants: "title #2", "title #3", etc.
         # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
         escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        clauses = ["title LIKE ? ESCAPE '\\'"]
+        params: List[Any] = [f"{escaped} #%"]
+        if source is not None:
+            clauses.append("source = ?")
+            params.append(source)
+        if chat_id is not None:
+            clauses.append("chat_id = ?")
+            params.append(str(chat_id))
+        if thread_id is not None:
+            clauses.append("thread_id = ?")
+            params.append(str(thread_id))
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT id, title, started_at FROM sessions "
-                "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
-                (f"{escaped} #%",),
+                f"WHERE {' AND '.join(clauses)} ORDER BY started_at DESC",
+                params,
             )
             numbered = cursor.fetchall()
 
@@ -3252,6 +3311,8 @@ class SessionDB:
         id_query: str = None,
         search_query: str = None,
         compact_rows: bool = False,
+        chat_id: str = None,
+        thread_id: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -3316,6 +3377,12 @@ class SessionDB:
         if source:
             where_clauses.append("s.source = ?")
             params.append(source)
+        if chat_id is not None:
+            where_clauses.append("s.chat_id = ?")
+            params.append(str(chat_id))
+        if thread_id is not None:
+            where_clauses.append("s.thread_id = ?")
+            params.append(str(thread_id))
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
@@ -4765,6 +4832,8 @@ class SessionDB:
         offset: int = 0,
         sort: str = None,
         include_inactive: bool = False,
+        chat_id: str = None,
+        thread_id: str = None,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -4841,6 +4910,13 @@ class SessionDB:
             exclude_placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({exclude_placeholders})")
             params.extend(exclude_sources)
+
+        if chat_id is not None:
+            where_clauses.append("s.chat_id = ?")
+            params.append(str(chat_id))
+        if thread_id is not None:
+            where_clauses.append("s.thread_id = ?")
+            params.append(str(thread_id))
 
         if role_filter:
             role_placeholders = ",".join("?" for _ in role_filter)
@@ -4919,6 +4995,12 @@ class SessionDB:
                 if exclude_sources is not None:
                     tri_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
                     tri_params.extend(exclude_sources)
+                if chat_id is not None:
+                    tri_where.append("s.chat_id = ?")
+                    tri_params.append(str(chat_id))
+                if thread_id is not None:
+                    tri_where.append("s.thread_id = ?")
+                    tri_params.append(str(thread_id))
                 if role_filter:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
@@ -4976,6 +5058,12 @@ class SessionDB:
                 if exclude_sources is not None:
                     like_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
                     like_params.extend(exclude_sources)
+                if chat_id is not None:
+                    like_where.append("s.chat_id = ?")
+                    like_params.append(str(chat_id))
+                if thread_id is not None:
+                    like_where.append("s.thread_id = ?")
+                    like_params.append(str(thread_id))
                 if role_filter:
                     like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     like_params.extend(role_filter)
