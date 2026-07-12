@@ -446,6 +446,37 @@ class TestBusySessionAck:
         assert "Queued for the next turn" in content
 
     @pytest.mark.asyncio
+    async def test_steer_mode_queues_media_instead_of_dropping_attachment(self):
+        """Steer is text-only; media must remain a complete queued event."""
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter()
+
+        event = _make_event(text="这两个是什么意思")
+        event.message_type = MessageType.PHOTO
+        event.media_urls = ["/tmp/dashboard.png"]
+        event.media_types = ["image/png"]
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        runner._running_agents[sk] = agent
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        agent.steer.assert_not_called()
+        assert adapter._pending_messages.get(sk) is event
+        queued = adapter._pending_messages[sk]
+        assert queued.media_urls == ["/tmp/dashboard.png"]
+        assert queued.media_types == ["image/png"]
+
+        call_kwargs = adapter._send_with_retry.call_args
+        content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
+        assert "Queued for the next turn" in content
+        assert "Steered" not in content
+
+    @pytest.mark.asyncio
     async def test_interrupt_mode_text_followups_fifo_not_merged(self):
         """Two TEXT follow-ups during a busy turn (interrupt mode) must each
         get their OWN next-turn slot via FIFO — NOT newline-merged into one
