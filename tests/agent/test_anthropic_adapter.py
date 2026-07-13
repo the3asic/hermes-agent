@@ -180,6 +180,34 @@ class TestBuildAnthropicClient:
                 "anthropic-beta": "interleaved-thinking-2025-05-14"
             }
 
+    @pytest.mark.parametrize(
+        "base_url",
+        (
+            "https://open.bigmodel.cn/api/anthropic",
+            "http://127.0.0.1:8787/api/anthropic",
+            "http://localhost/api/anthropic/",
+            "http://[::1]:8787/api/anthropic",
+        ),
+    )
+    def test_zhipu_anthropic_endpoints_use_bearer_auth(self, base_url):
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("zhipu-secret-123", base_url=base_url)
+
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["auth_token"] == "zhipu-secret-123"
+            assert "api_key" not in kwargs
+
+    def test_local_non_zhipu_path_keeps_api_key_auth(self):
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client(
+                "local-proxy-key",
+                base_url="http://127.0.0.1:8787/v1/anthropic",
+            )
+
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["api_key"] == "local-proxy-key"
+            assert "auth_token" not in kwargs
+
     def test_azure_foundry_anthropic_endpoint_uses_bearer_auth(self):
         """Azure AI Foundry's /anthropic endpoint requires Authorization: Bearer.
 
