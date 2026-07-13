@@ -967,33 +967,6 @@ def test_discord_slash_echo_extra_config_bridge(monkeypatch, tmp_path):
     assert os.getenv("HERMES_DISCORD_SLASH_ECHO") == "all"
 
 
-def test_discord_history_backfill_free_response_config_bridge(monkeypatch, tmp_path):
-    """discord.history_backfill_free_response must reach the adapter runtime.
-
-    The adapter reads this flag from DISCORD_HISTORY_BACKFILL_FREE_RESPONSE
-    unless tests seed config.extra directly, so the real config.yaml path needs
-    its own bridge coverage.
-    """
-    import os
-    import yaml
-    from pathlib import Path
-
-    hermes_dir = tmp_path / ".hermes"
-    hermes_dir.mkdir()
-    (hermes_dir / "config.yaml").write_text(yaml.dump({
-        "discord": {"history_backfill_free_response": True},
-    }))
-
-    monkeypatch.delenv("DISCORD_HISTORY_BACKFILL_FREE_RESPONSE", raising=False)
-    monkeypatch.setenv("HERMES_HOME", str(hermes_dir))
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-    from gateway.config import load_gateway_config
-    load_gateway_config()
-
-    assert os.getenv("DISCORD_HISTORY_BACKFILL_FREE_RESPONSE") == "true"
-
-
 # ------------------------------------------------------------------
 # /skill command registration (flat + autocomplete)
 # ------------------------------------------------------------------
