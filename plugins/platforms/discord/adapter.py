@@ -2463,6 +2463,36 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Channel {chat_id} not found")
 
         filename = file_name or os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
+        guild = getattr(channel, "guild", None)
+        upload_limit = getattr(guild, "filesize_limit", None)
+        if not isinstance(upload_limit, int) or upload_limit <= 0:
+            upload_limit = getattr(
+                getattr(discord, "utils", None),
+                "DEFAULT_FILE_SIZE_LIMIT_BYTES",
+                10 * 1024 * 1024,
+            )
+        if not isinstance(upload_limit, int) or upload_limit <= 0:
+            upload_limit = 10 * 1024 * 1024
+        if file_size > upload_limit:
+            size_mib = file_size / (1024 * 1024)
+            limit_mib = upload_limit / (1024 * 1024)
+            logger.warning(
+                "[%s] Skipping oversized Discord attachment %s (%.1f MiB > %.1f MiB limit)",
+                self.name,
+                filename,
+                size_mib,
+                limit_mib,
+            )
+            notice = (
+                f"⚠️ Couldn't deliver the file attachment ({filename}): "
+                f"{size_mib:.1f} MiB exceeds this Discord server's "
+                f"{limit_mib:.1f} MiB upload limit."
+            )
+            if caption:
+                notice = f"{caption}\n{notice}"
+            return await self.send(chat_id=chat_id, content=notice)
+
         with open(file_path, "rb") as fh:
             file = discord.File(fh, filename=filename)
             if self._is_forum_parent(channel):

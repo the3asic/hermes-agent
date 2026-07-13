@@ -160,6 +160,46 @@ async def test_send_does_not_retry_on_unrelated_errors():
     assert send_calls[0]["reference"] is reference_obj
 
 
+@pytest.mark.asyncio
+async def test_send_document_preflights_guild_upload_limit(tmp_path, monkeypatch):
+    """Oversized files produce one clear notice without hitting Discord's API."""
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(
+        id=555,
+        guild=SimpleNamespace(filesize_limit=10 * 1024 * 1024),
+        send=AsyncMock(return_value=SimpleNamespace(id=1234)),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    file_path = tmp_path / "handoff.zip"
+    file_path.write_bytes(b"PK")
+    monkeypatch.setattr(
+        "plugins.platforms.discord.adapter.os.path.getsize",
+        lambda _path: 82 * 1024 * 1024,
+    )
+    file_factory = MagicMock()
+    monkeypatch.setattr(_discord_mod, "File", file_factory)
+
+    result = await adapter.send_document(
+        "555",
+        str(file_path),
+        caption="Build handoff",
+        file_name="handoff.zip",
+    )
+
+    assert result.success is True
+    file_factory.assert_not_called()
+    channel.send.assert_awaited_once()
+    notice = channel.send.await_args.kwargs["content"]
+    assert "Build handoff" in notice
+    assert "handoff.zip" in notice
+    assert "82.0 MiB" in notice
+    assert "10.0 MiB upload limit" in notice
+
+
 # ---------------------------------------------------------------------------
 # Forum channel tests
 # ---------------------------------------------------------------------------
