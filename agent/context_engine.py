@@ -17,7 +17,8 @@ The engine is responsible for:
 
 Lifecycle:
   1. Engine is instantiated and registered (plugin register() or default)
-  2. on_session_start() called when a conversation begins
+  2. on_session_start() called when a conversation begins and after a
+     compression boundary (including in-place compression with the same id)
   3. update_from_response() called after each API response with usage data
   4. should_compress() checked after each turn
   5. compress() called when should_compress() returns True
@@ -174,10 +175,14 @@ class ContextEngine(ABC):
     # -- Optional: session lifecycle ---------------------------------------
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
-        """Called when a new conversation session begins.
+        """Called when a session begins or crosses a compression boundary.
 
         Use this to load persisted state (DAG, store) for the session.
-        kwargs may include hermes_home, platform, model, etc.
+        kwargs may include hermes_home, platform, model, boundary_reason,
+        old_session_id, in_place, and active_message_count.  For in-place
+        compression, ``session_id`` and ``old_session_id`` are identical and
+        ``active_message_count`` is the final host transcript length after any
+        host-added continuity messages.
         """
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:

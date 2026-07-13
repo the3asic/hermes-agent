@@ -70,6 +70,12 @@ class TestInPlaceCompaction:
             _seed(db, sid, "my-research")
             agent = _make_agent(db, sid, in_place=True)
             agent._last_flushed_db_idx = 5
+            boundary_calls = []
+            agent.context_compressor.on_session_start = (
+                lambda bound_session_id, **kwargs: boundary_calls.append(
+                    (bound_session_id, kwargs)
+                )
+            )
 
             messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
             compressed, _sp = compress_context(
@@ -123,6 +129,13 @@ class TestInPlaceCompaction:
             assert agent._last_compaction_in_place is True
             # Live transcript actually shrank.
             assert len(compressed) == 2
+            assert boundary_calls
+            bound_session_id, boundary_kwargs = boundary_calls[-1]
+            assert bound_session_id == sid
+            assert boundary_kwargs["boundary_reason"] == "compression"
+            assert boundary_kwargs["old_session_id"] == sid
+            assert boundary_kwargs["in_place"] is True
+            assert boundary_kwargs["active_message_count"] == len(compressed)
 
     def test_in_place_alternation_preserved(self):
         """The compacted list must not introduce consecutive same-role messages."""

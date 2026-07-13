@@ -1386,6 +1386,8 @@ def compress_context(
                     agent.session_id or "",
                     boundary_reason="compression",
                     old_session_id=_boundary_parent,
+                    in_place=in_place,
+                    active_message_count=len(compressed),
                     platform=getattr(agent, "platform", None) or "cli",
                     conversation_id=getattr(agent, "_gateway_session_key", None),
                 )
