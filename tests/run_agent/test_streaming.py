@@ -1746,6 +1746,59 @@ class TestSilentRetryMidToolCall:
 # ── Test: CopilotACP Streaming Decision ──────────────────────────────────
 
 
+class TestProviderRequiresNonStreaming:
+    @pytest.mark.parametrize(
+        ("provider", "base_url"),
+        [
+            ("copilot-acp", "acp://copilot"),
+            ("custom", "acp+tcp://host:1234"),
+        ],
+    )
+    def test_copilot_routes_are_non_streaming(self, provider, base_url):
+        from agent.conversation_loop import _provider_requires_non_streaming
+
+        agent = SimpleNamespace(
+            provider=provider,
+            base_url=base_url,
+            model="claude-opus-4.7",
+            api_mode="chat_completions",
+        )
+        assert _provider_requires_non_streaming(agent) is True
+
+    @pytest.mark.parametrize(
+        "model",
+        ["MiniMax-M3", "minimax/MiniMax-M3"],
+    )
+    def test_minimax_m3_anthropic_route_is_non_streaming(self, model):
+        from agent.conversation_loop import _provider_requires_non_streaming
+
+        agent = SimpleNamespace(
+            provider="minimax-cn",
+            base_url="https://api.minimaxi.com/anthropic",
+            model=model,
+            api_mode="anthropic_messages",
+        )
+        assert _provider_requires_non_streaming(agent) is True
+
+    @pytest.mark.parametrize(
+        ("model", "api_mode"),
+        [
+            ("MiniMax-M2.7", "anthropic_messages"),
+            ("MiniMax-M3", "chat_completions"),
+        ],
+    )
+    def test_other_minimax_routes_keep_streaming(self, model, api_mode):
+        from agent.conversation_loop import _provider_requires_non_streaming
+
+        agent = SimpleNamespace(
+            provider="minimax-cn",
+            base_url="https://api.minimaxi.com/anthropic",
+            model=model,
+            api_mode=api_mode,
+        )
+        assert _provider_requires_non_streaming(agent) is False
+
+
 def _valid_acp_response():
     """Build a minimal valid non-streaming API response for copilot-acp."""
     return SimpleNamespace(
