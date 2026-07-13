@@ -4700,11 +4700,17 @@ class AIAgent:
         # api_mode-flip race (the Anthropic SDK raises a non-retryable
         # TypeError on them). See #31673.
         from agent.anthropic_adapter import create_anthropic_message
+        from agent.conversation_loop import _provider_requires_non_streaming
+
+        prefer_stream = not (
+            bool(getattr(self, "_disable_streaming", False))
+            or _provider_requires_non_streaming(self)
+        )
         return create_anthropic_message(
             self._anthropic_client,
             api_kwargs,
             log_prefix=getattr(self, "log_prefix", ""),
-            prefer_stream=not bool(getattr(self, "_disable_streaming", False)),
+            prefer_stream=prefer_stream,
         )
 
     def _rebuild_anthropic_client(self) -> None:

@@ -6992,6 +6992,35 @@ class TestAnthropicCredentialRefresh:
         agent._anthropic_client.messages.create.assert_called_once_with(model="claude-sonnet-4-20250514")
         assert result is response
 
+    def test_anthropic_messages_create_disables_sdk_stream_for_minimax_m3(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
+        ):
+            agent = AIAgent(
+                api_key="test-minimax-key",
+                base_url="https://api.minimaxi.com/anthropic",
+                provider="minimax-cn",
+                model="MiniMax-M3",
+                api_mode="anthropic_messages",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        response = SimpleNamespace(content=[])
+        agent._disable_streaming = False
+        agent._anthropic_client = MagicMock()
+        agent._anthropic_client.messages.create.return_value = response
+
+        with patch.object(agent, "_try_refresh_anthropic_client_credentials", return_value=False):
+            result = agent._anthropic_messages_create({"model": "MiniMax-M3"})
+
+        agent._anthropic_client.messages.stream.assert_not_called()
+        agent._anthropic_client.messages.create.assert_called_once_with(model="MiniMax-M3")
+        assert result is response
+
     def test_anthropic_messages_create_does_not_mask_bedrock_stream_validation_errors(self):
         with (
             patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),

@@ -79,6 +79,39 @@ logger = logging.getLogger(__name__)
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
 
+def _provider_requires_non_streaming(agent: Any) -> bool:
+    """Return whether the provider/model route needs a completed response.
+
+    Copilot ACP returns a completed object rather than an iterable stream.
+    MiniMax M3's Anthropic endpoint can emit ``message_delta`` events with
+    ``usage: null``; the Anthropic SDK stream accumulator dereferences that
+    value, while the non-streaming Messages response remains valid.
+    """
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    base_url = str(getattr(agent, "base_url", "") or "").strip().lower()
+
+    if (
+        provider == "copilot-acp"
+        or base_url.startswith("acp://copilot")
+        or base_url.startswith("acp+tcp://")
+    ):
+        return True
+
+    if str(getattr(agent, "api_mode", "") or "") != "anthropic_messages":
+        return False
+
+    model = str(getattr(agent, "model", "") or "").strip().lower()
+    model_leaf = model.rsplit("/", 1)[-1]
+    if not model_leaf.startswith("minimax-m3"):
+        return False
+
+    return (
+        provider in {"minimax", "minimax-cn", "minimax-oauth"}
+        or base_url_host_matches(base_url, "minimax.io")
+        or base_url_host_matches(base_url, "minimaxi.com")
+    )
+
+
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
     """Extract a provider-reported image dimension ceiling, if present."""
     parts = []
@@ -1288,15 +1321,8 @@ def run_conversation(
                 # session instead of re-failing every retry.
                 if getattr(agent, "_disable_streaming", False):
                     _use_streaming = False
-                # CopilotACPClient communicates via subprocess stdio and
-                # returns a plain SimpleNamespace — not an iterable
-                # stream.  Mirror the ACP exclusion used for Responses
-                # API upgrade (lines ~1083-1085).
-                elif (
-                    agent.provider in {"copilot-acp"}
-                    or str(agent.base_url or "").lower().startswith("acp://copilot")
-                    or str(agent.base_url or "").lower().startswith("acp+tcp://")
-                ):
+                # Some routes expose only a safe completed-response path.
+                elif _provider_requires_non_streaming(agent):
                     _use_streaming = False
                 # MoA streams only when a display/TTS consumer is present to
                 # receive the deltas. MoAChatCompletions.create() honors
