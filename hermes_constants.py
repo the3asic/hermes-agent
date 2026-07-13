@@ -1126,6 +1126,16 @@ def translate_cwd_for_wsl_backend(cwd: str) -> str:
 _container_detected: bool | None = None
 
 
+def _root_mount_has_container_runtime(mountinfo: str) -> bool:
+    """Return whether this process's root mount names a container runtime."""
+    runtime_markers = ("kubepods", "containerd", "crio")
+    for line in mountinfo.splitlines():
+        fields = line.split()
+        if len(fields) > 5 and fields[4] == "/":
+            return any(marker in line for marker in runtime_markers)
+    return False
+
+
 def is_container() -> bool:
     """Return True when running inside a container.
 
@@ -1166,12 +1176,13 @@ def is_container() -> bool:
     except OSError:
         pass
     # cgroup v2: /proc/1/cgroup is just "0::/" with no marker. The container
-    # runtime still shows up in the mount table (overlay rootfs, runtime mount
-    # paths), so scan mountinfo as a last resort.
+    # runtime can still show up in the process root mount. Do not scan child
+    # mounts: a normal Docker host has containerd-backed mounts for its own
+    # running containers.
     try:
         with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
             mountinfo = f.read()
-            if any(marker in mountinfo for marker in ("kubepods", "containerd", "crio")):
+            if _root_mount_has_container_runtime(mountinfo):
                 _container_detected = True
                 return True
     except OSError:

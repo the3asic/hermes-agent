@@ -544,8 +544,11 @@ class TestRoutingIntents:
         """'ALL' / 'All' / 'all' are all recognized."""
         from cron.scheduler import _resolve_delivery_targets
 
-        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-111")
-        monkeypatch.setenv("DISCORD_HOME_CHANNEL", "-222")
+        home_targets = {"telegram": "-111", "discord": "-222"}
+        monkeypatch.setattr(
+            "cron.scheduler._get_home_target_chat_id",
+            lambda platform_name: home_targets.get(platform_name),
+        )
 
         for token in ("ALL", "All", "all"):
             targets = _resolve_delivery_targets({"deliver": token, "origin": None})
@@ -614,6 +617,61 @@ class TestDeliverResultWrapping:
 
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
         assert "Cronjob Response: abc-123" in sent_content
+
+    def test_submit_rejection_does_not_precreate_worker_coroutine(self):
+        """A rejected fallback submit must not leak a second coroutine."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        created = []
+
+        class FakeCoroutine:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        def fake_send(*_args, **_kwargs):
+            coro = FakeCoroutine()
+            created.append(coro)
+            return coro
+
+        pool = MagicMock()
+        pool.submit.side_effect = RuntimeError(
+            "cannot schedule new futures after interpreter shutdown"
+        )
+        job = {
+            "id": "shutdown-race",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+        with (
+            patch("gateway.config.load_gateway_config", return_value=mock_cfg),
+            patch("tools.send_message_tool._send_to_platform", new=fake_send),
+            patch(
+                "cron.scheduler.asyncio.run",
+                side_effect=RuntimeError(
+                    "asyncio.run() cannot be called from a running event loop"
+                ),
+            ),
+            patch(
+                "cron.scheduler.concurrent.futures.ThreadPoolExecutor",
+                return_value=pool,
+            ),
+        ):
+            error = _deliver_result(job, "Output.")
+
+        assert len(created) == 1
+        assert created[0].closed is True
+        pool.submit.assert_called_once()
+        pool.shutdown.assert_called_once_with(wait=False)
+        assert "interpreter is shutting down" in error
 
     def test_delivery_skips_wrapping_when_config_disabled(self):
         """When cron.wrap_response is false, deliver raw content without header/footer."""

@@ -10,6 +10,27 @@ from types import SimpleNamespace
 from gateway import status
 
 
+class TestLinuxProcStatParsing:
+    def test_suffix_parser_keeps_state_after_space_containing_comm(self):
+        raw = "123 (npm exec (sh -c) ) Z 1 2 3"
+
+        assert status._parse_linux_proc_stat_suffix(raw)[0] == "Z"
+
+    def test_start_time_parser_handles_spaces_and_parentheses_in_comm(self):
+        raw = (
+            "123 (npm exec (sh -c) ) "
+            "S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987654"
+        )
+
+        assert status._parse_linux_proc_stat_start_time(raw) == 987654
+
+    def test_start_time_parser_rejects_truncated_rows(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="truncated"):
+            status._parse_linux_proc_stat_start_time("123 (short name) S 1 2")
+
+
 class TestGatewayPidState:
     def test_write_pid_file_records_gateway_metadata(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
