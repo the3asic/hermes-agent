@@ -4645,19 +4645,36 @@ class TestOptimizeFts:
         # Search still works after repeated optimization.
         assert len(db.search_messages("repeat")) == 1
 
-    def test_write_path_optimizes_fts_on_cadence(self, db, monkeypatch):
-        """Writes periodically merge FTS segments so they never accumulate
-        into the tens-of-thousands that lengthen the write-lock hold and
-        starve competing writers ("database is locked")."""
-        db._OPTIMIZE_EVERY_N_WRITES = 5
+    def test_incremental_merge_preserves_search(self, db):
+        db.create_session(session_id="s1", source="cli")
+        for i in range(50):
+            db.append_message(
+                session_id="s1",
+                role="user",
+                content=f"bounded merge needle {i}",
+            )
+        before = db.search_messages("needle")
+        merged = db.merge_fts(max_pages=10)
+        assert merged in (0, 1, 2)
+        after = db.search_messages("needle")
+        assert [row["id"] for row in after] == [row["id"] for row in before]
+
+    def test_incremental_merge_rejects_non_positive_budget(self, db):
+        with pytest.raises(ValueError, match="greater than zero"):
+            db.merge_fts(max_pages=0)
+
+    def test_write_path_incrementally_merges_fts_on_cadence(self, db, monkeypatch):
+        """Periodic write maintenance uses a bounded merge, not full optimize."""
+        db._FTS_MERGE_EVERY_N_WRITES = 5
+        db._FTS_MERGE_PAGES_PER_PASS = 123
         calls = {"n": 0}
-        real_optimize = db.optimize_fts
 
-        def _counting_optimize():
+        def _counting_merge(*, max_pages):
             calls["n"] += 1
-            return real_optimize()
+            assert max_pages == 123
+            return 0
 
-        monkeypatch.setattr(db, "optimize_fts", _counting_optimize)
+        monkeypatch.setattr(db, "merge_fts", _counting_merge)
         # create_session is write #1; appends are #2.. -> #5 and #10 trigger.
         db.create_session(session_id="s1", source="cli")
         for i in range(9):
@@ -4666,14 +4683,16 @@ class TestOptimizeFts:
         # The auto-merge is layout-only: search is unaffected.
         assert len(db.search_messages("needle")) == 9
 
-    def test_write_path_optimize_failure_never_breaks_write(self, db, monkeypatch):
-        """A failing periodic optimize must not fail the surrounding write."""
-        db._OPTIMIZE_EVERY_N_WRITES = 2
+    def test_write_path_incremental_merge_failure_never_breaks_write(
+        self, db, monkeypatch
+    ):
+        """A failing periodic merge must not fail the surrounding write."""
+        db._FTS_MERGE_EVERY_N_WRITES = 2
 
-        def _boom():
-            raise sqlite3.OperationalError("simulated optimize failure")
+        def _boom(*, max_pages):
+            raise sqlite3.OperationalError("simulated merge failure")
 
-        monkeypatch.setattr(db, "optimize_fts", _boom)
+        monkeypatch.setattr(db, "merge_fts", _boom)
         db.create_session(session_id="s1", source="cli")  # write #1
         # write #2 trips the cadence; the swallowed failure must not propagate.
         db.append_message(session_id="s1", role="user", content="still persists")
