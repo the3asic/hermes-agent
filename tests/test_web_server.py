@@ -12,6 +12,20 @@ import uvicorn
 from hermes_cli import web_server
 
 
+def test_strip_internal_session_fields_preserves_public_session_data():
+    session = {
+        "id": "session-1",
+        "title": "Visible title",
+        "scope_key": "discord:chat:user",
+        "origin_json": '{"platform":"discord"}',
+    }
+
+    result = web_server._strip_internal_session_fields(session)
+
+    assert result is session
+    assert result == {"id": "session-1", "title": "Visible title"}
+
+
 def _stub_uvicorn(monkeypatch):
     """Replace uvicorn.Config/Server with fakes so start_server returns
     immediately.  Returns a dict with captured Config kwargs."""
