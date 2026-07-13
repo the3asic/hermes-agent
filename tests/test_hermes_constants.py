@@ -116,6 +116,27 @@ class TestGetHermesHome:
         assert get_hermes_home() == local_appdata / "hermes"
 
 
+class TestContainerDetectionMountinfo:
+    def test_host_child_container_mount_does_not_mark_host_as_container(self):
+        mountinfo = "\n".join(
+            (
+                "35 2 8:2 / / rw,relatime - ext4 /dev/sda2 rw",
+                "104 35 0:52 / /var/lib/docker/rootfs/overlayfs/abc rw - "
+                "overlay overlay rw,lowerdir=/var/lib/containerd/snapshots/1/fs",
+            )
+        )
+
+        assert hermes_constants._root_mount_has_container_runtime(mountinfo) is False
+
+    def test_containerd_backed_root_mount_marks_container(self):
+        mountinfo = (
+            "35 2 0:52 / / rw,relatime - overlay overlay "
+            "rw,lowerdir=/var/lib/containerd/snapshots/1/fs"
+        )
+
+        assert hermes_constants._root_mount_has_container_runtime(mountinfo) is True
+
+
 class TestHermesManagedNode:
     def test_windows_node_dir_prefers_portable_root(self, tmp_path, monkeypatch):
         home = tmp_path / "hermes"
