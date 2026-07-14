@@ -115,12 +115,13 @@ class TestTtsDispatcherMiniMax:
 
 class TestCheckTtsRequirementsMiniMax:
     def test_cn_key_counts_as_available_provider(self, monkeypatch):
-        from tools.tts_tool import check_tts_requirements
+        from tools import tts_tool
 
         monkeypatch.setenv("MINIMAX_CN_API_KEY", "cn-key")
-        with patch("tools.tts_tool._import_edge_tts", side_effect=ImportError), \
-             patch("tools.tts_tool._import_elevenlabs", side_effect=ImportError), \
-             patch("tools.tts_tool._import_openai_client", side_effect=ImportError), \
-             patch("tools.tts_tool._import_mistral_client", side_effect=ImportError), \
-             patch("tools.tts_tool._check_neutts_available", return_value=False):
-            assert check_tts_requirements() is True
+        monkeypatch.setattr(
+            tts_tool,
+            "_load_tts_config",
+            lambda: {"provider": "minimax", "minimax": {}},
+        )
+
+        assert tts_tool.check_tts_requirements() is True
