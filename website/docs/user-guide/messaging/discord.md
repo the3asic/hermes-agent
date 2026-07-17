@@ -288,7 +288,8 @@ Discord behavior is controlled through two files: **`~/.hermes/.env`** for crede
 | `DISCORD_IGNORED_CHANNELS` | No | — | Comma-separated channel IDs where the bot **never** responds, even when `@mentioned`. Takes priority over all other channel settings. |
 | `DISCORD_ALLOWED_CHANNELS` | No | — | Comma-separated channel IDs. When set, the bot **only** responds in these channels (plus DMs if allowed). Overrides `config.yaml` `discord.allowed_channels`. Combine with `DISCORD_IGNORED_CHANNELS` to express allow/deny rules. |
 | `DISCORD_NO_THREAD_CHANNELS` | No | — | Comma-separated channel IDs where the bot responds directly in the channel instead of creating a thread. Only relevant when `DISCORD_AUTO_THREAD` is `true`. |
-| `DISCORD_HISTORY_BACKFILL` | No | `true` | When `true`, prepend recent channel scrollback (since the bot's last response) to the user message when the bot is mentioned. Recovers context the bot would otherwise miss with `require_mention`. Skipped in DMs and free-response channels. Set to `false` to disable. |
+| `DISCORD_HISTORY_BACKFILL` | No | `true` | When `true`, prepend recent channel scrollback to mention-gated channel, thread, and reply triggers. Skipped in DMs. Set to `false` to disable all Discord history backfill. |
+| `DISCORD_HISTORY_BACKFILL_FREE_RESPONSE` | No | `false` | When `true`, configured `DISCORD_FREE_RESPONSE_CHANNELS` also hydrate one recent user/assistant exchange. Commands and transient voice-linked free-response do not opt in. |
 | `DISCORD_HISTORY_BACKFILL_LIMIT` | No | `50` | Maximum number of messages to scan backwards when assembling the backfill block. In practice the scan usually stops earlier — at the bot's own last message in the channel. |
 | `DISCORD_REPLY_TO_MODE` | No | `"first"` | Controls reply-reference behavior: `"off"` — never reply to the original message, `"first"` — reply-reference on the first message chunk only (default), `"all"` — reply-reference on every chunk. |
 | `DISCORD_ALLOW_MENTION_EVERYONE` | No | `false` | When `false` (default), the bot cannot ping `@everyone` or `@here` even if its response contains those tokens. Set to `true` to opt back in. See [Mention Control](#mention-control) below. |
@@ -296,7 +297,8 @@ Discord behavior is controlled through two files: **`~/.hermes/.env`** for crede
 | `DISCORD_ALLOW_MENTION_USERS` | No | `true` | When `true` (default), the bot can ping individual users by ID. |
 | `DISCORD_ALLOW_MENTION_REPLIED_USER` | No | `true` | When `true` (default), replying to a message pings the original author. |
 | `DISCORD_PROXY` | No | — | Proxy URL for Discord connections (HTTP, WebSocket, REST). Overrides `HTTPS_PROXY`/`ALL_PROXY`. Supports `http://`, `https://`, and `socks5://` schemes. |
-| `DISCORD_ALLOW_ANY_ATTACHMENT` | No | `false` | When `true`, the bot accepts attachments of any file type (not just the built-in PDF/text/zip/office allowlist). Unknown types are cached to disk and surfaced to the agent as a local path with `application/octet-stream` MIME so it can inspect them with `terminal` / `read_file` / `ffprobe` / etc. |
+| `DISCORD_ALLOW_ANY_ATTACHMENT` | No | — | Compatibility no-op. Every file type from an authorized sender is always accepted; the value is ignored and retained only for existing configurations. |
+| `DISCORD_INLINE_TEXT_ATTACHMENTS` | No | `true` | When `true`, small UTF-8 text-like attachments are copied into the model-visible message. Set to `false` to cache and surface them by path without inlining their contents. |
 | `DISCORD_MAX_ATTACHMENT_BYTES` | No | `33554432` | Maximum bytes per attachment the gateway will download and cache. Default 32 MiB. Set to `0` for no cap (attachments are held in memory while being written, so unlimited carries a real memory cost). |
 | `HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS` | No | `0.6` | Grace window the adapter waits before flushing a queued text chunk. Useful for smoothing streamed output. |
 | `HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS` | No | `2.0` | Delay between split chunks when a single message exceeds Discord's length limit. |
@@ -322,7 +324,10 @@ discord:
   ignored_channels: []            # Channel IDs where bot never responds
   no_thread_channels: []          # Channel IDs where bot responds without threading
   history_backfill: true          # Prepend recent channel scrollback on mention (default: true)
+  history_backfill_free_response: false  # Opt in configured free-response channels (default: false)
   history_backfill_limit: 50      # Max messages to scan backwards (default: 50)
+  inline_text_attachments: true   # Inline small text-like uploads (default: true)
+  max_attachment_bytes: 33554432  # Per-file cache cap; 0 disables the cap
   channel_prompts: {}             # Per-channel ephemeral system prompts
   allow_mentions:                 # What the bot is allowed to ping (safe defaults)
     everyone: false               # @everyone / @here pings (default: false)
@@ -462,7 +467,8 @@ Behavior by surface:
 - **Server channels** (with `require_mention: true`): backfill scans the channel since the bot's last response. Useful when other participants posted while the bot wasn't addressed.
 - **Threads**: backfill scans the thread only — Discord's `channel.history()` on a thread returns only that thread's messages, not the parent channel. This is the right scope because threads are usually self-contained conversations.
 - **DMs**: skipped. Every DM message triggers the bot, so the session transcript is already complete — there's no mention gap to fill.
-- **Free-response channels** and **bot's own auto-created threads**: skipped for the same reason — no mention gating means no gap.
+- **Configured free-response channels**: skipped by default. Set `history_backfill_free_response: true` to include one recent user/assistant exchange on ordinary messages in channels matched by `free_response_channels`.
+- **Transient voice-linked free-response** and **bot's own auto-created threads**: skipped. The free-response opt-in does not widen either behavior.
 
 Per-user sessions (`group_sessions_per_user: true`, the default) also benefit: a user's session is missing the context posted by other channel participants and the user's own messages from before they tagged the bot. Backfill fills both gaps.
 
@@ -479,6 +485,21 @@ discord:
 ```
 
 > **Note:** Messages that arrive *while* the bot is processing (between a trigger and its response) are not captured. This is an accepted simplification — the user can re-send or tag again.
+
+#### `discord.history_backfill_free_response`
+
+**Type:** boolean — **Default:** `false`
+
+This opt-in hydrates nearby Discord scrollback for ordinary messages in channels explicitly matched by `discord.free_response_channels`. It includes the assistant's most recent Discord-visible response plus the user exchange that led to it, then stops at the preceding assistant turn. Mention-gated channels, threads, and replies keep their existing history behavior. Commands and temporary voice-linked free-response channels do not hydrate because of this flag.
+
+```yaml
+discord:
+  free_response_channels: ["channel-id"]
+  history_backfill: true
+  history_backfill_free_response: true
+```
+
+Equivalent env var: `DISCORD_HISTORY_BACKFILL_FREE_RESPONSE=true`. An explicit env value takes precedence over `config.yaml`.
 
 #### `discord.history_backfill_limit`
 
@@ -629,21 +650,24 @@ Any file type a user uploads is accepted. Authorization to message the agent is 
 
 - Known types (PDF, docx/xlsx/pptx, zip, images/audio/video, etc.) keep their precise MIME.
 - Unknown types fall back to the upload's reported content type, or `application/octet-stream` when none is given.
-- Small UTF-8-decodable files (text, code, config, HTML, CSS, JSON, YAML, ...) have their contents auto-injected into the prompt up to 100 KiB. Binary files that can't be decoded are surfaced as a path-pointing context note only (auto-translated for Docker/Modal sandboxed terminals via `to_agent_visible_cache_path`), so they don't blow up the context window.
+- Small UTF-8 text-like files (text, code, config, HTML, CSS, JSON, YAML, ...) have their contents auto-injected into the prompt up to 100 KiB when `inline_text_attachments` is `true` (the default). Set it to `false` to cache and surface the path without copying file contents into the model-visible message. Binary files are always surfaced by path only.
 
 The only inbound limit is the per-file size cap (default 32 MiB):
 
 ```yaml
 discord:
+  # Optional — keep text-like uploads out of the model-visible message.
+  # The cached file path remains available to the agent.
+  inline_text_attachments: true
   # Optional — raise/disable the per-file size cap. Default is 32 MiB.
   # The whole file is held in memory while being cached, so unlimited
   # uploads carry a real memory cost.
   max_attachment_bytes: 33554432   # bytes; 0 = unlimited
 ```
 
-Equivalent env var: `DISCORD_MAX_ATTACHMENT_BYTES=33554432` (or `0` for no cap).
+Equivalent env vars: `DISCORD_INLINE_TEXT_ATTACHMENTS=true` and `DISCORD_MAX_ATTACHMENT_BYTES=33554432` (or `0` for no cap). Explicit env values take precedence over `config.yaml`.
 
-The legacy `discord.allow_any_attachment` flag is now a no-op — any file type is always accepted — and is kept only so existing configs don't error.
+The legacy `discord.allow_any_attachment` flag and `DISCORD_ALLOW_ANY_ATTACHMENT` env var are no-ops. Any file type from an authorized sender is always accepted; both names remain only so existing configurations keep loading.
 
 :::warning Memory cost of unlimited
 Disabling the size cap (`max_attachment_bytes: 0`) means a user can drop a multi-GB file on the bot and the gateway will dutifully buffer it through memory while caching to disk. Only set this in trusted single-user installs. For shared bots, keep the default 32 MiB or raise it conservatively.
@@ -862,5 +886,4 @@ Leave `everyone` and `roles` at `false` unless you know exactly why you need the
 :::
 
 For more information on securing your Hermes Agent deployment, see the [Security Guide](../security.md).
-
 

@@ -287,7 +287,8 @@ Discord 行为通过两个文件控制：**`~/.hermes/.env`** 用于凭据和环
 | `DISCORD_IGNORED_CHANNELS` | 否 | — | 机器人**永不**响应的频道 ID，逗号分隔，即使被 `@提及` 也不响应。优先于所有其他频道设置。 |
 | `DISCORD_ALLOWED_CHANNELS` | 否 | — | 频道 ID，逗号分隔。设置后，机器人**仅**在这些频道（以及允许的私信）中响应。覆盖 `config.yaml` 中的 `discord.allowed_channels`。与 `DISCORD_IGNORED_CHANNELS` 结合使用可表达允许/拒绝规则。 |
 | `DISCORD_NO_THREAD_CHANNELS` | 否 | — | 机器人直接在频道中响应而不创建线程的频道 ID，逗号分隔。仅在 `DISCORD_AUTO_THREAD` 为 `true` 时有效。 |
-| `DISCORD_HISTORY_BACKFILL` | 否 | `true` | 为 `true` 时，当机器人被提及时，将最近的频道滚动历史（自机器人上次响应以来）前置到用户消息中。恢复机器人在 `require_mention` 模式下会错过的上下文。在私信和自由响应频道中跳过。设置为 `false` 可禁用。 |
+| `DISCORD_HISTORY_BACKFILL` | 否 | `true` | 为 `true` 时，为需要提及的频道、线程和回复触发补充最近的频道消息。私信不使用。设为 `false` 会关闭 Discord 的全部历史回填。 |
+| `DISCORD_HISTORY_BACKFILL_FREE_RESPONSE` | 否 | `false` | 为 `true` 时，`DISCORD_FREE_RESPONSE_CHANNELS` 明确配置的频道也会补充最近一轮用户和助手消息。命令消息和临时语音关联频道不受此项影响。 |
 | `DISCORD_HISTORY_BACKFILL_LIMIT` | 否 | `50` | 组装回填块时向后扫描的最大消息数。实际上扫描通常会更早停止——在机器人自己在频道中的最后一条消息处。 |
 | `DISCORD_REPLY_TO_MODE` | 否 | `"first"` | 控制回复引用行为：`"off"` — 从不回复原始消息，`"first"` — 仅在第一个消息块上添加回复引用（默认），`"all"` — 在每个块上都添加回复引用。 |
 | `DISCORD_ALLOW_MENTION_EVERYONE` | 否 | `false` | 为 `false`（默认）时，即使响应中包含这些 token，机器人也无法 ping `@everyone` 或 `@here`。设置为 `true` 可重新启用。参见下方[提及控制](#mention-control)。 |
@@ -295,7 +296,8 @@ Discord 行为通过两个文件控制：**`~/.hermes/.env`** 用于凭据和环
 | `DISCORD_ALLOW_MENTION_USERS` | 否 | `true` | 为 `true`（默认）时，机器人可以通过 ID ping 单个用户。 |
 | `DISCORD_ALLOW_MENTION_REPLIED_USER` | 否 | `true` | 为 `true`（默认）时，回复消息会 ping 原始作者。 |
 | `DISCORD_PROXY` | 否 | — | Discord 连接的代理 URL（HTTP、WebSocket、REST）。覆盖 `HTTPS_PROXY`/`ALL_PROXY`。支持 `http://`、`https://` 和 `socks5://` 协议。 |
-| `DISCORD_ALLOW_ANY_ATTACHMENT` | 否 | `false` | 为 `true` 时，机器人接受任何文件类型的附件（不仅限于内置的 PDF/文本/zip/office 允许列表）。未知类型会被缓存到磁盘，并以 `application/octet-stream` MIME 类型作为本地路径提供给 agent，以便它可以使用 `terminal` / `read_file` / `ffprobe` 等工具检查。 |
+| `DISCORD_ALLOW_ANY_ATTACHMENT` | 否 | — | 兼容用空开关。已授权发送者上传的所有文件类型始终会被接受；该值会被忽略，只为兼容现有配置而保留。 |
+| `DISCORD_INLINE_TEXT_ATTACHMENTS` | 否 | `true` | 为 `true` 时，小型 UTF-8 文本类附件会复制进模型可见消息。设为 `false` 后仍会缓存文件并提供路径，但不会内联文件内容。 |
 | `DISCORD_MAX_ATTACHMENT_BYTES` | 否 | `33554432` | 网关将下载并缓存的每个附件的最大字节数。默认 32 MiB。设置为 `0` 表示无上限（附件在写入时保存在内存中，因此无限制会带来真实的内存成本）。 |
 | `HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS` | 否 | `0.6` | 适配器在刷新排队文本块之前等待的宽限窗口。用于平滑流式输出。 |
 | `HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS` | 否 | `2.0` | 当单条消息超过 Discord 长度限制时，分割块之间的延迟。 |
@@ -315,7 +317,10 @@ discord:
   ignored_channels: []            # 机器人永不响应的频道 ID
   no_thread_channels: []          # 机器人不创建线程直接响应的频道 ID
   history_backfill: true          # 在提及时前置最近的频道滚动历史（默认：true）
+  history_backfill_free_response: false  # 让明确配置的自由响应频道也回填（默认：false）
   history_backfill_limit: 50      # 向后扫描的最大消息数（默认：50）
+  inline_text_attachments: true   # 内联小型文本类附件（默认：true）
+  max_attachment_bytes: 33554432  # 每个文件的缓存上限；0 表示不设上限
   channel_prompts: {}             # 每个频道的临时系统 prompt（提示词）
   allow_mentions:                 # 机器人允许 ping 的内容（安全默认值）
     everyone: false               # @everyone / @here ping（默认：false）
@@ -455,7 +460,8 @@ discord:
 - **服务器频道**（使用 `require_mention: true`）：回填扫描自机器人上次响应以来的频道。当其他参与者在机器人未被提及时发帖时很有用。
 - **线程**：回填仅扫描该线程——Discord 对线程的 `channel.history()` 只返回该线程的消息，不包括父频道。这是正确的范围，因为线程通常是自包含的对话。
 - **私信**：跳过。每条私信消息都会触发机器人，因此会话记录已经完整——没有提及间隙需要填补。
-- **自由响应频道**和**机器人自动创建的线程**：出于同样的原因跳过——没有提及门控意味着没有间隙。
+- **明确配置的自由响应频道**：默认跳过。设置 `history_backfill_free_response: true` 后，`free_response_channels` 匹配频道中的普通消息会带上最近一轮用户和助手消息。
+- **临时语音关联的自由响应频道**和**机器人自动创建的线程**：继续跳过。自由响应回填开关不会扩大这两种行为。
 
 每用户会话（`group_sessions_per_user: true`，默认值）也受益：用户的会话缺少其他频道参与者发布的上下文以及用户在标记机器人之前自己的消息。回填填补了这两个间隙。
 
@@ -472,6 +478,21 @@ discord:
 ```
 
 > **注意：** 机器人处理*过程中*到达的消息（在触发和响应之间）不会被捕获。这是一个可接受的简化——用户可以重新发送或再次标记。
+
+#### `discord.history_backfill_free_response`
+
+**类型：** 布尔值 — **默认值：** `false`
+
+此项只让 `discord.free_response_channels` 明确匹配的频道在普通消息触发时补充附近的 Discord 历史。回填会包含助手最近一次在 Discord 可见的回复，以及引出该回复的用户消息，并在更早一轮助手回复处停止。需要提及的频道、线程和回复维持原有行为。命令消息和临时语音关联频道不会因为此项而回填。
+
+```yaml
+discord:
+  free_response_channels: ["channel-id"]
+  history_backfill: true
+  history_backfill_free_response: true
+```
+
+等效环境变量：`DISCORD_HISTORY_BACKFILL_FREE_RESPONSE=true`。明确设置的环境变量优先于 `config.yaml`。
 
 #### `discord.history_backfill_limit`
 
@@ -618,24 +639,26 @@ Discord 的每次上传大小限制取决于服务器的加成等级（免费 25
 
 ## 接收任意文件类型
 
-默认情况下，机器人缓存与内置允许列表匹配的上传——图片、音频、视频、PDF、文本/markdown/csv/log、JSON/XML/YAML/TOML、zip、docx/xlsx/pptx。其他任何内容（`.wav`、`.bin`、自定义扩展名的转储文件）都会被记录为 `Unsupported document type` 并在 agent 看到之前被丢弃。
+机器人会接受已授权发送者上传的任意文件类型。控制访问的是消息发送权限，不是扩展名。每个文件都会缓存到 `~/.hermes/cache/documents/`，并作为 `DOCUMENT` 类型消息提供给 agent，供 `terminal` 或 `read_file` 检查。
 
-要接受任意文件类型，启用 `discord.allow_any_attachment`：
+- 已知类型（PDF、docx/xlsx/pptx、zip、图片、音频、视频等）保留精确的 MIME 类型。
+- 未知类型使用上传时报告的内容类型；没有内容类型时使用 `application/octet-stream`。
+- 当 `inline_text_attachments` 为 `true`（默认）时，小型 UTF-8 文本类文件会自动注入最多 100 KiB 内容。设为 `false` 后只提供缓存路径，不把文件内容复制进模型可见消息。二进制文件始终只提供路径。
 
 ```yaml
 discord:
-  allow_any_attachment: true
+  # 可选：不把文本类附件内容复制进模型可见消息。
+  # 文件仍会缓存，agent 仍能看到路径。
+  inline_text_attachments: true
   # 可选 — 提高/禁用每文件大小上限。默认为 32 MiB。
   # 整个文件在缓存时保存在内存中，因此无限制
   # 上传会带来真实的内存成本。
   max_attachment_bytes: 33554432   # 字节；0 = 无限制
 ```
 
-启用该标志后，任何上传的文件都会被下载、缓存到 `~/.hermes/cache/documents/` 下，并以 `application/octet-stream` MIME 类型的 `DOCUMENT` 类型消息事件提供给 agent。Agent 收到指向本地路径的上下文说明（通过 `to_agent_visible_cache_path` 为 Docker/Modal 沙盒终端自动转换），可以使用 `terminal`（`ffprobe`、`unzip`、`file`、`strings` 等）或 `read_file` 检查文件。文件内容**不会**内联到 prompt 中——只有路径——因此二进制上传不会撑爆上下文窗口。
+等效环境变量：`DISCORD_INLINE_TEXT_ATTACHMENTS=true` 和 `DISCORD_MAX_ATTACHMENT_BYTES=33554432`（或 `0` 表示无上限）。明确设置的环境变量优先于 `config.yaml`。
 
-已在允许列表中的已知文本格式（`.txt`、`.md`、`.log`）继续自动注入最多 100 KiB 的内容；启用该标志后此行为不变。
-
-等效环境变量：`DISCORD_ALLOW_ANY_ATTACHMENT=true` 和 `DISCORD_MAX_ATTACHMENT_BYTES=33554432`（或 `0` 表示无上限）。
+旧的 `discord.allow_any_attachment` 配置项和 `DISCORD_ALLOW_ANY_ATTACHMENT` 环境变量都是兼容用空开关。已授权发送者上传的所有文件类型始终会被接受；这两个名称只为保证现有配置可以继续加载而保留。
 
 :::warning 无限制的内存成本
 禁用大小上限（`max_attachment_bytes: 0`）意味着用户可以向机器人上传数 GB 的文件，网关会尽职地在缓存到磁盘时将其缓冲到内存中。仅在受信任的单用户安装中设置此项。对于共享机器人，保持默认的 32 MiB 或保守地提高上限。

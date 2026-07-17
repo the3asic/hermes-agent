@@ -283,7 +283,11 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `DISCORD_REQUIRE_MENTION` | Require an @mention before responding in server channels |
 | `DISCORD_FREE_RESPONSE_CHANNELS` | Comma-separated channel IDs where mention is not required |
 | `DISCORD_AUTO_THREAD` | Auto-thread long replies when supported |
-| `DISCORD_ALLOW_ANY_ATTACHMENT` | When `true`, accept attachments of any file type (not just the built-in PDF/text/zip/office allowlist). Unknown types are cached and surfaced to the agent as a local path so it can inspect them via `terminal` / `read_file` / `ffprobe`. Default `false`. |
+| `DISCORD_HISTORY_BACKFILL` | Enable Discord channel/thread/reply scrollback hydration. Default `true`. |
+| `DISCORD_HISTORY_BACKFILL_FREE_RESPONSE` | Also hydrate one recent exchange for configured free-response channel messages. Default `false`; commands and transient voice-linked free-response are excluded. |
+| `DISCORD_HISTORY_BACKFILL_LIMIT` | Maximum Discord messages scanned during history backfill. Default `50`. |
+| `DISCORD_ALLOW_ANY_ATTACHMENT` | Compatibility no-op. All file types from authorized senders are always accepted; the value is ignored. |
+| `DISCORD_INLINE_TEXT_ATTACHMENTS` | Inline small UTF-8 text-like uploads into the model-visible message. Default `true`; set `false` to surface only the cached path. |
 | `DISCORD_MAX_ATTACHMENT_BYTES` | Maximum bytes per attachment the gateway will cache. Default `33554432` (32 MiB). Set to `0` for no cap (attachments are held in memory while being written). |
 | `DISCORD_REACTIONS` | Enable emoji reactions on messages during processing (default: `true`) |
 | `DISCORD_IGNORED_CHANNELS` | Comma-separated channel IDs where the bot never responds |
