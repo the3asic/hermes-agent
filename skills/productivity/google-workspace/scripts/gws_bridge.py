@@ -101,6 +101,7 @@ def main():
 
     access_token = get_valid_token()
     env = os.environ.copy()
+    env.pop("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE", None)
     env["GOOGLE_WORKSPACE_CLI_TOKEN"] = access_token
 
     result = subprocess.run(["gws"] + sys.argv[1:], env=env)
