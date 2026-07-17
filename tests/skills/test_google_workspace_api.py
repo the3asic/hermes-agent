@@ -172,7 +172,72 @@ def test_bridge_main_injects_token_env(bridge_module, tmp_path):
                 bridge_module.main()
 
     assert captured["env"]["GOOGLE_WORKSPACE_CLI_TOKEN"] == "ya29.injected"
+    assert "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE" not in captured["env"]
     assert captured["cmd"] == ["gws", "gmail", "+triage"]
+
+
+def test_api_gws_env_falls_back_to_native_encrypted_store(api_module, monkeypatch):
+    """A missing plaintext credential path must not mask gws native auth."""
+    monkeypatch.setenv(
+        "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE",
+        "/definitely/missing/gws-credentials.json",
+    )
+    assert not api_module.TOKEN_PATH.exists()
+
+    env = api_module._gws_env()
+
+    assert "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE" not in env
+
+
+def test_api_gws_env_preserves_existing_explicit_credentials(api_module, monkeypatch, tmp_path):
+    credentials = tmp_path / "service-account.json"
+    credentials.write_text("{}")
+    monkeypatch.setenv("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE", str(credentials))
+
+    env = api_module._gws_env()
+
+    assert env["GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE"] == str(credentials)
+
+
+def test_api_gws_env_ignores_legacy_hermes_token_without_type(api_module, monkeypatch):
+    """Legacy google_token.json works for the Python SDK but not the gws CLI."""
+    _write_token(api_module.TOKEN_PATH)
+    monkeypatch.setenv(
+        "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE",
+        "/definitely/missing/gws-credentials.json",
+    )
+
+    env = api_module._gws_env()
+
+    assert "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE" not in env
+
+
+def test_api_gws_env_uses_compatible_hermes_token(api_module, monkeypatch):
+    _write_token(api_module.TOKEN_PATH, type="authorized_user")
+    monkeypatch.delenv("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE", raising=False)
+
+    env = api_module._gws_env()
+
+    assert env["GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE"] == str(api_module.TOKEN_PATH)
+
+
+def test_api_run_gws_does_not_require_hermes_token_file(api_module, monkeypatch):
+    """The gws CLI can authenticate through ~/.config/gws/credentials.enc."""
+    monkeypatch.delenv("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE", raising=False)
+    api_module._ensure_authenticated = MagicMock(
+        side_effect=AssertionError("gws path must not require google_token.json")
+    )
+    captured = {}
+
+    def capture_run(cmd, **kwargs):
+        captured["env"] = kwargs["env"]
+        return MagicMock(returncode=0, stdout="{}", stderr="")
+
+    with patch.object(api_module.subprocess, "run", side_effect=capture_run):
+        assert api_module._run_gws(["calendar", "calendarList", "list"]) == {}
+
+    api_module._ensure_authenticated.assert_not_called()
+    assert "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE" not in captured["env"]
 
 
 def test_api_calendar_list_uses_events_list(api_module):

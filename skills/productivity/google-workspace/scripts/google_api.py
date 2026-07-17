@@ -86,9 +86,27 @@ def _gws_binary() -> str | None:
     return shutil.which("gws")
 
 
+def _is_gws_compatible_token_file(path: Path) -> bool:
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError, TypeError):
+        return False
+    return payload.get("type") == "authorized_user" and all(
+        payload.get(key) for key in ("client_id", "client_secret", "refresh_token")
+    )
+
+
 def _gws_env() -> dict[str, str]:
     env = os.environ.copy()
-    env["GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE"] = str(TOKEN_PATH)
+    configured_path = env.get("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE")
+    if configured_path and Path(configured_path).expanduser().exists():
+        return env
+    if _is_gws_compatible_token_file(TOKEN_PATH):
+        env["GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE"] = str(TOKEN_PATH)
+    else:
+        # Let gws fall back to its native encrypted credential store.  A stale
+        # env var pointing at a missing plaintext file otherwise forces a 401.
+        env.pop("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE", None)
     return env
 
 
@@ -96,8 +114,6 @@ def _run_gws(parts: list[str], *, params: dict | None = None, body: dict | None 
     binary = _gws_binary()
     if not binary:
         raise RuntimeError("gws not installed")
-
-    _ensure_authenticated()
 
     cmd = [binary, *parts]
     if params is not None:
