@@ -282,7 +282,7 @@ You can run `hermes gateway` in the background or as a systemd service for persi
 
 ## Configuration Reference
 
-Discord behavior is controlled through two files: **`~/.hermes/.env`** for credentials and env-level toggles, and **`~/.hermes/config.yaml`** for structured settings. Environment variables always take precedence over config.yaml values when both are set.
+Discord behavior is controlled through two files: **`~/.hermes/.env`** for credentials and env-level overrides, and **`~/.hermes/config.yaml`** for structured settings. An explicit environment variable wins over the equivalent legacy top-level `discord:` field. Direct adapter values under `platforms.discord.extra` are already-resolved runtime config and take precedence over environment fallbacks.
 
 ### Environment Variables (`.env`)
 
@@ -317,7 +317,7 @@ Discord behavior is controlled through two files: **`~/.hermes/.env`** for crede
 | `DISCORD_PROXY` | No | — | Proxy URL for Discord connections (HTTP, WebSocket, REST). Overrides `HTTPS_PROXY`/`ALL_PROXY`. Supports `http://`, `https://`, and `socks5://` schemes. |
 | `DISCORD_ALLOW_ANY_ATTACHMENT` | No | — | Compatibility no-op. Every file type from an authorized sender is always accepted; the value is ignored and retained only for existing configurations. |
 | `DISCORD_INLINE_TEXT_ATTACHMENTS` | No | `true` | When `true`, small UTF-8 text-like attachments are copied into the model-visible message. Set to `false` to cache and surface them by path without inlining their contents. |
-| `DISCORD_MAX_ATTACHMENT_BYTES` | No | `33554432` | Maximum bytes per attachment the gateway will download and cache. Default 32 MiB. Set to `0` for no cap (attachments are held in memory while being written, so unlimited carries a real memory cost). |
+| `DISCORD_MAX_ATTACHMENT_BYTES` | No | `33554432` | Maximum bytes per Discord document attachment the gateway will download and cache. Default 32 MiB. Set to `0` to disable this document-specific cap; images, audio, and video remain subject to `gateway.max_inbound_media_bytes`. Documents are held in memory while being written. |
 | `HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS` | No | `0.6` | Grace window the adapter waits before flushing a queued text chunk. Useful for smoothing streamed output. |
 | `HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS` | No | `2.0` | Delay between split chunks when a single message exceeds Discord's length limit. |
 
@@ -329,7 +329,7 @@ Wiring multiple Hermes profiles to reply to one another in a shared channel — 
 
 ### Config File (`config.yaml`)
 
-The `discord` section in `~/.hermes/config.yaml` mirrors the env vars above. Config.yaml settings are applied as defaults — if the equivalent env var is already set, the env var wins.
+The top-level `discord` section in `~/.hermes/config.yaml` mirrors many env-level settings. The gateway translates supported values into environment defaults without overwriting an explicit environment variable. For `history_backfill_free_response`, `inline_text_attachments`, and `max_attachment_bytes`, direct values under `platforms.discord.extra` bypass that legacy bridge and win over environment fallbacks.
 
 ```yaml
 # Discord-specific settings
@@ -351,8 +351,9 @@ discord:
     limit: 100                    # Global scan cap per reconnect
     max_dispatches: 10            # Recovery dispatch cap per reconnect
   inline_text_attachments: true   # Inline small text-like uploads (default: true)
-  max_attachment_bytes: 33554432  # Per-file cache cap; 0 disables the cap
+  max_attachment_bytes: 33554432  # Document cache cap; 0 disables this cap
   channel_prompts: {}             # Per-channel ephemeral system prompts
+  channel_overrides: {}           # Per-channel/thread model, reasoning, and fallback policy
   allow_mentions:                 # What the bot is allowed to ping (safe defaults)
     everyone: false               # @everyone / @here pings (default: false)
     roles: false                  # @role pings (default: false)
@@ -480,6 +481,83 @@ Behavior:
 - If a message arrives inside a thread or forum post and that thread has no explicit entry, Hermes falls back to the parent channel/forum ID.
 - Prompts are applied ephemerally at runtime, so changing them affects future turns immediately without rewriting past session history.
 
+#### `discord.channel_overrides`
+
+**Type:** mapping — **Default:** `{}`
+
+Set runtime policy for one Discord channel, thread, or forum post. The supported
+fields are exactly `model`, `provider`, `system_prompt`, `reasoning_effort`, and
+`fallback_providers`.
+
+```yaml
+fallback_providers:               # Global chain
+  - provider: openrouter
+    model: anthropic/claude-sonnet-4.6
+
+discord:
+  channel_overrides:
+    "100000000000000001":
+      provider: anthropic
+      model: claude-opus-4.6
+      system_prompt: Focus on code review in this channel.
+      reasoning_effort: high
+      fallback_providers:
+        - provider: openrouter
+          model: anthropic/claude-sonnet-4.6
+    "100000000000000002":
+      reasoning_effort: false     # `none` also disables reasoning
+      fallback_providers: []      # Disable fallback for this thread/channel
+```
+
+Reasoning is resolved in this order:
+
+1. The session's live `/reasoning` setting.
+2. `reasoning_effort` on the exact channel or thread.
+3. `reasoning_effort` on the parent channel or forum.
+4. Global `agent.reasoning_effort`.
+
+An omitted reasoning field inherits the next level. `false` or `none` is an
+explicit disable and stops inheritance. Run `/reasoning reset` to remove a
+session setting and return to the channel/global policy.
+
+Fallback is resolved independently on every turn:
+
+1. `fallback_providers` on the exact channel or thread.
+2. `fallback_providers` on the parent channel or forum.
+3. Top-level `fallback_providers` (plus the legacy `fallback_model` chain).
+
+An omitted fallback field inherits. An explicit empty list disables fallback
+for that channel. A session `/model` command may still replace the primary
+model/provider; it does not replace the effective channel fallback chain. The
+chain is passed to the existing AIAgent fallback implementation, including when
+Hermes reuses a cached agent. Keep credentials in `.env`; for a custom endpoint,
+use `key_env` rather than writing a secret into this mapping. Fallback entries
+support `provider`, `model`, `base_url`, `api_key`, `key_env`, and `api_key_env`;
+unknown fields are rejected instead of ignored.
+
+All five override fields inherit independently. For example, an exact thread can
+set only `provider` while inheriting the parent channel's `model`,
+`system_prompt`, reasoning, and fallback chain.
+
+Channel overrides are loaded when the gateway starts. After editing this mapping,
+run `hermes config check` and restart/reload the gateway before expecting the new
+policy to affect messages. Reusing a cached agent does not freeze the resolved
+policy, but editing YAML alone does not hot-reload `GatewayConfig`.
+
+Writing YAML is not proof that Hermes applies it. Run `hermes config check`,
+then exercise the runtime resolver/behavior. For a source checkout, the focused
+contract test is:
+
+```bash
+python -m pytest -q tests/gateway/test_config.py tests/gateway/test_channel_overrides.py
+```
+
+`hermes config check` rejects unknown platform names, unknown override fields,
+and malformed values with the complete configured path, such as
+`platforms.typo_discord.channel_overrides`,
+`discord.channel_overrides.<id>...`, or
+`platforms.discord.channel_overrides.<id>...`.
+
 #### `discord.history_backfill`
 
 **Type:** boolean — **Default:** `true`
@@ -523,7 +601,7 @@ discord:
   history_backfill_free_response: true
 ```
 
-Equivalent env var: `DISCORD_HISTORY_BACKFILL_FREE_RESPONSE=true`. An explicit env value takes precedence over `config.yaml`.
+Equivalent env var: `DISCORD_HISTORY_BACKFILL_FREE_RESPONSE=true`. An explicit env value wins over top-level `discord.history_backfill_free_response`; `platforms.discord.extra.history_backfill_free_response` wins over the env fallback.
 
 #### `discord.history_backfill_limit`
 
@@ -694,25 +772,24 @@ Any file type a user uploads is accepted. Authorization to message the agent is 
 - Unknown types fall back to the upload's reported content type, or `application/octet-stream` when none is given.
 - Small UTF-8 text-like files (text, code, config, HTML, CSS, JSON, YAML, ...) have their contents auto-injected into the prompt up to 100 KiB when `inline_text_attachments` is `true` (the default). Set it to `false` to cache and surface the path without copying file contents into the model-visible message. Binary files are always surfaced by path only.
 
-The only inbound limit is the per-file size cap (default 32 MiB):
+Discord applies two inbound size limits: the document cache cap below and the gateway-wide `gateway.max_inbound_media_bytes` limit for images, audio, and video.
 
 ```yaml
 discord:
   # Optional — keep text-like uploads out of the model-visible message.
   # The cached file path remains available to the agent.
   inline_text_attachments: true
-  # Optional — raise/disable the per-file size cap. Default is 32 MiB.
-  # The whole file is held in memory while being cached, so unlimited
-  # uploads carry a real memory cost.
-  max_attachment_bytes: 33554432   # bytes; 0 = unlimited
+  # Optional — raise/disable the Discord document cache cap. Default: 32 MiB.
+  # The whole document is held in memory while being cached.
+  max_attachment_bytes: 33554432   # bytes; 0 = disable the document-specific cap
 ```
 
-Equivalent env vars: `DISCORD_INLINE_TEXT_ATTACHMENTS=true` and `DISCORD_MAX_ATTACHMENT_BYTES=33554432` (or `0` for no cap). Explicit env values take precedence over `config.yaml`.
+Equivalent env vars: `DISCORD_INLINE_TEXT_ATTACHMENTS=true` and `DISCORD_MAX_ATTACHMENT_BYTES=33554432` (or `0` to disable the document-specific cap). Explicit env values win over the top-level `discord:` fields; corresponding values under `platforms.discord.extra` win over the env fallback.
 
 The legacy `discord.allow_any_attachment` flag and `DISCORD_ALLOW_ANY_ATTACHMENT` env var are no-ops. Any file type from an authorized sender is always accepted; both names remain only so existing configurations keep loading.
 
-:::warning Memory cost of unlimited
-Disabling the size cap (`max_attachment_bytes: 0`) means a user can drop a multi-GB file on the bot and the gateway will dutifully buffer it through memory while caching to disk. Only set this in trusted single-user installs. For shared bots, keep the default 32 MiB or raise it conservatively.
+:::warning Scope and memory cost
+`max_attachment_bytes` applies to Discord document attachments, including text files. Images, audio, and video use the gateway-wide `gateway.max_inbound_media_bytes` limit. Setting the document cap to `0` removes this Discord-specific check, so keep a finite gateway-wide limit and use `0` only on trusted installations. Negative values are invalid and fall back to 32 MiB.
 :::
 
 ## Interactive Prompts (clarify)

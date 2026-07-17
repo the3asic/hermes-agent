@@ -281,7 +281,7 @@ hermes gateway
 
 ## 配置参考
 
-Discord 行为通过两个文件控制：**`~/.hermes/.env`** 用于凭据和环境级开关，**`~/.hermes/config.yaml`** 用于结构化设置。当两者都设置时，环境变量始终优先于 config.yaml 的值。
+Discord 行为通过两个文件控制：**`~/.hermes/.env`** 用于凭据和环境级覆盖值，**`~/.hermes/config.yaml`** 用于结构化设置。明确设置的环境变量优先于等效的旧式顶层 `discord:` 字段。`platforms.discord.extra` 属于 adapter 已解析的运行时配置，优先于环境变量回退值。
 
 ### 环境变量（`.env`）
 
@@ -314,13 +314,13 @@ Discord 行为通过两个文件控制：**`~/.hermes/.env`** 用于凭据和环
 | `DISCORD_PROXY` | 否 | — | Discord 连接的代理 URL（HTTP、WebSocket、REST）。覆盖 `HTTPS_PROXY`/`ALL_PROXY`。支持 `http://`、`https://` 和 `socks5://` 协议。 |
 | `DISCORD_ALLOW_ANY_ATTACHMENT` | 否 | — | 兼容用空开关。已授权发送者上传的所有文件类型始终会被接受；该值会被忽略，只为兼容现有配置而保留。 |
 | `DISCORD_INLINE_TEXT_ATTACHMENTS` | 否 | `true` | 为 `true` 时，小型 UTF-8 文本类附件会复制进模型可见消息。设为 `false` 后仍会缓存文件并提供路径，但不会内联文件内容。 |
-| `DISCORD_MAX_ATTACHMENT_BYTES` | 否 | `33554432` | 网关将下载并缓存的每个附件的最大字节数。默认 32 MiB。设置为 `0` 表示无上限（附件在写入时保存在内存中，因此无限制会带来真实的内存成本）。 |
+| `DISCORD_MAX_ATTACHMENT_BYTES` | 否 | `33554432` | 网关将下载并缓存的每个 Discord 文档附件最大字节数。默认 32 MiB。设为 `0` 只会关闭文档专用上限；图片、音频和视频仍受 `gateway.max_inbound_media_bytes` 限制。文档在写入时保存在内存中。 |
 | `HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS` | 否 | `0.6` | 适配器在刷新排队文本块之前等待的宽限窗口。用于平滑流式输出。 |
 | `HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS` | 否 | `2.0` | 当单条消息超过 Discord 长度限制时，分割块之间的延迟。 |
 
 ### 配置文件（`config.yaml`）
 
-`~/.hermes/config.yaml` 中的 `discord` 部分与上述环境变量对应。config.yaml 设置作为默认值应用——如果已设置等效的环境变量，则环境变量优先。
+`~/.hermes/config.yaml` 中的顶层 `discord` 部分与许多环境变量对应。Gateway 会把已支持的字段转换为环境默认值，但不会覆盖明确设置的环境变量。对于 `history_backfill_free_response`、`inline_text_attachments` 和 `max_attachment_bytes`，直接写在 `platforms.discord.extra` 下的值不走旧式桥接，并优先于环境变量回退值。
 
 ```yaml
 # Discord 特定设置
@@ -342,7 +342,7 @@ discord:
     limit: 100                    # 每次重连的全局扫描上限
     max_dispatches: 10            # 每次重连的恢复分发上限
   inline_text_attachments: true   # 内联小型文本类附件（默认：true）
-  max_attachment_bytes: 33554432  # 每个文件的缓存上限；0 表示不设上限
+  max_attachment_bytes: 33554432  # 文档附件缓存上限；0 表示关闭这一层限制
   channel_prompts: {}             # 每个频道的临时系统 prompt（提示词）
   allow_mentions:                 # 机器人允许 ping 的内容（安全默认值）
     everyone: false               # @everyone / @here ping（默认：false）
@@ -514,7 +514,7 @@ discord:
   history_backfill_free_response: true
 ```
 
-等效环境变量：`DISCORD_HISTORY_BACKFILL_FREE_RESPONSE=true`。明确设置的环境变量优先于 `config.yaml`。
+等效环境变量：`DISCORD_HISTORY_BACKFILL_FREE_RESPONSE=true`。明确设置的环境变量优先于顶层 `discord.history_backfill_free_response`；`platforms.discord.extra.history_backfill_free_response` 则优先于环境变量回退值。
 
 #### `discord.history_backfill_limit`
 
@@ -690,18 +690,17 @@ discord:
   # 可选：不把文本类附件内容复制进模型可见消息。
   # 文件仍会缓存，agent 仍能看到路径。
   inline_text_attachments: true
-  # 可选 — 提高/禁用每文件大小上限。默认为 32 MiB。
-  # 整个文件在缓存时保存在内存中，因此无限制
-  # 上传会带来真实的内存成本。
-  max_attachment_bytes: 33554432   # 字节；0 = 无限制
+  # 可选 — 提高/关闭 Discord 文档附件缓存上限。默认为 32 MiB。
+  # 整个文档在缓存时会保存在内存中。
+  max_attachment_bytes: 33554432   # 字节；0 = 关闭文档专用上限
 ```
 
-等效环境变量：`DISCORD_INLINE_TEXT_ATTACHMENTS=true` 和 `DISCORD_MAX_ATTACHMENT_BYTES=33554432`（或 `0` 表示无上限）。明确设置的环境变量优先于 `config.yaml`。
+等效环境变量：`DISCORD_INLINE_TEXT_ATTACHMENTS=true` 和 `DISCORD_MAX_ATTACHMENT_BYTES=33554432`（设为 `0` 只关闭文档专用上限）。明确设置的环境变量优先于顶层 `discord:` 字段；`platforms.discord.extra` 下的对应值优先于环境变量回退值。
 
 旧的 `discord.allow_any_attachment` 配置项和 `DISCORD_ALLOW_ANY_ATTACHMENT` 环境变量都是兼容用空开关。已授权发送者上传的所有文件类型始终会被接受；这两个名称只为保证现有配置可以继续加载而保留。
 
-:::warning 无限制的内存成本
-禁用大小上限（`max_attachment_bytes: 0`）意味着用户可以向机器人上传数 GB 的文件，网关会尽职地在缓存到磁盘时将其缓冲到内存中。仅在受信任的单用户安装中设置此项。对于共享机器人，保持默认的 32 MiB 或保守地提高上限。
+:::warning 作用范围与内存成本
+`max_attachment_bytes` 只限制 Discord 文档附件（包括文本文件）。图片、音频和视频使用 gateway 全局的 `gateway.max_inbound_media_bytes`。设为 `0` 只会关闭 Discord 文档这一层检查，因此仍应保留有限的全局媒体上限，并且只在可信环境中使用 `0`。负数无效，会回退到 32 MiB。
 :::
 
 ## 交互式提示（clarify）

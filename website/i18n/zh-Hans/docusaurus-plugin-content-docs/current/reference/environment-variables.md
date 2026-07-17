@@ -264,7 +264,7 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 | `DISCORD_HISTORY_BACKFILL_LIMIT` | Discord 历史回填最多扫描的消息数。默认 `50`。 |
 | `DISCORD_ALLOW_ANY_ATTACHMENT` | 兼容用空开关。已授权发送者上传的所有文件类型始终会被接受；该值会被忽略。 |
 | `DISCORD_INLINE_TEXT_ATTACHMENTS` | 把小型 UTF-8 文本类附件内联进模型可见消息。默认 `true`；设为 `false` 后只提供缓存路径。 |
-| `DISCORD_MAX_ATTACHMENT_BYTES` | gateway 缓存的每个附件最大字节数。默认 `33554432`（32 MiB）。设为 `0` 表示无上限（附件在写入时保存在内存中）。 |
+| `DISCORD_MAX_ATTACHMENT_BYTES` | gateway 缓存的每个 Discord 文档附件最大字节数。默认 `33554432`（32 MiB）。设为 `0` 只会关闭文档专用上限；图片、音频和视频仍受 `gateway.max_inbound_media_bytes` 限制。文档在写入时保存在内存中。 |
 | `DISCORD_REACTIONS` | 处理期间在消息上启用 emoji 反应（默认：`true`） |
 | `DISCORD_IGNORED_CHANNELS` | bot 永不响应的逗号分隔频道 ID |
 | `DISCORD_NO_THREAD_CHANNELS` | bot 不自动创建线程的逗号分隔频道 ID |

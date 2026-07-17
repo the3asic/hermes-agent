@@ -5644,6 +5644,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # Get channel topic (if available).
         # For forum threads, inherit the parent forum's topic.
         chat_topic = self._get_effective_topic(interaction.channel, is_thread=is_thread)
+        parent_id = str(
+            getattr(getattr(interaction, "channel", None), "parent_id", "") or ""
+        )
 
         source = self.build_source(
             chat_id=str(interaction.channel_id),
@@ -5653,11 +5656,11 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            parent_chat_id=parent_id or None,
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
         channel_id = str(interaction.channel_id)
-        parent_id = str(getattr(getattr(interaction, "channel", None), "parent_id", "") or "")
         return MessageEvent(
             text=text,
             message_type=msg_type,
@@ -5822,11 +5825,11 @@ class DiscordAdapter(BasePlatformAdapter):
         }
 
     def _discord_max_attachment_bytes(self) -> int:
-        """Return the per-attachment byte cap. 0 means unlimited.
+        """Return the Discord document byte cap. 0 means no document cap.
 
-        The whole attachment is held in memory while being written to the
-        cache, so unlimited carries a real memory cost. Default 32 MiB
-        matches the historical hardcoded value.
+        Images/audio/video use ``gateway.max_inbound_media_bytes`` instead.
+        The whole document is held in memory while being written to the cache,
+        so removing this cap carries a real memory cost. Default: 32 MiB.
         """
         configured = self.config.extra.get("max_attachment_bytes")
         if configured is None:
@@ -5841,7 +5844,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 configured,
             )
             return 32 * 1024 * 1024
-        return max(0, value)
+        if value < 0:
+            logger.warning(
+                "[Discord] max_attachment_bytes must be >= 0, got %r; "
+                "falling back to 32 MiB",
+                configured,
+            )
+            return 32 * 1024 * 1024
+        return value
 
     @staticmethod
     def _is_discord_voice_message_attachment(att: Any) -> bool:
@@ -7160,6 +7170,7 @@ class DiscordAdapter(BasePlatformAdapter):
         att,
         *,
         media_type: str = "media",
+        max_bytes: Optional[int] = None,
     ) -> Optional[bytes]:
         """Read an attachment via discord.py's authenticated bot session.
 
@@ -7168,13 +7179,17 @@ class DiscordAdapter(BasePlatformAdapter):
         should treat ``None`` as a signal to fall back to the URL-based
         downloaders.
 
-        Oversized attachments (per ``gateway.max_inbound_media_bytes``) raise
-        ``ValueError`` BEFORE the bytes are pulled into memory when Discord
-        reports the size up front, so a hostile upload can't OOM the gateway.
+        Oversized attachments raise ``ValueError`` before the bytes are pulled
+        into memory when Discord reports the size up front, then are checked
+        again against the actual byte length. ``max_bytes=None`` uses
+        ``gateway.max_inbound_media_bytes``; callers may supply a platform-
+        specific cap, including ``0`` to disable that check.
         """
         attachment_size = getattr(att, "size", None)
         if attachment_size:
-            validate_inbound_media_size(int(attachment_size), media_type=media_type)
+            validate_inbound_media_size(
+                int(attachment_size), media_type=media_type, max_bytes=max_bytes
+            )
 
         reader = getattr(att, "read", None)
         if reader is None or not callable(reader):
@@ -7188,7 +7203,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 e,
             )
             return None
-        validate_inbound_media_size(len(raw_bytes), media_type=media_type)
+        validate_inbound_media_size(
+            len(raw_bytes), media_type=media_type, max_bytes=max_bytes
+        )
         return raw_bytes
 
     async def _cache_discord_image(self, att, ext: str) -> str:
@@ -7240,7 +7257,12 @@ class DiscordAdapter(BasePlatformAdapter):
         for passing the returned bytes to ``cache_document_from_bytes``
         (and, where applicable, for injecting text content).
         """
-        raw_bytes = await self._read_attachment_bytes(att, media_type="document")
+        max_doc_bytes = self._discord_max_attachment_bytes()
+        raw_bytes = await self._read_attachment_bytes(
+            att,
+            media_type="document",
+            max_bytes=max_doc_bytes,
+        )
         if raw_bytes is not None:
             return raw_bytes
 
@@ -7261,7 +7283,13 @@ class DiscordAdapter(BasePlatformAdapter):
             ) as resp:
                 if resp.status != 200:
                     raise Exception(f"HTTP {resp.status}")
-                return await resp.read()
+                raw_bytes = await resp.read()
+                validate_inbound_media_size(
+                    len(raw_bytes),
+                    media_type="document",
+                    max_bytes=max_doc_bytes,
+                )
+                return raw_bytes
 
     async def _handle_message(
         self,
