@@ -4,6 +4,8 @@ import logging
 import os
 from unittest.mock import patch
 
+import pytest
+
 from agent.secret_scope import reset_secret_scope, set_secret_scope
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from gateway.config import (
@@ -100,6 +102,13 @@ class TestPlatformConfigRoundtrip:
                     model="openrouter/healer-alpha",
                     provider="openrouter",
                     system_prompt="You are a daily news summarizer.",
+                    reasoning_effort="high",
+                    fallback_providers=[
+                        {
+                            "provider": "anthropic",
+                            "model": "claude-sonnet-4.6",
+                        },
+                    ],
                 ),
                 "9876543210": ChannelOverride(
                     model="anthropic/claude-opus-4.6",
@@ -111,9 +120,17 @@ class TestPlatformConfigRoundtrip:
         d = pc.to_dict()
         assert "channel_overrides" in d
         assert d["channel_overrides"]["1234567890"]["model"] == "openrouter/healer-alpha"
+        assert d["channel_overrides"]["1234567890"]["reasoning_effort"] == "high"
+        assert d["channel_overrides"]["1234567890"]["fallback_providers"] == [
+            {"provider": "anthropic", "model": "claude-sonnet-4.6"},
+        ]
         assert d["channel_overrides"]["9876543210"]["system_prompt"] == "You are a coding assistant."
         restored = PlatformConfig.from_dict(d)
         assert restored.channel_overrides["1234567890"].model == "openrouter/healer-alpha"
+        assert restored.channel_overrides["1234567890"].reasoning_effort == "high"
+        assert restored.channel_overrides["1234567890"].fallback_providers == [
+            {"provider": "anthropic", "model": "claude-sonnet-4.6"},
+        ]
         assert restored.channel_overrides["9876543210"].provider == "anthropic"
 
     def test_channel_overrides_from_dict_normalizes_channel_id_to_str(self):
@@ -134,12 +151,77 @@ class TestChannelOverride:
         assert ChannelOverride.from_dict({}).model is None
         assert ChannelOverride.from_dict(None).model is None
 
+    def test_gateway_config_rejects_unknown_platform_with_overrides(self):
+        with pytest.raises(ValueError, match="unknown platform"):
+            GatewayConfig.from_dict({
+                "platforms": {
+                    "typo_discord": {"channel_overrides": {"123": {"model": "gpt-5"}}}
+                }
+            })
+
     def test_to_dict_omits_none(self):
         ov = ChannelOverride(model="gpt-4", provider=None, system_prompt="Hi")
         d = ov.to_dict()
         assert d["model"] == "gpt-4"
         assert "provider" not in d
         assert d["system_prompt"] == "Hi"
+
+    def test_reasoning_disabled_roundtrip_is_not_missing(self):
+        restored = ChannelOverride.from_dict({"reasoning_effort": False})
+        assert restored.reasoning_effort is False
+        assert restored.to_dict()["reasoning_effort"] is False
+
+    def test_reasoning_uses_canonical_parser(self):
+        restored = ChannelOverride.from_dict({"reasoning_effort": " XHIGH "})
+        assert restored.reasoning_effort == "xhigh"
+
+    def test_invalid_reasoning_is_rejected(self):
+        with pytest.raises(ValueError, match="unknown value 'turbo'"):
+            ChannelOverride.from_dict({"reasoning_effort": "turbo"})
+
+    @pytest.mark.parametrize("field_name", ["model", "provider"])
+    def test_blank_route_field_is_rejected(self, field_name):
+        with pytest.raises(ValueError, match=f"{field_name} must not be blank"):
+            ChannelOverride.from_dict({field_name: "   "})
+
+    def test_unknown_fallback_field_is_rejected(self):
+        with pytest.raises(ValueError, match="api_mode"):
+            ChannelOverride.from_dict({
+                "fallback_providers": [
+                    {
+                        "provider": "openrouter",
+                        "model": "gpt-5",
+                        "api_mode": "chat_completions",
+                    },
+                ],
+            })
+
+    def test_unknown_key_is_rejected_instead_of_discarded(self):
+        with pytest.raises(ValueError, match="unsupported_field"):
+            ChannelOverride.from_dict({"model": "gpt-5", "unsupported_field": True})
+
+    def test_fallback_providers_use_canonical_normalizer(self):
+        restored = ChannelOverride.from_dict({
+            "fallback_providers": [
+                {
+                    "provider": " openrouter ",
+                    "model": " anthropic/claude-sonnet-4.6 ",
+                    "base_url": "https://openrouter.ai/api/v1/",
+                },
+            ],
+        })
+        assert restored.fallback_providers == [
+            {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "base_url": "https://openrouter.ai/api/v1",
+            },
+        ]
+
+    def test_explicit_empty_fallback_roundtrip_is_not_missing(self):
+        restored = ChannelOverride.from_dict({"fallback_providers": []})
+        assert restored.fallback_providers == []
+        assert restored.to_dict()["fallback_providers"] == []
 
 
 class TestPlatformConfigMalformedSections:
@@ -434,6 +516,83 @@ class TestGatewayConfigRoundtrip:
 
 
 class TestLoadGatewayConfig:
+    def test_loads_channel_fallback_contract_from_real_yaml(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  discord:\n"
+            "    channel_overrides:\n"
+            "      '123':\n"
+            "        reasoning_effort: medium\n"
+            "        fallback_providers:\n"
+            "          - provider: openai-codex\n"
+            "            model: gpt-5.6-sol\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        override = config.platforms[Platform.DISCORD].channel_overrides["123"]
+        assert override.reasoning_effort == "medium"
+        assert override.fallback_providers == [
+            {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+        ]
+
+    def test_real_yaml_rejects_unknown_platform_with_overrides(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  typo_discord:\n"
+            "    channel_overrides:\n"
+            "      '123':\n"
+            "        model: gpt-5\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        with pytest.raises(ValueError, match="unknown platform"):
+            load_gateway_config()
+
+    def test_real_yaml_rejects_unknown_nested_gateway_platform_with_overrides(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    typo_discord:\n"
+            "      channel_overrides:\n"
+            "        '123':\n"
+            "          model: gpt-5\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        with pytest.raises(ValueError, match="unknown platform"):
+            load_gateway_config()
+
+    def test_real_yaml_rejects_unknown_legacy_platform_with_overrides(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "typo_discord:\n  channel_overrides:\n    '123':\n      model: gpt-5\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        with pytest.raises(ValueError, match="unknown platform"):
+            load_gateway_config()
+
     def test_bridges_quick_commands_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
@@ -824,6 +983,35 @@ class TestLoadGatewayConfig:
         assert telegram.token == "top-token"
         assert telegram.extra["reply_prefix"] == "top"
 
+    def test_top_level_platform_map_wins_for_overrides_and_shared_bridge(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    discord:\n"
+            "      require_mention: true\n"
+            "      channel_overrides:\n"
+            "        '123':\n"
+            "          model: nested-model\n"
+            "platforms:\n"
+            "  discord:\n"
+            "    require_mention: false\n"
+            "    channel_overrides:\n"
+            "      '123':\n"
+            "        model: top-model\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+        discord = config.platforms[Platform.DISCORD]
+
+        assert discord.channel_overrides["123"].model == "top-model"
+        assert discord.extra["require_mention"] is False
+
     def test_shared_key_loop_bridges_allow_from_from_nested_platforms(self, tmp_path, monkeypatch):
         """Regression: shared-key loop must bridge allow_from / require_mention
         into PlatformConfig.extra even when the platform is configured only
@@ -928,7 +1116,11 @@ class TestLoadGatewayConfig:
             '    "1234567890":\n'
             "      model: openrouter/healer-alpha\n"
             "      provider: openrouter\n"
-            "      system_prompt: Daily news summarizer\n",
+            "      system_prompt: Daily news summarizer\n"
+            "      reasoning_effort: false\n"
+            "      fallback_providers:\n"
+            "        - provider: anthropic\n"
+            "          model: claude-sonnet-4.6\n",
             encoding="utf-8",
         )
 
@@ -942,6 +1134,38 @@ class TestLoadGatewayConfig:
         assert ov.model == "openrouter/healer-alpha"
         assert ov.provider == "openrouter"
         assert ov.system_prompt == "Daily news summarizer"
+        assert ov.reasoning_effort is False
+        assert ov.fallback_providers == [
+            {"provider": "anthropic", "model": "claude-sonnet-4.6"},
+        ]
+
+        # Exercise the dataclass serialization path after the real YAML bridge.
+        restored = GatewayConfig.from_dict(config.to_dict())
+        restored_ov = restored.platforms[Platform.DISCORD].channel_overrides[
+            "1234567890"
+        ]
+        assert restored_ov.reasoning_effort is False
+        assert restored_ov.fallback_providers == ov.fallback_providers
+
+    def test_unknown_discord_channel_override_field_fails_real_yaml_load(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "discord:\n"
+            "  channel_overrides:\n"
+            "    '123':\n"
+            "      unsupported_field: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        with pytest.raises(
+            ValueError,
+            match=r"channel_overrides\.123: Unknown channel override field.*unsupported_field",
+        ):
+            load_gateway_config()
 
     def test_bridges_discord_channel_prompts_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"

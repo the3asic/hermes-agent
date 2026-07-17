@@ -288,7 +288,7 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `DISCORD_HISTORY_BACKFILL_LIMIT` | Maximum Discord messages scanned during history backfill. Default `50`. |
 | `DISCORD_ALLOW_ANY_ATTACHMENT` | Compatibility no-op. All file types from authorized senders are always accepted; the value is ignored. |
 | `DISCORD_INLINE_TEXT_ATTACHMENTS` | Inline small UTF-8 text-like uploads into the model-visible message. Default `true`; set `false` to surface only the cached path. |
-| `DISCORD_MAX_ATTACHMENT_BYTES` | Maximum bytes per attachment the gateway will cache. Default `33554432` (32 MiB). Set to `0` for no cap (attachments are held in memory while being written). |
+| `DISCORD_MAX_ATTACHMENT_BYTES` | Maximum bytes per Discord document attachment the gateway will cache. Default `33554432` (32 MiB). Set to `0` to disable this document-specific cap; image, audio, and video uploads remain subject to `gateway.max_inbound_media_bytes`. Documents are held in memory while being written. |
 | `DISCORD_REACTIONS` | Enable emoji reactions on messages during processing (default: `true`) |
 | `DISCORD_IGNORED_CHANNELS` | Comma-separated channel IDs where the bot never responds |
 | `DISCORD_NO_THREAD_CHANNELS` | Comma-separated channel IDs where bot responds without auto-threading |

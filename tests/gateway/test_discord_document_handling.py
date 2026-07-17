@@ -603,8 +603,58 @@ class TestAllowAnyAttachment:
         assert event.media_urls == []
 
     @pytest.mark.asyncio
+    async def test_authenticated_document_read_checks_actual_bytes_without_size(
+        self, adapter
+    ):
+        """A missing Discord size must not bypass the document cache cap."""
+        adapter.config.extra["max_attachment_bytes"] = 4
+        att = make_attachment(
+            filename="actual-too-big.bin",
+            content_type="application/octet-stream",
+            size=0,
+        )
+        att.read = AsyncMock(return_value=b"12345")
+
+        with pytest.raises(ValueError, match="Inbound document payload is too large"):
+            await adapter._cache_discord_document(att, ".bin")
+
+    @pytest.mark.asyncio
+    async def test_url_fallback_checks_actual_document_bytes_without_size(
+        self, adapter
+    ):
+        """The SSRF-gated URL fallback must enforce the same document cap."""
+        adapter.config.extra["max_attachment_bytes"] = 4
+        att = make_attachment(
+            filename="fallback-too-big.bin",
+            content_type="application/octet-stream",
+            size=0,
+        )
+
+        with _mock_aiohttp_download(b"12345"):
+            with pytest.raises(
+                ValueError, match="Inbound document payload is too large"
+            ):
+                await adapter._cache_discord_document(att, ".bin")
+
+    @pytest.mark.asyncio
+    async def test_zero_disables_document_cap_not_media_cap(self, adapter, monkeypatch):
+        """A zero document cap does not borrow the global media limit."""
+        from gateway.platforms import base as platform_base
+
+        adapter.config.extra["max_attachment_bytes"] = 0
+        monkeypatch.setattr(platform_base, "get_inbound_media_max_bytes", lambda: 1)
+        att = make_attachment(
+            filename="allowed-document.bin",
+            content_type="application/octet-stream",
+            size=0,
+        )
+        att.read = AsyncMock(return_value=b"12345")
+
+        assert await adapter._cache_discord_document(att, ".bin") == b"12345"
+
+    @pytest.mark.asyncio
     async def test_max_attachment_bytes_zero_means_unlimited(self, adapter):
-        """max_attachment_bytes=0 disables the size cap entirely."""
+        """max_attachment_bytes=0 disables the document-specific size cap."""
         adapter.config.extra["max_attachment_bytes"] = 0
 
         # 64 MiB — would normally exceed the historical 32 MiB hardcoded cap.
@@ -657,4 +707,9 @@ class TestAllowAnyAttachment:
     def test_max_bytes_helper_invalid_value_falls_back(self, adapter):
         """Garbage in max_attachment_bytes config falls back to 32 MiB."""
         adapter.config.extra["max_attachment_bytes"] = "not-a-number"
+        assert adapter._discord_max_attachment_bytes() == 32 * 1024 * 1024
+
+    def test_max_bytes_helper_negative_value_falls_back(self, adapter):
+        """Negative values must not silently become the unlimited sentinel."""
+        adapter.config.extra["max_attachment_bytes"] = -1
         assert adapter._discord_max_attachment_bytes() == 32 * 1024 * 1024

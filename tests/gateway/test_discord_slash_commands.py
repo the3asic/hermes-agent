@@ -551,6 +551,7 @@ def test_build_slash_event_preserves_thread_context(adapter):
     assert event.source.chat_id == "555"
     assert event.source.chat_type == "thread"
     assert event.source.thread_id == "555"
+    assert event.source.parent_chat_id == "100"
     assert "TestGuild" in event.source.chat_name
 
 
@@ -764,6 +765,7 @@ class _FakeThreadChannel(_discord_mod.Thread):
         self.name = name
         self.guild = SimpleNamespace(name=guild_name, id=1)
         self.topic = None
+        self.parent_id = parent_id
         self.parent = SimpleNamespace(id=parent_id, name="general", guild=SimpleNamespace(name=guild_name, id=1))
 
     def history(self, *args, **kwargs):

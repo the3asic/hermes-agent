@@ -1159,7 +1159,6 @@ DEFAULT_CONFIG = {
         "image_input_mode": "auto",
         "disabled_toolsets": [],
     },
-    
     "terminal": {
         "backend": "local",
         "modal_mode": "auto",
@@ -1256,14 +1255,12 @@ DEFAULT_CONFIG = {
         # via TERMINAL_LOCAL_PERSISTENT env var.
         "persistent_shell": True,
     },
-
     "web": {
         "backend": "",           # shared fallback — applies to both search and extract
         "search_backend": "",    # per-capability override for web_search (e.g. "searxng")
         "extract_backend": "",   # per-capability override for web_extract (e.g. "native")
         "extract_char_limit": 15000,  # per-page char budget for web_extract; larger pages truncate + store full text in cache/web
     },
-
     "browser": {
         "inactivity_timeout": 120,
         "command_timeout": 30,  # Timeout for browser commands in seconds (screenshot, navigate, etc.)
@@ -1303,7 +1300,6 @@ DEFAULT_CONFIG = {
             "loopback_host_alias": "host.docker.internal",
         },
     },
-
     # Filesystem checkpoints — automatic snapshots before destructive file ops.
     # When enabled, the agent takes a snapshot of the working directory once
     # per conversation turn (on first write_file/patch call).  Use /rollback
@@ -1342,7 +1338,6 @@ DEFAULT_CONFIG = {
         "delete_orphans": True,
         "min_interval_hours": 24,
     },
-
     # Hard cap (chars) for a single automatic context file such as SOUL.md,
     # AGENTS.md, CLAUDE.md, .hermes.md, or .cursorrules before Hermes applies
     # head/tail truncation. ``null`` (the default) lets the cap scale with the
@@ -1350,12 +1345,10 @@ DEFAULT_CONFIG = {
     # rarely truncate a project doc. Set a positive integer to pin a fixed cap
     # and override the dynamic behavior. Separate from read_file tool limits.
     "context_file_max_chars": None,
-
     # Maximum characters returned by a single read_file call.  Reads that
     # exceed this are rejected with guidance to use offset+limit.
     # 100K chars ≈ 25–35K tokens across typical tokenisers.
     "file_read_max_chars": 100_000,
-
     # Seconds to wait at agent-build time for in-flight MCP server discovery
     # to finish before the agent snapshots its tool list.  MCP discovery runs
     # in a background thread so a slow/dead server can't freeze startup; this
@@ -1370,7 +1363,6 @@ DEFAULT_CONFIG = {
     # (see agent/turn_context.py), so correctness never depends on it.  Keep it
     # small so a slow/dead server adds little to first-response latency.
     "mcp_discovery_timeout": 1.5,
-
     # Tool-output truncation thresholds. When terminal output or a
     # single read_file page exceeds these limits, Hermes truncates the
     # payload sent to the model (keeping head + tail for terminal,
@@ -1390,7 +1382,6 @@ DEFAULT_CONFIG = {
         "max_lines": 2000,
         "max_line_length": 2000,
     },
-
     # Tool loop guardrails nudge models when they repeat failed or
     # non-progressing tool calls. Soft warnings are always-on by default;
     # hard stops are opt-in so interactive CLI/TUI sessions keep flowing.
@@ -1408,76 +1399,74 @@ DEFAULT_CONFIG = {
             "idempotent_no_progress": 5,
         },
     },
-
     "compression": {
         "enabled": True,
         "threshold": 0.50,            # compress when context usage exceeds this ratio.
-                                      # Models with context windows below 512K are
-                                      # floored at 0.75 (raise-only) so compaction
-                                      # doesn't fire with half the window still free;
-                                      # set this above 0.75 to override the floor.
+        # Models with context windows below 512K are
+        # floored at 0.75 (raise-only) so compaction
+        # doesn't fire with half the window still free;
+        # set this above 0.75 to override the floor.
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "hygiene_hard_message_limit": 5000,  # gateway session-hygiene force-compress threshold by message count
         "protect_first_n": 3,         # non-system head messages always preserved
-                                      # verbatim, in ADDITION to the system prompt
-                                      # (which is always implicitly protected). Set to
-                                      # 0 for long-running rolling-compaction sessions
-                                      # where you want nothing pinned except the
-                                      # system prompt + rolling summary + recent tail.
+        # verbatim, in ADDITION to the system prompt
+        # (which is always implicitly protected). Set to
+        # 0 for long-running rolling-compaction sessions
+        # where you want nothing pinned except the
+        # system prompt + rolling summary + recent tail.
         "abort_on_summary_failure": False,  # When True, auto-compression that fails
-                                      # to generate a summary (aux LLM errored / returned
-                                      # non-JSON / timed out) aborts entirely instead of
-                                      # dropping the middle window with a static
-                                      # "summary unavailable" placeholder.  Messages are
-                                      # preserved unchanged and the session "freezes" at
-                                      # its current size until the user runs /compress
-                                      # (which bypasses the failure cooldown) or /new.
-                                      # Default False matches historical behavior; set to
-                                      # True if you'd rather pause than silently lose
-                                      # context turns when your aux model is flaky.
+        # to generate a summary (aux LLM errored / returned
+        # non-JSON / timed out) aborts entirely instead of
+        # dropping the middle window with a static
+        # "summary unavailable" placeholder.  Messages are
+        # preserved unchanged and the session "freezes" at
+        # its current size until the user runs /compress
+        # (which bypasses the failure cooldown) or /new.
+        # Default False matches historical behavior; set to
+        # True if you'd rather pause than silently lose
+        # context turns when your aux model is flaky.
         "codex_gpt55_autoraise": True,  # Historical key name kept for compatibility.
-                                      # When True, gpt-5.4 / gpt-5.5 / gpt-5.6 on the
-                                      # ChatGPT Codex OAuth route raise their compaction
-                                      # trigger to 85% (vs the global `threshold` above).
-                                      # Codex hard-caps these families at a 272K window, so
-                                      # the default 50% would compact at ~136K and waste half
-                                      # the usable context. Set to False to opt back down to
-                                      # the global threshold (e.g. 0.50) for those Codex
-                                      # sessions. Only this exact route is affected —
-                                      # gpt-5.4 / 5.5 / 5.6 on OpenAI's direct API,
-                                      # OpenRouter, and Copilot keep the global threshold
-                                      # regardless.
+        # When True, gpt-5.4 / gpt-5.5 / gpt-5.6 on the
+        # ChatGPT Codex OAuth route raise their compaction
+        # trigger to 85% (vs the global `threshold` above).
+        # Codex hard-caps these families at a 272K window, so
+        # the default 50% would compact at ~136K and waste half
+        # the usable context. Set to False to opt back down to
+        # the global threshold (e.g. 0.50) for those Codex
+        # sessions. Only this exact route is affected —
+        # gpt-5.4 / 5.5 / 5.6 on OpenAI's direct API,
+        # OpenRouter, and Copilot keep the global threshold
+        # regardless.
         "codex_gpt55_autoraise_notice": True,  # Display the one-time Codex gpt-5.4/5.5/5.6
-                                      # autoraise banner. Set False to keep the
-                                      # 85% threshold autoraise but suppress the
-                                      # user-facing notice in CLI/gateway output.
+        # autoraise banner. Set False to keep the
+        # 85% threshold autoraise but suppress the
+        # user-facing notice in CLI/gateway output.
         "codex_app_server_auto": "native",  # Codex app-server (codex CLI runtime) thread
-                                      # compaction mode. The codex agent owns the real
-                                      # thread context, so Hermes' summarizer cannot
-                                      # shrink it (#36801). native = codex decides when
-                                      # to compact its own thread (default); hermes =
-                                      # Hermes' compression threshold triggers
-                                      # thread/compact/start; off = never auto-trigger
-                                      # (codex may still compact natively).
+        # compaction mode. The codex agent owns the real
+        # thread context, so Hermes' summarizer cannot
+        # shrink it (#36801). native = codex decides when
+        # to compact its own thread (default); hermes =
+        # Hermes' compression threshold triggers
+        # thread/compact/start; off = never auto-trigger
+        # (codex may still compact natively).
         "in_place": True,             # When True, compaction rewrites the message
-                                      # list and rebuilds the system prompt WITHOUT
-                                      # rotating the session id — the conversation
-                                      # keeps one durable id for its whole life
-                                      # (no parent_session_id chain, no `name #N`
-                                      # renumbering). Eliminates the session-rotation
-                                      # bug cluster (#33618 /goal loss, #14238 lost
-                                      # response, #33907 orphans, #45117 search gaps,
-                                      # #42228 null cwd) — see #38763. Non-destructive:
-                                      # the live context is compacted (lossy for what
-                                      # the model reloads), but the pre-compaction
-                                      # turns are soft-archived under the same id
-                                      # (active=0, compacted=1) — still searchable via
-                                      # session_search and recoverable, not deleted.
-                                      # Default False during rollout; will flip on
-                                      # after live validation.
+        # list and rebuilds the system prompt WITHOUT
+        # rotating the session id — the conversation
+        # keeps one durable id for its whole life
+        # (no parent_session_id chain, no `name #N`
+        # renumbering). Eliminates the session-rotation
+        # bug cluster (#33618 /goal loss, #14238 lost
+        # response, #33907 orphans, #45117 search gaps,
+        # #42228 null cwd) — see #38763. Non-destructive:
+        # the live context is compacted (lossy for what
+        # the model reloads), but the pre-compaction
+        # turns are soft-archived under the same id
+        # (active=0, compacted=1) — still searchable via
+        # session_search and recoverable, not deleted.
+        # Default False during rollout; will flip on
+        # after live validation.
     },
-
     # Kanban subsystem (orchestrator workers + dispatcher-driven child tasks).
     # See tools/kanban_tools.py and hermes_cli/kanban_db.py for the actual
     # implementations. Per-platform notification opt-out is handled by the
@@ -1492,13 +1481,11 @@ DEFAULT_CONFIG = {
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
     },
-
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
     # cache_ttl must be "5m" or "1h" (Anthropic-supported tiers); other values are ignored.
     "prompt_caching": {
         "cache_ttl": "5m",
     },
-
     # OpenRouter-specific settings.
     # response_cache: enable OpenRouter response caching (X-OpenRouter-Cache header).
     #   When enabled, identical requests return cached responses for free (zero billing).
@@ -1519,7 +1506,6 @@ DEFAULT_CONFIG = {
         "response_cache_ttl": 300,
         "min_coding_score": 0.65,
     },
-
     # AWS Bedrock provider configuration.
     # Only used when model.provider is "bedrock".
     "bedrock": {
@@ -1539,7 +1525,6 @@ DEFAULT_CONFIG = {
             "trace": "disabled",         # "enabled", "disabled", or "enabled_full"
         },
     },
-
     # Auxiliary model config — provider:model for each side task.
     # Format: provider is the provider name, model is the model slug.
     # "auto" for provider = auto-detect best available provider.
@@ -1745,7 +1730,6 @@ DEFAULT_CONFIG = {
             "extra_body": {},
         },
     },
-    
     "display": {
         "compact": False,
         "personality": "",
@@ -1950,7 +1934,6 @@ DEFAULT_CONFIG = {
             "unicode_cols": 0,
         },
     },
-
     # Web dashboard settings
     "dashboard": {
         "theme": "default",  # Dashboard visual theme: "default", "midnight", "ember", "mono", "cyberpunk", "rose"
@@ -2052,12 +2035,10 @@ DEFAULT_CONFIG = {
         # the login flow.
         "public_url": "",
     },
-
     # Privacy settings
     "privacy": {
         "redact_pii": False,  # When True, hash user IDs and strip phone numbers from LLM context
     },
-    
     # Text-to-speech configuration
     # Each provider supports an optional `max_text_length:` override for the
     # per-request input-character cap. Omit it to use the provider's documented
@@ -2128,7 +2109,6 @@ DEFAULT_CONFIG = {
             # "base_url": "",  # override DEEPINFRA_BASE_URL for TTS only
         },
     },
-
     "stt": {
         "enabled": True,
         # When true, gateway voice messages are transcribed for the agent and
@@ -2157,7 +2137,6 @@ DEFAULT_CONFIG = {
             # "base_url": "",  # override DEEPINFRA_BASE_URL for STT only
         },
     },
-
     "voice": {
         "record_key": "ctrl+b",
         "max_recording_seconds": 120,
@@ -2166,13 +2145,11 @@ DEFAULT_CONFIG = {
         "silence_threshold": 200,     # RMS below this = silence (0-32767)
         "silence_duration": 3.0,      # Seconds of silence before auto-stop
     },
-    
     "human_delay": {
         "mode": "off",
         "min_ms": 800,
         "max_ms": 2500,
     },
-    
     # Context engine -- controls how the context window is managed when
     # approaching the model's token limit.
     # "compressor" = built-in lossy summarization (default).
@@ -2182,7 +2159,6 @@ DEFAULT_CONFIG = {
     "context": {
         "engine": "compressor",
     },
-
     # Persistent memory -- bounded curated memory injected into system prompt
     "memory": {
         "memory_enabled": True,
@@ -2208,7 +2184,6 @@ DEFAULT_CONFIG = {
         # Only ONE external provider is allowed at a time.
         "provider": "",
     },
-
     # Subagent delegation — override the provider:model used by delegate_task
     # so child agents can run on a different (cheaper/faster) provider and model.
     # Uses the same runtime provider resolution as CLI/gateway startup, so all
@@ -2219,9 +2194,9 @@ DEFAULT_CONFIG = {
         "base_url": "",    # direct OpenAI-compatible endpoint for subagents
         "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
         "api_mode": "",    # wire protocol for delegation.base_url: "chat_completions",
-                           # "codex_responses", or "anthropic_messages". Empty = auto-detect
-                           # from URL (e.g. /anthropic suffix → anthropic_messages). Set this
-                           # explicitly for non-standard endpoints the heuristic can't detect.
+        # "codex_responses", or "anthropic_messages". Empty = auto-detect
+        # from URL (e.g. /anthropic suffix → anthropic_messages). Set this
+        # explicitly for non-standard endpoints the heuristic can't detect.
         # When delegate_task narrows child toolsets explicitly, preserve any
         # MCP toolsets the parent already has enabled. On by default so
         # narrowing (e.g. toolsets=["web","browser"]) expresses "I want these
@@ -2229,7 +2204,7 @@ DEFAULT_CONFIG = {
         # Set to false for strict intersection.
         "inherit_mcp_toolsets": True,
         "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
-                               # independent of the parent's max_iterations)
+        # independent of the parent's max_iterations)
         # Subagent summaries return to the parent's context verbatim. A batch
         # fan-out (N children) returns N summaries at once, which can exceed
         # the parent's context window and trigger a compression/429 death
@@ -2245,19 +2220,18 @@ DEFAULT_CONFIG = {
         # instruction). 0 disables the hard ceiling; the dynamic headroom
         # budget still applies.
         "max_summary_chars": 24000,
-
         "child_timeout_seconds": 0,  # optional wall-clock cap per child agent. 0 (default)
-                                     # = no timeout: children fail only from real errors
-                                     # (API, tools, iteration budget), never a delegation
-                                     # stopwatch. Set a positive number of seconds
-                                     # (floor 30s) to enforce a hard cap.
+        # = no timeout: children fail only from real errors
+        # (API, tools, iteration budget), never a delegation
+        # stopwatch. Set a positive number of seconds
+        # (floor 30s) to enforce a hard cap.
         "reasoning_effort": "",  # subagent effort: "ultra", "max", "xhigh", "high",
-                                 # "medium", "low", "minimal", "none" (empty = inherit)
+        # "medium", "low", "minimal", "none" (empty = inherit)
         "max_concurrent_children": 3,  # unified concurrency cap: max parallel children per batch
-                                       # AND max concurrent background (background=true)
-                                       # delegation units. New async dispatches beyond the cap
-                                       # fall back to synchronous execution. Floor of 1, no ceiling.
-                                       # (Replaces the deprecated max_async_children.)
+        # AND max concurrent background (background=true)
+        # delegation units. New async dispatches beyond the cap
+        # fall back to synchronous execution. Floor of 1, no ceiling.
+        # (Replaces the deprecated max_async_children.)
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
         # and _get_orchestrator_enabled).  Floored at 1, no upper ceiling —
         # raise deliberately, each level multiplies API cost.
@@ -2273,12 +2247,10 @@ DEFAULT_CONFIG = {
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
     },
-
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
     # injected at the start of every API call for few-shot priming.
     # Never saved to sessions, logs, or trajectories.
     "prefill_messages_file": "",
-
     # Goals — persistent cross-turn goals (Ralph-style loop).
     # After every turn, a lightweight judge call asks the auxiliary model
     # whether the active /goal is satisfied by the assistant's last
@@ -2294,7 +2266,6 @@ DEFAULT_CONFIG = {
         # unbounded model spend on fuzzy / unachievable goals.
         "max_turns": 20,
     },
-
     # Mixture of Agents — named presets used by /moa. A preset is an execution
     # mode around the main model, not a provider/model itself: references +
     # aggregator synthesize private guidance before each main-model iteration.
@@ -2315,13 +2286,15 @@ DEFAULT_CONFIG = {
                     {"provider": "openai-codex", "model": "gpt-5.5"},
                     {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro"},
                 ],
-                "aggregator": {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
+                "aggregator": {
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-opus-4.8",
+                },
                 "max_tokens": 4096,
                 "enabled": True,
             }
         },
     },
-
     # Skills — external skill directories for sharing skills across tools/agents.
     # Each path is expanded (~, ${VAR}) and resolved.  Read-only — skill creation
     # always goes to ~/.hermes/skills/.
@@ -2365,7 +2338,6 @@ DEFAULT_CONFIG = {
         #                     /skills approve <id> or drop with /skills reject <id>.
         "write_approval": False,
     },
-
     # Curator — background skill maintenance.
     #
     # Periodically reviews AGENT-CREATED skills (never bundled or
@@ -2415,16 +2387,13 @@ DEFAULT_CONFIG = {
             "keep": 5,  # retain last N regular snapshots
         },
     },
-
     # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.
     # This section is only needed for hermes-specific overrides; everything else
     # (apiKey, workspace, peerName, sessions, enabled) comes from the global config.
     "honcho": {},
-
     # IANA timezone (e.g. "Asia/Kolkata", "America/New_York").
     # Empty string means use server-local time.
     "timezone": "",
-
     # Slack platform settings (gateway mode)
     "slack": {
         "require_mention": True,       # Require @mention to respond in channels
@@ -2432,7 +2401,6 @@ DEFAULT_CONFIG = {
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "channel_prompts": {},         # Per-channel ephemeral system prompts
     },
-
     # Discord platform settings (gateway mode)
     "discord": {
         "require_mention": True,       # Require @mention to respond in server channels
@@ -2470,10 +2438,11 @@ DEFAULT_CONFIG = {
         # message. False still caches and surfaces the file by path. Env
         # override: DISCORD_INLINE_TEXT_ATTACHMENTS.
         "inline_text_attachments": True,
-        # Maximum bytes per attachment the gateway will cache. The whole file
-        # is held in memory while being written, so unlimited uploads carry a
-        # real memory cost. Default 32 MiB matches the historical hardcoded
-        # cap. Set to 0 for no cap. Env override: DISCORD_MAX_ATTACHMENT_BYTES.
+        # Maximum bytes per Discord document attachment the gateway will cache.
+        # Images/audio/video use gateway.max_inbound_media_bytes. The whole
+        # document is held in memory while being written. Default 32 MiB matches
+        # the historical hardcoded document cap. Set to 0 for no Discord-specific
+        # document cap. Env override: DISCORD_MAX_ATTACHMENT_BYTES.
         "max_attachment_bytes": 33554432,
         # When True, Discord approval prompts mention numeric allowed users so
         # owners notice approval requests in shared channels/threads. Env
@@ -2503,7 +2472,6 @@ DEFAULT_CONFIG = {
             ],
         },
     },
-
     # WhatsApp platform settings (gateway mode)
     "whatsapp": {
         # Reply prefix prepended to every outgoing WhatsApp message.
@@ -2511,7 +2479,6 @@ DEFAULT_CONFIG = {
         # Set to "" (empty string) to disable the header entirely.
         # Supports \n for newlines, e.g. "🤖 *My Bot*\n──────\n"
     },
-
     # Telegram platform settings (gateway mode)
     "telegram": {
         "reactions": False,            # Add 👀/✅/❌ reactions to messages during processing
@@ -2522,7 +2489,6 @@ DEFAULT_CONFIG = {
             "rich_drafts": False,       # Experimental Bot API 10.1 rich draft previews during Telegram DM streaming. Default off because Telegram Desktop/macOS can visually overlay rich draft frames until the chat redraws.
         },
     },
-
     # Mattermost platform settings (gateway mode)
     "mattermost": {
         "require_mention": True,       # Require @mention to respond in channels
@@ -2530,14 +2496,12 @@ DEFAULT_CONFIG = {
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "channel_prompts": {},         # Per-channel ephemeral system prompts
     },
-
     # Matrix platform settings (gateway mode)
     "matrix": {
         "require_mention": True,       # Require @mention to respond in rooms
         "free_response_rooms": "",     # Comma-separated room IDs where bot responds without mention
         "allowed_rooms": "",           # If set, bot ONLY responds in these room IDs (whitelist)
     },
-
     # Approval mode for dangerous commands:
     #   manual — always prompt the user
     #   smart  — use auxiliary LLM to auto-approve low-risk commands (default)
@@ -2578,12 +2542,10 @@ DEFAULT_CONFIG = {
         # opt out there).
         "destructive_slash_confirm": True,
     },
-
     # Permanently allowed dangerous command patterns (added via "always" approval)
     "command_allowlist": [],
     # User-defined quick commands that bypass the agent loop (type: exec only)
     "quick_commands": {},
-
     # Per-platform system-prompt hint overrides. Lets an admin append to or
     # replace Hermes' built-in platform hint for a single messaging platform
     # (WhatsApp, Slack, Telegram, ...) without affecting other platforms.
@@ -2599,7 +2561,6 @@ DEFAULT_CONFIG = {
     #         When tabular output would be useful, invoke the
     #         table_formatting skill instead of emitting a Markdown table.
     "platform_hints": {},
-
     # Shell-script hooks — declarative bridge that invokes shell scripts
     # on plugin-hook events (pre_tool_call, post_tool_call, pre_llm_call,
     # subagent_stop, etc.).  Each entry maps an event name to a list of
@@ -2608,7 +2569,6 @@ DEFAULT_CONFIG = {
     # stored approval from ~/.hermes/shell-hooks-allowlist.json.
     # See `website/docs/user-guide/features/hooks.md` for schema + examples.
     "hooks": {},
-
     # Auto-accept shell-hook registrations without a TTY prompt.  Also
     # toggleable per-invocation via --accept-hooks or HERMES_ACCEPT_HOOKS=1.
     # Gateway / cron / non-interactive runs need this (or one of the other
@@ -2618,7 +2578,6 @@ DEFAULT_CONFIG = {
     # Supports string format: {"name": "system prompt"}
     # Or dict format: {"name": {"description": "...", "system_prompt": "...", "tone": "...", "style": "..."}}
     "personalities": {},
-
     # Pre-exec security scanning via tirith
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
@@ -2648,7 +2607,6 @@ DEFAULT_CONFIG = {
         # systems where any runtime install is unacceptable.
         "allow_lazy_installs": True,
     },
-
     "cron": {
         # Active cron SCHEDULER provider (Axis B — the trigger that decides
         # WHEN a due job fires). Empty string = the built-in in-process 60s
@@ -2717,7 +2675,6 @@ DEFAULT_CONFIG = {
         # HERMES_CRON_SESSION_DB_TIMEOUT env var. 0 = unlimited (skip the bound).
         "session_db_timeout_seconds": 10,
     },
-
     # Kanban multi-agent coordination — controls the dispatcher loop that
     # spawns workers for ready tasks. The dispatcher ticks every N seconds
     # (default 60), reclaims stale claims, promotes dependency-satisfied
@@ -2778,7 +2735,6 @@ DEFAULT_CONFIG = {
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
     },
-
     # execute_code settings — controls the tool used for programmatic tool calls.
     "code_execution": {
         # Execution mode:
@@ -2792,7 +2748,6 @@ DEFAULT_CONFIG = {
         # tool whitelist apply identically in both modes.
         "mode": "project",
     },
-
     # Tool Search (progressive disclosure for large tool surfaces).
     # When the model is connected to many MCP servers or non-core plugin
     # tools, their JSON schemas can consume a substantial fraction of the
@@ -2824,7 +2779,6 @@ DEFAULT_CONFIG = {
             "max_search_limit": 20,
         },
     },
-
     # Logging — controls file logging to ~/.hermes/logs/.
     # agent.log captures INFO+ (all agent activity); errors.log captures WARNING+.
     "logging": {
@@ -2832,7 +2786,6 @@ DEFAULT_CONFIG = {
         "max_size_mb": 5,      # Max size per log file before rotation
         "backup_count": 3,     # Number of rotated backup files to keep
     },
-
     # Remotely-hosted model catalog manifest.  When enabled, the CLI fetches
     # curated model lists for OpenRouter and Nous Portal from this URL,
     # falling back to the in-repo snapshot on network failure.  Lets us
@@ -2853,7 +2806,6 @@ DEFAULT_CONFIG = {
         #       url: https://example.com/my-curation.json
         "providers": {},
     },
-
     # Network settings — workarounds for connectivity issues.
     "network": {
         # Force IPv4 connections.  On servers with broken or unreachable IPv6,
@@ -2861,7 +2813,6 @@ DEFAULT_CONFIG = {
         # before falling back to IPv4.  Set to true to skip IPv6 entirely.
         "force_ipv4": False,
     },
-
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
@@ -2875,14 +2826,12 @@ DEFAULT_CONFIG = {
         # internal HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT env var, which still
         # works as a manual override and wins if set explicitly.
         "platform_connect_timeout": 30,
-
         # Whether the gateway keeps writing the legacy sessions.json mirror of
         # its routing index. The primary copy lives in state.db (the
         # gateway_routing table). Default True for backward compatibility with
         # external tooling and downgrade safety; set to false to stop
         # producing ~/.hermes/sessions/sessions.json entirely.
         "write_sessions_json": True,
-
         # Scale-to-zero idle detection (Phase 0). The gateway watches for idle
         # and, when an instance is opted in via the NAS "Labs" toggle (carried as
         # the HERMES_SCALE_TO_ZERO env stamp) AND messaging is relay-only/absent
@@ -2894,7 +2843,6 @@ DEFAULT_CONFIG = {
         "scale_to_zero": {
             "idle_timeout_minutes": 5,
         },
-
         # Auto-resume restart-loop breaker (#30719, defense-3). When the
         # gateway is killed mid-turn (SIGTERM) and revived by a supervisor
         # (launchd KeepAlive / systemd Restart=), it auto-resumes the
@@ -2911,7 +2859,6 @@ DEFAULT_CONFIG = {
             "max_restarts": 3,
             "window_seconds": 60,
         },
-
         # Inject a human-readable timestamp prefix (e.g.
         # "[Tue 2026-04-28 13:40:53 CEST]") onto user messages IN THE MODEL'S
         # CONTEXT so the agent has temporal awareness of when each message was
@@ -2922,7 +2869,6 @@ DEFAULT_CONFIG = {
         "message_timestamps": {
             "enabled": False,
         },
-
         # Maximum bytes for an inbound image / audio / video payload the
         # gateway will buffer into memory and cache to disk. Inbound media is
         # read fully into RAM before being written, so an unbounded upload
@@ -2932,7 +2878,6 @@ DEFAULT_CONFIG = {
         # (gateway/platforms/base.py), so the cap holds across every platform
         # adapter. ``0`` disables the cap. Default 128 MiB.
         "max_inbound_media_bytes": 134217728,
-
         # When false (default), any file path the agent emits is delivered
         # as a native attachment as long as it isn't under the credential /
         # system-path denylist (/etc, /proc, ~/.ssh, ~/.aws, ~/.hermes/.env,
@@ -2970,7 +2915,6 @@ DEFAULT_CONFIG = {
         # multi-tool agent turn. Bridged to HERMES_MEDIA_TRUST_RECENT_SECONDS.
         # Only consulted when ``strict`` is true.
         "trust_recent_files_seconds": 600,
-
         # OpenAI-compatible API server platform
         # (gateway/platforms/api_server.py).
         "api_server": {
@@ -2983,7 +2927,6 @@ DEFAULT_CONFIG = {
             "max_concurrent_runs": 10,
         },
     },
-
     # Real-time token streaming to messaging platforms (Telegram, Discord,
     # Slack, etc.). Read at the top level by the gateway; absent this block the
     # gateway falls back to these same defaults, so adding it here only makes
@@ -3022,7 +2965,6 @@ DEFAULT_CONFIG = {
         # completion time. Telegram only; other platforms ignore it.
         "fresh_final_after_seconds": 0.0,
     },
-
     # Session storage — controls automatic cleanup of ~/.hermes/state.db.
     # state.db accumulates every session, message, tool call, and FTS5 index
     # entry forever.  Without auto-pruning, a heavy user (gateway + cron)
@@ -3059,7 +3001,6 @@ DEFAULT_CONFIG = {
         # tool that consumes the JSON files directly.
         "write_json_snapshots": False,
     },
-
     # Contextual first-touch onboarding hints (see agent/onboarding.py).
     # Each hint is shown once per install and then latched here so it
     # never fires again.  Users can wipe the section to re-see all hints.
@@ -3072,7 +3013,6 @@ DEFAULT_CONFIG = {
         # The offer fires at most once (latched under onboarding.seen).
         "profile_build": "ask",
     },
-
     # ``hermes update`` behaviour.
     "updates": {
         # Run a full ``hermes backup``-style zip of HERMES_HOME before every
@@ -3113,7 +3053,6 @@ DEFAULT_CONFIG = {
         # on non-admin accounts where `/Applications` is not writable.
         "refresh_cua_driver": True,
     },
-
     # Language Server Protocol — semantic diagnostics from real
     # language servers (pyright, gopls, rust-analyzer, etc.) wired
     # into the post-write lint check used by ``write_file`` and
@@ -3130,21 +3069,18 @@ DEFAULT_CONFIG = {
         # subsystem — no servers spawn, no background event loop, no
         # cost.
         "enabled": True,
-
         # Diagnostic-wait mode for the post-write check.
         # ``"document"`` waits up to ``wait_timeout`` seconds for the
         # current file's diagnostics; ``"full"`` additionally requests
         # workspace-wide diagnostics (slower).
         "wait_mode": "document",
         "wait_timeout": 5.0,
-
         # How to handle missing server binaries.
         # ``"auto"`` — try to install via npm/go/pip into
         #              ``<HERMES_HOME>/lsp/bin/`` on first use.
         # ``"manual"`` — only use binaries already on PATH.
         # ``"off"`` — alias for ``manual``.
         "install_strategy": "auto",
-
         # Per-server overrides.  Each key is a server_id from the
         # registry (``pyright``, ``typescript``, ``gopls``,
         # ``rust-analyzer``, etc.) and accepts:
@@ -3160,8 +3096,6 @@ DEFAULT_CONFIG = {
         # setups.
         "servers": {},
     },
-
-
     # X (Twitter) Search via xAI's built-in x_search Responses tool.
     # The tool registers when xAI credentials are available (SuperGrok
     # OAuth or XAI_API_KEY) AND the x_search toolset is enabled in
@@ -3178,7 +3112,6 @@ DEFAULT_CONFIG = {
         # Each retry backs off (1.5x attempt seconds, capped at 5s).
         "retries": 2,
     },
-
     # =========================================================================
     # External secret sources
     # =========================================================================
@@ -3254,7 +3187,6 @@ DEFAULT_CONFIG = {
             "override_existing": True,
         },
     },
-
     # Paste collapse thresholds (TUI + CLI).
     #
     # paste_collapse_threshold (default 5)
@@ -3275,7 +3207,6 @@ DEFAULT_CONFIG = {
     "paste_collapse_threshold": 5,
     "paste_collapse_threshold_fallback": 5,
     "paste_collapse_char_threshold": 2000,
-
     # Computer Use (cua-driver) toolset settings.
     "computer_use": {
         # cua-driver ships with anonymous usage telemetry (PostHog) ENABLED
@@ -3286,7 +3217,6 @@ DEFAULT_CONFIG = {
         # to let cua-driver use its own default (telemetry on).
         "cua_telemetry": False,
     },
-
     # Hermes Desktop (Electron app) launch options. These only affect
     # `hermes desktop`; they do not touch the CLI/gateway.
     "desktop": {
@@ -3304,8 +3234,6 @@ DEFAULT_CONFIG = {
         # Bridged to the HERMES_DESKTOP_DISABLE_GPU env var the Electron app reads.
         "disable_gpu": "auto",
     },
-
-
     # Google Vertex AI provider (Gemini via the OpenAI-compatible endpoint).
     # Auth is OAuth2 (short-lived access tokens minted from a service-account
     # JSON or Application Default Credentials) — NOT a static API key. The
@@ -3323,7 +3251,6 @@ DEFAULT_CONFIG = {
         # (e.g. "us-central1") only if your models are pinned to a region.
         "region": "global",
     },
-
     # Config schema version - bump this when adding new required fields
     "_config_version": 33,
 }
@@ -5252,6 +5179,27 @@ _VALID_CUSTOM_PROVIDER_FIELDS = {
 # Fields that look like they should be inside custom_providers, not at root
 _CUSTOM_PROVIDER_LIKE_FIELDS = {"base_url", "api_key", "rate_limit_delay", "api_mode"}
 
+# Per-channel runtime overrides are intentionally a small, closed schema.
+# Platform-specific extension settings continue to live under ``extra`` and
+# are not validated against this set.
+CHANNEL_OVERRIDE_SUPPORTED_FIELDS = (
+    "model",
+    "provider",
+    "system_prompt",
+    "reasoning_effort",
+    "fallback_providers",
+)
+_CHANNEL_OVERRIDE_SUPPORTED_FIELD_SET = frozenset(CHANNEL_OVERRIDE_SUPPORTED_FIELDS)
+FALLBACK_PROVIDER_SUPPORTED_FIELDS = (
+    "provider",
+    "model",
+    "base_url",
+    "api_key",
+    "key_env",
+    "api_key_env",
+)
+_FALLBACK_PROVIDER_SUPPORTED_FIELD_SET = frozenset(FALLBACK_PROVIDER_SUPPORTED_FIELDS)
+
 
 @dataclass
 class ConfigIssue:
@@ -5260,6 +5208,255 @@ class ConfigIssue:
     severity: str  # "error", "warning"
     message: str
     hint: str
+
+
+def _validate_fallback_provider_entry(
+    entry: Any,
+    entry_path: str,
+    issues: List["ConfigIssue"],
+) -> None:
+    """Validate one runtime-supported fallback provider mapping."""
+    if not isinstance(entry, dict):
+        issues.append(
+            ConfigIssue(
+                "error",
+                f"{entry_path} should be a dict, got {type(entry).__name__}",
+                "Each fallback entry needs provider and model fields.",
+            )
+        )
+        return
+
+    for field_name in entry:
+        if field_name in _FALLBACK_PROVIDER_SUPPORTED_FIELD_SET:
+            continue
+        issues.append(
+            ConfigIssue(
+                "error",
+                f"{entry_path}.{field_name} is an unknown fallback provider field",
+                "Supported fields: " + ", ".join(FALLBACK_PROVIDER_SUPPORTED_FIELDS),
+            )
+        )
+
+    for required in ("provider", "model"):
+        field_path = f"{entry_path}.{required}"
+        value = entry.get(required)
+        if value is None or value == "":
+            issues.append(
+                ConfigIssue(
+                    "error",
+                    f"{field_path}: {entry_path} is missing '{required}' field",
+                    f"Add a non-empty string for {required}.",
+                )
+            )
+        elif not isinstance(value, str):
+            issues.append(
+                ConfigIssue(
+                    "error",
+                    f"{field_path} must be a string, got {type(value).__name__}",
+                    f"Quote the {required} value in YAML.",
+                )
+            )
+        elif not value.strip():
+            issues.append(
+                ConfigIssue(
+                    "error",
+                    f"{field_path} must not be blank",
+                    f"Set {required} to a usable value.",
+                )
+            )
+
+    for field_name in sorted(
+        _FALLBACK_PROVIDER_SUPPORTED_FIELD_SET - {"provider", "model"}
+    ):
+        if field_name not in entry or entry[field_name] is None:
+            continue
+        if not isinstance(entry[field_name], str):
+            issues.append(
+                ConfigIssue(
+                    "error",
+                    f"{entry_path}.{field_name} must be a string, got "
+                    f"{type(entry[field_name]).__name__}",
+                    f"Quote the {field_name} value in YAML.",
+                )
+            )
+
+
+def _validate_fallback_provider_list(
+    raw: Any,
+    path: str,
+    issues: List["ConfigIssue"],
+) -> None:
+    """Validate the canonical plural fallback-provider list shape."""
+    if not isinstance(raw, list):
+        issues.append(
+            ConfigIssue(
+                "error",
+                f"{path} must be a YAML list, got {type(raw).__name__}",
+                "Use a list of entries with provider and model fields; use [] to disable fallback.",
+            )
+        )
+        return
+
+    for index, entry in enumerate(raw):
+        _validate_fallback_provider_entry(entry, f"{path}[{index}]", issues)
+
+
+def _iter_channel_override_sections(config: Dict[str, Any]):
+    """Yield ``(platform_name, path, value)`` without inspecting ``extra``."""
+    platforms = config.get("platforms")
+    if isinstance(platforms, dict):
+        for platform_name, platform_cfg in platforms.items():
+            if isinstance(platform_cfg, dict) and "channel_overrides" in platform_cfg:
+                yield (
+                    str(platform_name),
+                    f"platforms.{platform_name}.channel_overrides",
+                    platform_cfg.get("channel_overrides"),
+                )
+
+    gateway_cfg = config.get("gateway")
+    gateway_platforms = (
+        gateway_cfg.get("platforms") if isinstance(gateway_cfg, dict) else None
+    )
+    if isinstance(gateway_platforms, dict):
+        for platform_name, platform_cfg in gateway_platforms.items():
+            if isinstance(platform_cfg, dict) and "channel_overrides" in platform_cfg:
+                yield (
+                    str(platform_name),
+                    f"gateway.platforms.{platform_name}.channel_overrides",
+                    platform_cfg.get("channel_overrides"),
+                )
+
+    # The user-facing messaging config also accepts top-level platform blocks,
+    # for example ``discord.channel_overrides``. Only inspect mappings that
+    # explicitly contain this field; all sibling/plugin-owned keys remain free.
+    for platform_name, platform_cfg in config.items():
+        if platform_name in {"platforms", "gateway"}:
+            continue
+        if isinstance(platform_cfg, dict) and "channel_overrides" in platform_cfg:
+            yield (
+                str(platform_name),
+                f"{platform_name}.channel_overrides",
+                platform_cfg.get("channel_overrides"),
+            )
+
+
+def _validate_channel_override_sections(
+    config: Dict[str, Any], issues: List["ConfigIssue"]
+) -> None:
+    from hermes_constants import parse_reasoning_effort
+
+    try:
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+        from gateway.config import Platform
+        from gateway.platform_registry import platform_registry
+
+        known_platforms = {platform.value for platform in Platform}
+        known_platforms.update(entry.name for entry in platform_registry.all_entries())
+    except Exception:
+        known_platforms = set()
+
+    for platform_name, section_path, raw_overrides in _iter_channel_override_sections(
+        config
+    ):
+        if known_platforms and platform_name not in known_platforms:
+            issues.append(
+                ConfigIssue(
+                    "error",
+                    f"{section_path} belongs to unknown platform '{platform_name}'",
+                    "Fix the platform name or install/register its platform plugin.",
+                )
+            )
+            continue
+        if not isinstance(raw_overrides, dict):
+            issues.append(
+                ConfigIssue(
+                    "error",
+                    f"{section_path} must be a mapping, got {type(raw_overrides).__name__}",
+                    "Map each Discord channel or thread ID to an override mapping.",
+                )
+            )
+            continue
+
+        for channel_id, override in raw_overrides.items():
+            override_path = f"{section_path}.{channel_id}"
+            if not isinstance(override, dict):
+                issues.append(
+                    ConfigIssue(
+                        "error",
+                        f"{override_path} must be a mapping, got {type(override).__name__}",
+                        "Set supported fields under this channel or thread ID.",
+                    )
+                )
+                continue
+
+            for field_name in override:
+                if field_name in _CHANNEL_OVERRIDE_SUPPORTED_FIELD_SET:
+                    continue
+                issues.append(
+                    ConfigIssue(
+                        "error",
+                        f"{override_path}.{field_name} is an unknown channel override field",
+                        "Supported fields: "
+                        + ", ".join(CHANNEL_OVERRIDE_SUPPORTED_FIELDS),
+                    )
+                )
+
+            for field_name in ("model", "provider", "system_prompt"):
+                if field_name not in override or override[field_name] is None:
+                    continue
+                if not isinstance(override[field_name], str):
+                    issues.append(
+                        ConfigIssue(
+                            "error",
+                            f"{override_path}.{field_name} must be a string, got "
+                            f"{type(override[field_name]).__name__}",
+                            f"Quote the {field_name} value in YAML.",
+                        )
+                    )
+                elif (
+                    field_name in {"model", "provider"}
+                    and not override[field_name].strip()
+                ):
+                    issues.append(
+                        ConfigIssue(
+                            "error",
+                            f"{override_path}.{field_name} must not be blank",
+                            f"Set {field_name} to a usable value or omit the field to inherit.",
+                        )
+                    )
+
+            if (
+                "reasoning_effort" in override
+                and override["reasoning_effort"] is not None
+            ):
+                reasoning = override["reasoning_effort"]
+                reasoning_path = f"{override_path}.reasoning_effort"
+                if reasoning is True or not isinstance(reasoning, (str, bool)):
+                    issues.append(
+                        ConfigIssue(
+                            "error",
+                            f"{reasoning_path} must be an effort string or false, got "
+                            f"{type(reasoning).__name__}",
+                            "Use minimal, low, medium, high, xhigh, max, ultra, none, or false.",
+                        )
+                    )
+                elif parse_reasoning_effort(reasoning) is None:
+                    issues.append(
+                        ConfigIssue(
+                            "error",
+                            f"{reasoning_path} has an unknown value",
+                            "Use minimal, low, medium, high, xhigh, max, ultra, none, or false.",
+                        )
+                    )
+
+            if "fallback_providers" in override:
+                _validate_fallback_provider_list(
+                    override["fallback_providers"],
+                    f"{override_path}.fallback_providers",
+                    issues,
+                )
 
 
 def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["ConfigIssue"]:
@@ -5277,6 +5474,8 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             return [ConfigIssue("error", "Could not load config.yaml", "Run 'hermes setup' to create a valid config")]
 
     issues: List[ConfigIssue] = []
+
+    _validate_channel_override_sections(config, issues)
 
     # ── custom_providers must be a list, not a dict ──────────────────────
     cp = config.get("custom_providers")
@@ -5323,53 +5522,32 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                         "Add the API endpoint URL, e.g.: base_url: https://api.example.com/v1",
                     ))
 
-    # ── fallback_model: single dict OR list of dicts (chain) ─────────────
+    # ── Fallback routes: one closed schema shared by global and channel config ──
+    if "fallback_providers" in config:
+        _validate_fallback_provider_list(
+            config.get("fallback_providers"), "fallback_providers", issues
+        )
+
+    # Legacy fallback_model accepts one mapping or a list, but each entry has
+    # the same runtime-supported fields as fallback_providers.
     fb = config.get("fallback_model")
     if fb is not None:
         if isinstance(fb, list):
-            # Chain fallback — validate each entry
-            for i, entry in enumerate(fb):
-                if not isinstance(entry, dict):
-                    issues.append(ConfigIssue(
-                        "error",
-                        f"fallback_model[{i}] should be a dict, got {type(entry).__name__}",
-                        "Each entry needs provider + model",
-                    ))
-                else:
-                    if not entry.get("provider"):
-                        issues.append(ConfigIssue(
-                            "warning",
-                            f"fallback_model[{i}] is missing 'provider' field",
-                            "Add: provider: openrouter (or another provider)",
-                        ))
-                    if not entry.get("model"):
-                        issues.append(ConfigIssue(
-                            "warning",
-                            f"fallback_model[{i}] is missing 'model' field",
-                            "Add: model: <model-name>",
-                        ))
-        elif not isinstance(fb, dict):
-            issues.append(ConfigIssue(
-                "error",
-                f"fallback_model should be a dict with 'provider' and 'model', got {type(fb).__name__}",
-                "Change to:\n"
-                "  fallback_model:\n"
-                "    provider: openrouter\n"
-                "    model: anthropic/claude-sonnet-4",
-            ))
-        elif fb:
-            if not fb.get("provider"):
-                issues.append(ConfigIssue(
-                    "warning",
-                    "fallback_model is missing 'provider' field — fallback will be disabled",
-                    "Add: provider: openrouter (or another provider)",
-                ))
-            if not fb.get("model"):
-                issues.append(ConfigIssue(
-                    "warning",
-                    "fallback_model is missing 'model' field — fallback will be disabled",
-                    "Add: model: anthropic/claude-sonnet-4 (or another model)",
-                ))
+            for index, entry in enumerate(fb):
+                _validate_fallback_provider_entry(
+                    entry, f"fallback_model[{index}]", issues
+                )
+        elif isinstance(fb, dict):
+            if fb:  # {} remains the legacy disabled value.
+                _validate_fallback_provider_entry(fb, "fallback_model", issues)
+        else:
+            issues.append(
+                ConfigIssue(
+                    "error",
+                    f"fallback_model should be a dict or list, got {type(fb).__name__}",
+                    "Use one provider/model mapping, a list of mappings, or {} to disable it.",
+                )
+            )
 
     # ── Check for fallback_model accidentally nested inside custom_providers ──
     if isinstance(cp, dict) and "fallback_model" not in config and "fallback_model" in (cp or {}):
@@ -8362,9 +8540,25 @@ def config_command(args):
             print()
             print(color(f"  {len(missing_config)} new config option(s) available", Colors.YELLOW))
             print("    Run 'hermes config migrate' to add them")
-        
+
+        structure_issues = validate_config_structure()
+        if structure_issues:
+            print()
+            print(color("  Config structure issues:", Colors.BOLD))
+            for issue in structure_issues:
+                marker = "✗" if issue.severity == "error" else "⚠"
+                marker_color = (
+                    Colors.RED if issue.severity == "error" else Colors.YELLOW
+                )
+                print(color(f"    {marker} {issue.message}", marker_color))
+                if issue.hint:
+                    for hint_line in issue.hint.splitlines():
+                        print(color(f"      {hint_line}", Colors.DIM))
+
         print()
-    
+        if any(issue.severity == "error" for issue in structure_issues):
+            sys.exit(1)
+
     else:
         print(f"Unknown config command: {subcmd}")
         print()

@@ -779,7 +779,7 @@ async def test_skill_handler_rejects_before_dispatch_for_unauthorized(
     # Patch _run_simple_slash so we can detect any leak through it.
     dispatched: list = []
 
-    async def fake_dispatch(_interaction, text):
+    async def fake_dispatch(_interaction, text, **_kwargs):
         dispatched.append(text)
 
     adapter._run_simple_slash = fake_dispatch  # type: ignore[assignment]
@@ -838,7 +838,7 @@ async def test_skill_handler_dispatches_for_authorized(
 
     dispatched: list = []
 
-    async def fake_dispatch(_interaction, text):
+    async def fake_dispatch(_interaction, text, **_kwargs):
         dispatched.append(text)
 
     adapter._run_simple_slash = fake_dispatch  # type: ignore[assignment]
