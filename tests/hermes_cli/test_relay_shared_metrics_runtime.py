@@ -2600,3 +2600,4 @@ def test_skill_lifecycle_does_not_fallback_across_an_explicit_session(
         for event in direct_runtime.events
         if event[0] == "scope.event" and event[1] == "hermes.skill.lifecycle"
     ] == []
+
