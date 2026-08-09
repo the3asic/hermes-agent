@@ -1913,7 +1913,9 @@ DEFAULT_CONFIG = {
         "thread_require_mention": False,  # If True, require @mention in threads too (multi-bot threads)
         "bots_require_inline_mention": False,  # Multi-bot rooms: if True, another bot must type @thisbot in its message to trigger a reply; a Discord reply/quote alone won't. Prevents two bots auto-replying to each other forever. Does not affect humans.
         "history_backfill": True,         # If True, prepend recent channel scrollback when bot is triggered (recovers messages missed while require_mention gated them out)
+        "history_backfill_free_response": False,  # Opt-in: include the previous visible exchange for configured free-response channels
         "history_backfill_limit": 50,     # Max number of recent messages to scan when assembling the backfill block
+        "inline_text_attachments": True,  # If False, cache text attachments by path without copying their bytes into the user turn
         "missed_message_backfill": {
             "enabled": False,             # Replay missed Discord messages after reconnect/startup
             "channels": "",               # Comma-separated channel IDs; empty uses free_response_channels

@@ -6147,6 +6147,23 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_ALLOW_ANY_ATTACHMENT", "false").lower() in {"true", "1", "yes", "on"}
 
+    def _discord_inline_text_attachments(self) -> bool:
+        """Return whether small text documents are copied into the user turn.
+
+        The file is cached and surfaced by path either way. Disabling inline
+        text avoids duplicating large or credential-bearing text in the model
+        transcript while preserving tool access to the attachment.
+        """
+        env_value = os.getenv("DISCORD_INLINE_TEXT_ATTACHMENTS")
+        if env_value is not None:
+            return env_value.lower() not in {"false", "0", "no", "off", ""}
+        configured = self.config.extra.get("inline_text_attachments")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in {"false", "0", "no", "off", ""}
+            return bool(configured)
+        return True
+
     def _discord_max_attachment_bytes(self) -> int:
         """Return the per-attachment byte cap. 0 means unlimited.
 
@@ -6437,6 +6454,22 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_HISTORY_BACKFILL", "true").lower() in {"true", "1", "yes"}
 
+    def _discord_history_backfill_free_response(self) -> bool:
+        """Return whether configured free-response channels include scrollback.
+
+        Voice-linked free-response is transient and intentionally excluded;
+        this setting applies only to channels named in free_response_channels.
+        """
+        env_value = os.getenv("DISCORD_HISTORY_BACKFILL_FREE_RESPONSE")
+        if env_value is not None:
+            return env_value.lower() in {"true", "1", "yes", "on"}
+        configured = self.config.extra.get("history_backfill_free_response")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in {"false", "0", "no", "off", ""}
+            return bool(configured)
+        return False
+
     def _discord_history_backfill_limit(self) -> int:
         """Return the max number of messages to scan backwards for context.
 
@@ -6462,6 +6495,7 @@ class DiscordAdapter(BasePlatformAdapter):
         channel: Any,
         before: "DiscordMessage",
         reply_target: Optional[Any] = None,
+        include_self_boundary: bool = False,
     ) -> str:
         """Fetch recent channel messages for conversational context.
 
@@ -6503,7 +6537,11 @@ class DiscordAdapter(BasePlatformAdapter):
         _cached_id = self._last_self_message_id.get(channel_id)
         _after_obj = None
         try:
-            if _cached_id and int(_cached_id) < int(before.id):
+            if (
+                _cached_id
+                and not include_self_boundary
+                and int(_cached_id) < int(before.id)
+            ):
                 _after_obj = discord.Object(id=int(_cached_id))
         except (ValueError, TypeError):
             pass  # Malformed cache entry — fall back to cold-start scan
@@ -6571,6 +6609,8 @@ class DiscordAdapter(BasePlatformAdapter):
             # ── Primary window: recent channel activity since the last bot turn ──
             collected: List[Tuple[str, str]] = []  # (message_id, line)
             seen_ids: set = set()
+            included_self_boundary = False
+            seen_nonself_after_boundary = False
             # IMPORTANT: pass oldest_first=False explicitly.  discord.py 2.x
             # silently flips the default to True when `after=` is supplied,
             # which would select the *earliest* N messages after our last
@@ -6600,7 +6640,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 # session transcript.  (Redundant when _after_obj is set, but
                 # needed for cold start.)
                 if msg.author == self._client.user:
-                    break
+                    if not include_self_boundary:
+                        break
+                    if included_self_boundary and seen_nonself_after_boundary:
+                        break
+                    line = _keep(msg)
+                    if line is not None:
+                        mid = str(getattr(msg, "id", ""))
+                        collected.append((mid, line))
+                        if mid:
+                            seen_ids.add(mid)
+                    included_self_boundary = True
+                    continue
+                if included_self_boundary:
+                    seen_nonself_after_boundary = True
                 line = _keep(msg)
                 if line is None:
                     continue
@@ -7717,11 +7770,11 @@ class DiscordAdapter(BasePlatformAdapter):
             voice_linked_ids = {str(ch_id) for ch_id in self._voice_text_channels.values()}
             current_channel_id = str(message.channel.id)
             is_voice_linked_channel = current_channel_id in voice_linked_ids
-            is_free_channel = (
+            is_configured_free_response_channel = (
                 "*" in free_channels
                 or bool(channel_keys & free_channels)
-                or is_voice_linked_channel
             )
+            is_free_channel = is_configured_free_response_channel or is_voice_linked_channel
 
             # Skip the mention check if the message is in a thread where
             # the bot has previously participated (auto-created or replied in)
@@ -7959,7 +8012,11 @@ class DiscordAdapter(BasePlatformAdapter):
                             ext in _TEXT_INJECT_EXTENSIONS
                             or (content_type or "").startswith("text/")
                         )
-                        if _is_text and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                        if (
+                            self._discord_inline_text_attachments()
+                            and _is_text
+                            and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES
+                        ):
                             try:
                                 text_content = raw_bytes.decode("utf-8")
                                 display_name = att.filename or f"document{ext or '.txt'}"
@@ -8053,9 +8110,24 @@ class DiscordAdapter(BasePlatformAdapter):
                         with suppress(ValueError, TypeError):
                             _reply_target = _Snowflake(int(_ref_mid))
 
-            if (_has_mention_gap or is_thread or _is_reply) and auto_threaded_channel is None:
+            _is_free_response_trigger = (
+                is_configured_free_response_channel
+                and msg_type != MessageType.COMMAND
+                and self._discord_history_backfill_free_response()
+            )
+            _existing_backfill_trigger = _has_mention_gap or is_thread or _is_reply
+
+            if (
+                _existing_backfill_trigger or _is_free_response_trigger
+            ) and auto_threaded_channel is None:
                 _backfill_text = await self._fetch_channel_context(
-                    message.channel, before=message, reply_target=_reply_target,
+                    message.channel,
+                    before=message,
+                    reply_target=_reply_target,
+                    include_self_boundary=(
+                        _is_free_response_trigger
+                        and not _existing_backfill_trigger
+                    ),
                 )
                 if _backfill_text:
                     _channel_context = _backfill_text
@@ -10024,11 +10096,19 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     # history_backfill: recover missed channel messages for shared sessions
     # when require_mention is active.  Fetches messages between bot turns
     # and prepends them to the user message for context.
-    if "history_backfill" in discord_cfg and not os.getenv("DISCORD_HISTORY_BACKFILL"):
-        os.environ["DISCORD_HISTORY_BACKFILL"] = str(discord_cfg["history_backfill"]).lower()
-    hbl = discord_cfg.get("history_backfill_limit")
-    if hbl is not None and not os.getenv("DISCORD_HISTORY_BACKFILL_LIMIT"):
-        os.environ["DISCORD_HISTORY_BACKFILL_LIMIT"] = str(hbl)
+    for config_key, env_key in (
+        ("history_backfill", "DISCORD_HISTORY_BACKFILL"),
+        ("history_backfill_free_response", "DISCORD_HISTORY_BACKFILL_FREE_RESPONSE"),
+        ("history_backfill_limit", "DISCORD_HISTORY_BACKFILL_LIMIT"),
+        ("inline_text_attachments", "DISCORD_INLINE_TEXT_ATTACHMENTS"),
+        ("max_attachment_bytes", "DISCORD_MAX_ATTACHMENT_BYTES"),
+    ):
+        value = discord_cfg.get(config_key, platform_extra_cfg.get(config_key))
+        if value is None:
+            continue
+        seeded_extra[config_key] = value
+        if not _skip_env_bridge and not os.getenv(env_key):
+            os.environ[env_key] = str(value).lower()
     # allow_mentions: granular control over what the bot can ping.
     # Safe defaults (no @everyone/roles) are applied in the adapter;
     # these YAML keys only override when set and let users opt back

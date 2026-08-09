@@ -350,4 +350,25 @@ class TestAllowAnyAttachment:
         event = adapter.handle_message.call_args[0][0]
         assert len(event.media_urls) == 1
 
+    @pytest.mark.asyncio
+    async def test_inline_text_attachments_can_be_disabled(self, adapter):
+        """Disabled inline mode still caches the file but keeps bytes out of text."""
+        adapter.config.extra["inline_text_attachments"] = False
+        file_content = b"credential-shaped text that must stay path-only"
 
+        with _mock_aiohttp_download(file_content):
+            msg = make_message(
+                attachments=[
+                    make_attachment(
+                        filename="secret.txt",
+                        content_type="text/plain",
+                    )
+                ],
+                content="inspect this",
+            )
+            await adapter._handle_message(msg)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert len(event.media_urls) == 1
+        assert event.text == "inspect this"
+        assert "credential-shaped" not in event.text
