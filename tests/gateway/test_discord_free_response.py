@@ -114,6 +114,7 @@ def adapter(monkeypatch):
         "DISCORD_ALLOWED_CHANNELS",
         "DISCORD_IGNORED_CHANNELS",
         "DISCORD_HISTORY_BACKFILL",
+        "DISCORD_HISTORY_BACKFILL_FREE_RESPONSE",
         "DISCORD_HISTORY_BACKFILL_LIMIT",
         "DISCORD_ALLOW_BOTS",
     ):
@@ -1323,6 +1324,10 @@ async def test_discord_shared_channel_backfill_prepends_context(adapter, monkeyp
     await adapter._handle_message(message)
 
     adapter._fetch_channel_context.assert_awaited_once()
+    assert (
+        adapter._fetch_channel_context.await_args.kwargs["include_self_boundary"]
+        is False
+    )
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "hello with mention"
     assert event.channel_context == "[Recent channel messages]\n[Alice] context"
@@ -1349,6 +1354,10 @@ async def test_discord_per_user_channel_backfills_too(adapter, monkeypatch):
     await adapter._handle_message(message)
 
     adapter._fetch_channel_context.assert_awaited_once()
+    assert (
+        adapter._fetch_channel_context.await_args.kwargs["include_self_boundary"]
+        is False
+    )
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "hello with mention"
     assert event.channel_context == "[Recent channel messages]\n[Alice] context"
@@ -1358,7 +1367,8 @@ async def test_discord_per_user_channel_backfills_too(adapter, monkeypatch):
 async def test_discord_participated_thread_backfills_without_mention(adapter, monkeypatch):
     """Known threads still need recent thread context when mention gating is bypassed."""
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
-    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "456")
+    monkeypatch.setenv("DISCORD_HISTORY_BACKFILL_FREE_RESPONSE", "true")
     monkeypatch.delenv("DISCORD_THREAD_REQUIRE_MENTION", raising=False)
     adapter.config.extra["history_backfill"] = True
     adapter._fetch_channel_context = AsyncMock(return_value="[Recent channel messages]\n[Alice] thread context")
@@ -1370,6 +1380,10 @@ async def test_discord_participated_thread_backfills_without_mention(adapter, mo
     await adapter._handle_message(message)
 
     adapter._fetch_channel_context.assert_awaited_once()
+    assert (
+        adapter._fetch_channel_context.await_args.kwargs["include_self_boundary"]
+        is False
+    )
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "follow-up without mention"
     assert event.channel_context == "[Recent channel messages]\n[Alice] thread context"
@@ -1441,7 +1455,8 @@ async def test_discord_reply_in_free_channel_triggers_backfill(adapter, monkeypa
     as the anchor.
     """
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")  # free-response
-    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "321")
+    monkeypatch.setenv("DISCORD_HISTORY_BACKFILL_FREE_RESPONSE", "true")
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
     adapter.config.extra["history_backfill"] = True
     adapter._fetch_channel_context = AsyncMock(
@@ -1458,6 +1473,7 @@ async def test_discord_reply_in_free_channel_triggers_backfill(adapter, monkeypa
     # The reply target is passed as the anchor, carrying the referenced id.
     call = adapter._fetch_channel_context.await_args
     assert getattr(call.kwargs.get("reply_target"), "id", None) == 42
+    assert call.kwargs["include_self_boundary"] is False
 
     event = adapter.handle_message.await_args.args[0]
     assert event.channel_context == (
@@ -1467,14 +1483,13 @@ async def test_discord_reply_in_free_channel_triggers_backfill(adapter, monkeypa
 
 @pytest.mark.asyncio
 async def test_discord_non_reply_free_channel_skips_backfill(adapter, monkeypatch):
-    """A plain (non-reply) message in a free-response channel still skips backfill.
+    """A configured free-response channel still skips backfill by default.
 
-    Guards against the reply gate accidentally widening to every free-channel
-    message — only replies (and the existing mention-gap / thread cases) should
-    hydrate context.
+    This preserves behavior unless history_backfill_free_response is explicitly
+    enabled.
     """
-    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
-    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "321")
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
     adapter.config.extra["history_backfill"] = True
     adapter._fetch_channel_context = AsyncMock(return_value="[Recent channel messages]\n[Alice] noise")
@@ -1486,3 +1501,166 @@ async def test_discord_non_reply_free_channel_skips_backfill(adapter, monkeypatc
 
     adapter._fetch_channel_context.assert_not_awaited()
 
+
+def test_discord_history_backfill_free_response_defaults_false(adapter):
+    """Configured free-response channels keep the historical default."""
+    assert adapter._discord_history_backfill_free_response() is False
+
+
+def test_discord_history_backfill_free_response_env_overrides_extra(
+    adapter, monkeypatch
+):
+    """Explicit env values win over YAML-compatible platform extras."""
+    adapter.config.extra["history_backfill_free_response"] = True
+    monkeypatch.setenv("DISCORD_HISTORY_BACKFILL_FREE_RESPONSE", "false")
+
+    assert adapter._discord_history_backfill_free_response() is False
+
+
+@pytest.mark.asyncio
+async def test_discord_free_response_can_opt_into_history_backfill_from_yaml(
+    adapter, monkeypatch, tmp_path
+):
+    """Raw top-level YAML hydrates scrollback in configured free-response channels."""
+    import yaml
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "discord": {
+                    "require_mention": True,
+                    "free_response_channels": ["789"],
+                    "auto_thread": False,
+                    "history_backfill": True,
+                    "history_backfill_free_response": True,
+                    "history_backfill_limit": 10,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    from gateway.config import load_gateway_config
+
+    load_gateway_config()
+
+    human = SimpleNamespace(id=56, display_name="Alice", name="Alice", bot=False)
+    channel = FakeHistoryChannel(
+        [make_history_message(author=human, content="previous draft", msg_id=100)],
+        channel_id=789,
+    )
+    message = make_message(channel=channel, content="continue it")
+    message.id = 123
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.channel_context == (
+        "[Recent channel messages]\n"
+        "[Alice] previous draft"
+    )
+    assert event.text == "continue it"
+
+
+@pytest.mark.asyncio
+async def test_discord_free_response_backfill_includes_previous_self_turn(
+    adapter, monkeypatch
+):
+    """Opt-in recovery includes one recent user/assistant exchange."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "789")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.setenv("DISCORD_HISTORY_BACKFILL_FREE_RESPONSE", "true")
+    adapter.config.extra["history_backfill_limit"] = 10
+    adapter._client.user = SimpleNamespace(
+        id=999,
+        display_name="Hermes",
+        name="Hermes",
+        bot=True,
+    )
+
+    human = SimpleNamespace(id=56, display_name="Alice", name="Alice", bot=False)
+    channel = FakeHistoryChannel(
+        [
+            make_history_message(author=human, content="older unrelated", msg_id=97),
+            make_history_message(
+                author=adapter._client.user,
+                content="older assistant turn",
+                msg_id=98,
+            ),
+            make_history_message(author=human, content="prepare a draft", msg_id=100),
+            make_history_message(
+                author=adapter._client.user,
+                content="draft answer part 1",
+                msg_id=101,
+            ),
+            make_history_message(
+                author=adapter._client.user,
+                content="draft answer part 2",
+                msg_id=102,
+            ),
+        ],
+        channel_id=789,
+    )
+    adapter._last_self_message_id["789"] = "102"
+
+    message = make_message(channel=channel, content="continue the draft")
+    message.id = 123
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.channel_context == (
+        "[Recent channel messages]\n"
+        "[Alice] prepare a draft\n"
+        "[Hermes [bot]] draft answer part 1\n"
+        "[Hermes [bot]] draft answer part 2"
+    )
+    assert "older assistant turn" not in event.channel_context
+    assert "older unrelated" not in event.channel_context
+
+
+@pytest.mark.asyncio
+async def test_discord_free_response_history_backfill_skips_commands(
+    adapter, monkeypatch
+):
+    """The opt-in flag does not hydrate plain-channel command messages."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "789")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.setenv("DISCORD_HISTORY_BACKFILL_FREE_RESPONSE", "true")
+    adapter._fetch_channel_context = AsyncMock(return_value="unexpected context")
+
+    message = make_message(channel=FakeTextChannel(channel_id=789), content="/status")
+    await adapter._handle_message(message)
+
+    adapter._fetch_channel_context.assert_not_awaited()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_type == discord_platform.MessageType.COMMAND
+    assert event.channel_context is None
+
+
+@pytest.mark.asyncio
+async def test_discord_voice_linked_channel_does_not_enable_history_backfill(
+    adapter, monkeypatch
+):
+    """Transient voice-linked free-response does not hydrate scrollback."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.setenv("DISCORD_HISTORY_BACKFILL_FREE_RESPONSE", "true")
+    adapter._voice_text_channels[1234] = 789
+    adapter._fetch_channel_context = AsyncMock(return_value="unexpected context")
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=789),
+        content="voice-linked follow-up",
+    )
+    await adapter._handle_message(message)
+
+    adapter._fetch_channel_context.assert_not_awaited()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.channel_context is None

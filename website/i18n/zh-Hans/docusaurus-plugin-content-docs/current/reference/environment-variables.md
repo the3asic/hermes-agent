@@ -259,7 +259,11 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 | `DISCORD_REQUIRE_MENTION` | 在服务器频道中响应前要求 @mention |
 | `DISCORD_FREE_RESPONSE_CHANNELS` | 不需要 mention 的逗号分隔频道 ID |
 | `DISCORD_AUTO_THREAD` | 支持时自动将长回复转为线程 |
-| `DISCORD_ALLOW_ANY_ATTACHMENT` | 设为 `true` 时接受任意文件类型的附件（不仅限于内置的 PDF/文本/zip/office 白名单）。未知类型被缓存并以本地路径形式提供给 agent，供其通过 `terminal`/`read_file`/`ffprobe` 检查。默认 `false`。 |
+| `DISCORD_HISTORY_BACKFILL` | 启用 Discord 频道、线程和回复的历史回填。默认 `true`。 |
+| `DISCORD_HISTORY_BACKFILL_FREE_RESPONSE` | 让明确配置的自由响应频道消息也补充最近一轮对话。默认 `false`；命令和临时语音关联频道不使用。 |
+| `DISCORD_HISTORY_BACKFILL_LIMIT` | Discord 历史回填最多扫描的消息数。默认 `50`。 |
+| `DISCORD_ALLOW_ANY_ATTACHMENT` | 兼容用空开关。已授权发送者上传的所有文件类型始终会被接受；该值会被忽略。 |
+| `DISCORD_INLINE_TEXT_ATTACHMENTS` | 把小型 UTF-8 文本类附件内联进模型可见消息。默认 `true`；设为 `false` 后只提供缓存路径。 |
 | `DISCORD_MAX_ATTACHMENT_BYTES` | gateway 缓存的每个附件最大字节数。默认 `33554432`（32 MiB）。设为 `0` 表示无上限（附件在写入时保存在内存中）。 |
 | `DISCORD_REACTIONS` | 处理期间在消息上启用 emoji 反应（默认：`true`） |
 | `DISCORD_IGNORED_CHANNELS` | bot 永不响应的逗号分隔频道 ID |

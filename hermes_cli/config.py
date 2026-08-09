@@ -2442,6 +2442,7 @@ DEFAULT_CONFIG = {
         "thread_require_mention": False,  # If True, require @mention in threads too (multi-bot threads)
         "bots_require_inline_mention": False,  # Multi-bot rooms: if True, another bot must type @thisbot in its message to trigger a reply; a Discord reply/quote alone won't. Prevents two bots auto-replying to each other forever. Does not affect humans.
         "history_backfill": True,         # If True, prepend recent channel scrollback when bot is triggered (recovers messages missed while require_mention gated them out)
+        "history_backfill_free_response": False,  # Opt-in scrollback for configured free-response channels; voice-linked free-response stays excluded
         "history_backfill_limit": 50,     # Max number of recent messages to scan when assembling the backfill block
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
         "channel_prompts": {},         # Per-channel ephemeral system prompts (forum parents apply to child threads)
@@ -2462,9 +2463,13 @@ DEFAULT_CONFIG = {
         # DEPRECATED / no-op. Any uploaded file is now always cached and
         # surfaced to the agent regardless of file type — authorization to
         # message the agent is the gate, not the extension. Kept so existing
-        # configs that set it do not error. Env override:
-        # DISCORD_ALLOW_ANY_ATTACHMENT.
+        # configs that set it do not error. DISCORD_ALLOW_ANY_ATTACHMENT is
+        # the same compatibility no-op.
         "allow_any_attachment": False,
+        # Inline small UTF-8 text-like attachments into the model-visible
+        # message. False still caches and surfaces the file by path. Env
+        # override: DISCORD_INLINE_TEXT_ATTACHMENTS.
+        "inline_text_attachments": True,
         # Maximum bytes per attachment the gateway will cache. The whole file
         # is held in memory while being written, so unlimited uploads carry a
         # real memory cost. Default 32 MiB matches the historical hardcoded

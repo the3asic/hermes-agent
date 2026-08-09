@@ -1,8 +1,9 @@
 """Tests for native Discord slash command fast-paths (thread creation & auto-thread)."""
 
+import os
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
-import sys
 
 import pytest
 
@@ -942,6 +943,58 @@ def test_discord_auto_thread_config_bridge(monkeypatch, tmp_path):
 
     import os
     assert os.getenv("DISCORD_AUTO_THREAD") == "true"
+
+
+def test_discord_history_backfill_free_response_config_bridge(monkeypatch, tmp_path):
+    """Top-level free-response backfill config reaches the adapter env."""
+    import yaml
+    from pathlib import Path
+
+    hermes_dir = tmp_path / ".hermes"
+    hermes_dir.mkdir()
+    (hermes_dir / "config.yaml").write_text(
+        yaml.safe_dump(
+            {"discord": {"history_backfill_free_response": True}}
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("DISCORD_HISTORY_BACKFILL_FREE_RESPONSE", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_dir))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    from gateway.config import load_gateway_config
+
+    load_gateway_config()
+
+    assert os.getenv("DISCORD_HISTORY_BACKFILL_FREE_RESPONSE") == "true"
+
+
+def test_discord_history_backfill_free_response_env_overrides_yaml(
+    monkeypatch, tmp_path
+):
+    """An explicit env value is not replaced by top-level YAML."""
+    import yaml
+    from pathlib import Path
+
+    hermes_dir = tmp_path / ".hermes"
+    hermes_dir.mkdir()
+    (hermes_dir / "config.yaml").write_text(
+        yaml.safe_dump(
+            {"discord": {"history_backfill_free_response": True}}
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("DISCORD_HISTORY_BACKFILL_FREE_RESPONSE", "false")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_dir))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    from gateway.config import load_gateway_config
+
+    load_gateway_config()
+
+    assert os.getenv("DISCORD_HISTORY_BACKFILL_FREE_RESPONSE") == "false"
 
 
 def test_discord_slash_echo_extra_config_bridge(monkeypatch, tmp_path):

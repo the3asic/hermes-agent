@@ -7,6 +7,7 @@ to download, cache, and optionally inject text from non-image/audio files.
 
 import os
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Optional
@@ -97,6 +98,12 @@ def _redirect_cache(tmp_path, monkeypatch):
 def adapter(monkeypatch):
     monkeypatch.setattr(discord_platform.discord, "DMChannel", FakeDMChannel, raising=False)
     monkeypatch.setattr(discord_platform.discord, "Thread", FakeThread, raising=False)
+    for env_name in (
+        "DISCORD_INLINE_TEXT_ATTACHMENTS",
+        "DISCORD_MAX_ATTACHMENT_BYTES",
+        "DISCORD_ALLOW_ANY_ATTACHMENT",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
 
     config = PlatformConfig(enabled=True, token="fake-token")
     a = DiscordAdapter(config)
@@ -137,6 +144,7 @@ def make_message(attachments: list, content: str = "") -> SimpleNamespace:
     )
 
 
+@contextmanager
 def _mock_aiohttp_download(raw_bytes: bytes):
     """Return a patch context manager that makes aiohttp return raw_bytes."""
     resp = AsyncMock()
@@ -150,7 +158,28 @@ def _mock_aiohttp_download(raw_bytes: bytes):
     session.__aenter__ = AsyncMock(return_value=session)
     session.__aexit__ = AsyncMock(return_value=False)
 
-    return patch("aiohttp.ClientSession", return_value=session)
+    with (
+        patch("aiohttp.ClientSession", return_value=session),
+        patch.object(discord_platform, "is_safe_url", return_value=True),
+    ):
+        yield
+
+
+def _load_top_level_discord_config(tmp_path, monkeypatch, discord_config):
+    """Load a raw top-level ``discord:`` block through the real gateway bridge."""
+    import yaml
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump({"discord": discord_config}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    from gateway.config import load_gateway_config
+
+    load_gateway_config()
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +245,91 @@ class TestIncomingDocumentHandling:
         with open(event.media_urls[0], "rb") as fh:
             assert fh.read() == file_content
         assert event.media_types == ["text/plain"]
+
+    @pytest.mark.asyncio
+    async def test_top_level_yaml_attachment_settings_reach_runtime(
+        self, adapter, tmp_path, monkeypatch
+    ):
+        """Top-level Discord attachment settings drive real ingestion behavior."""
+        _load_top_level_discord_config(
+            tmp_path,
+            monkeypatch,
+            {
+                "inline_text_attachments": False,
+                "max_attachment_bytes": 1024,
+            },
+        )
+        file_content = b"TEXT_THAT_MUST_REMAIN_CACHE_ONLY"
+
+        with _mock_aiohttp_download(file_content):
+            msg = make_message(
+                [
+                    make_attachment(
+                        filename="notes.txt",
+                        content_type="text/plain",
+                        size=512,
+                    ),
+                    make_attachment(
+                        filename="too-large.bin",
+                        content_type="application/octet-stream",
+                        size=2048,
+                    ),
+                ],
+                content="inspect these",
+            )
+            await adapter._handle_message(msg)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert os.getenv("DISCORD_INLINE_TEXT_ATTACHMENTS") == "false"
+        assert os.getenv("DISCORD_MAX_ATTACHMENT_BYTES") == "1024"
+        assert "TEXT_THAT_MUST_REMAIN_CACHE_ONLY" not in event.text
+        assert event.text == "inspect these"
+        assert len(event.media_urls) == 1
+
+    @pytest.mark.asyncio
+    async def test_attachment_env_values_override_top_level_yaml(
+        self, adapter, tmp_path, monkeypatch
+    ):
+        """Explicit env values survive the YAML bridge and win at runtime."""
+        # Mirror a legacy duplicate under platforms.discord.extra: explicit
+        # env values must still win over both YAML surfaces.
+        adapter.config.extra.update(
+            {
+                "inline_text_attachments": False,
+                "max_attachment_bytes": 1024,
+            }
+        )
+        monkeypatch.setenv("DISCORD_INLINE_TEXT_ATTACHMENTS", "true")
+        monkeypatch.setenv("DISCORD_MAX_ATTACHMENT_BYTES", "4096")
+        _load_top_level_discord_config(
+            tmp_path,
+            monkeypatch,
+            {
+                "inline_text_attachments": False,
+                "max_attachment_bytes": 1024,
+            },
+        )
+        file_content = b"visible text"
+
+        with _mock_aiohttp_download(file_content):
+            msg = make_message(
+                [
+                    make_attachment(
+                        filename="notes.txt",
+                        content_type="text/plain",
+                        size=2048,
+                    )
+                ],
+                content="inspect this",
+            )
+            await adapter._handle_message(msg)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert os.getenv("DISCORD_INLINE_TEXT_ATTACHMENTS") == "true"
+        assert os.getenv("DISCORD_MAX_ATTACHMENT_BYTES") == "4096"
+        assert "[Content of notes.txt]:" in event.text
+        assert "visible text" in event.text
+        assert len(event.media_urls) == 1
 
     @pytest.mark.asyncio
     async def test_md_content_injected(self, adapter):
@@ -373,7 +487,13 @@ class TestIncomingDocumentHandling:
 
             return FakeSession()
 
-        with patch("aiohttp.ClientSession", return_value=make_session([content1, content2])):
+        with (
+            patch(
+                "aiohttp.ClientSession",
+                return_value=make_session([content1, content2]),
+            ),
+            patch.object(discord_platform, "is_safe_url", return_value=True),
+        ):
             msg = make_message(
                 attachments=[
                     make_attachment(filename="file1.txt", content_type="text/plain"),
@@ -523,14 +643,19 @@ class TestAllowAnyAttachment:
         assert "still a text file" in event.text
         assert event.media_types == ["text/plain"]
 
-    def test_helper_config_overrides_env(self, adapter, monkeypatch):
-        """config.yaml setting wins over env var."""
-        monkeypatch.setenv("DISCORD_ALLOW_ANY_ATTACHMENT", "true")
+    def test_allow_any_attachment_helper_is_compatibility_noop(
+        self, adapter, monkeypatch
+    ):
+        """The legacy flag never restores extension gating."""
+        monkeypatch.setenv("DISCORD_ALLOW_ANY_ATTACHMENT", "false")
         adapter.config.extra["allow_any_attachment"] = False
-        assert adapter._discord_allow_any_attachment() is False
+        assert adapter._discord_allow_any_attachment() is True
+
+        monkeypatch.setenv("DISCORD_ALLOW_ANY_ATTACHMENT", "true")
+        adapter.config.extra["allow_any_attachment"] = True
+        assert adapter._discord_allow_any_attachment() is True
 
     def test_max_bytes_helper_invalid_value_falls_back(self, adapter):
         """Garbage in max_attachment_bytes config falls back to 32 MiB."""
         adapter.config.extra["max_attachment_bytes"] = "not-a-number"
         assert adapter._discord_max_attachment_bytes() == 32 * 1024 * 1024
-
