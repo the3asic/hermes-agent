@@ -1073,12 +1073,12 @@ class ProcessRegistry:
                 session.process.wait()
             except Exception as e:
                 logger.debug("Process wait failed: %s", e)
-                return
-            session.exited = True
-            if session.completion_reason != "killed":
-                session.exit_code = session.process.returncode
-                session.completion_reason = "exited"
-            self._move_to_finished(session)
+            else:
+                session.exited = True
+                if session.completion_reason != "killed":
+                    session.exit_code = session.process.returncode
+                    session.completion_reason = "exited"
+                self._move_to_finished(session)
 
     def _env_poller_loop(
         self, session: ProcessSession, env: Any, log_path: str, pid_path: str, exit_path: str
