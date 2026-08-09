@@ -324,6 +324,7 @@ discord:
   history_backfill: true          # Prepend recent channel scrollback on mention (default: true)
   history_backfill_limit: 50      # Max messages to scan backwards (default: 50)
   channel_prompts: {}             # Per-channel ephemeral system prompts
+  channel_overrides: {}           # Per-channel/thread model, reasoning, and fallback policy
   allow_mentions:                 # What the bot is allowed to ping (safe defaults)
     everyone: false               # @everyone / @here pings (default: false)
     roles: false                  # @role pings (default: false)
@@ -450,6 +451,75 @@ Behavior:
 - Exact thread/channel ID matches win.
 - If a message arrives inside a thread or forum post and that thread has no explicit entry, Hermes falls back to the parent channel/forum ID.
 - Prompts are applied ephemerally at runtime, so changing them affects future turns immediately without rewriting past session history.
+
+#### `discord.channel_overrides`
+
+**Type:** mapping — **Default:** `{}`
+
+Set runtime policy for one Discord channel, thread, or forum post. The supported
+fields are exactly `model`, `provider`, `system_prompt`, `reasoning_effort`, and
+`fallback_providers`.
+
+```yaml
+fallback_providers:               # Global chain
+  - provider: openrouter
+    model: anthropic/claude-sonnet-4.6
+
+discord:
+  channel_overrides:
+    "100000000000000001":
+      provider: anthropic
+      model: claude-opus-4.6
+      system_prompt: Focus on code review in this channel.
+      reasoning_effort: high
+      fallback_providers:
+        - provider: openrouter
+          model: anthropic/claude-sonnet-4.6
+    "100000000000000002":
+      reasoning_effort: false     # `none` also disables reasoning
+      fallback_providers: []      # Disable fallback for this thread/channel
+```
+
+Reasoning is resolved in this order:
+
+1. The session's live `/reasoning` setting.
+2. `reasoning_effort` on the exact channel or thread.
+3. `reasoning_effort` on the parent channel or forum.
+4. The effective model's `agent.reasoning_overrides` entry, then global `agent.reasoning_effort`.
+
+An omitted reasoning field inherits the next level. `false` or `none` is an
+explicit disable and stops inheritance. Run `/reasoning reset` to remove a
+session setting and return to the channel/model/global policy.
+
+Fallback is resolved independently on every turn:
+
+1. `fallback_providers` on the exact channel or thread.
+2. `fallback_providers` on the parent channel or forum.
+3. Top-level `fallback_providers` (plus the legacy `fallback_model` chain).
+
+An omitted fallback field inherits. An explicit empty list disables fallback
+for that channel. A session `/model` command may still replace the primary
+model/provider; it does not replace the effective channel fallback chain. The
+chain is passed to the existing AIAgent fallback implementation, including when
+Hermes reuses a cached agent. Keep credentials in `.env`; for a custom endpoint,
+use `key_env` rather than writing a secret into this mapping.
+
+`model`, `provider`, and `system_prompt` keep their existing entry-level lookup:
+an exact override entry wins as a whole, and the parent entry is used only when
+the exact entry is absent. Reasoning and fallback use the field-by-field
+inheritance described above.
+
+Writing YAML is not proof that Hermes applies it. Run `hermes config check`,
+then exercise the runtime resolver/behavior. For a source checkout, the focused
+contract test is:
+
+```bash
+python -m pytest -q tests/gateway/test_config.py tests/gateway/test_channel_overrides.py
+```
+
+`hermes config check` rejects unknown override fields and malformed values with
+the complete configured path, such as `discord.channel_overrides.<id>...` or
+`platforms.discord.channel_overrides.<id>...`.
 
 #### `discord.history_backfill`
 
@@ -862,5 +932,3 @@ Leave `everyone` and `roles` at `false` unless you know exactly why you need the
 :::
 
 For more information on securing your Hermes Agent deployment, see the [Security Guide](../security.md).
-
-

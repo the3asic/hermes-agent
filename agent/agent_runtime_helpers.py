@@ -1305,6 +1305,14 @@ def restore_primary_runtime(agent) -> bool:
                         primary_provider or "?",
                     )
 
+        # Restore the primary model's reasoning after a turn-scoped fallback.
+        # Older runtime snapshots may not contain this key.
+        if "reasoning_config" in rt:
+            saved_reasoning = rt["reasoning_config"]
+            agent.reasoning_config = (
+                dict(saved_reasoning) if saved_reasoning is not None else None
+            )
+
         # ── Reset fallback chain for the new turn ──
         agent._fallback_activated = False
         agent._fallback_index = 0
@@ -2065,6 +2073,27 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             api_mode=agent.api_mode,
         )
 
+    # The new primary model may have a different per-model reasoning setting.
+    # Session/channel reasoning is turn-scoped and must remain fixed.
+    if getattr(agent, "_reasoning_config_fixed", False) is not True:
+        try:
+            from hermes_cli.config import load_config as _switch_load_config
+            from hermes_constants import resolve_reasoning_config
+
+            agent.reasoning_config = resolve_reasoning_config(
+                _switch_load_config() or {}, agent.model
+            )
+            logger.info(
+                "switch_model: reasoning_config resolved for %s: %s",
+                agent.model,
+                agent.reasoning_config,
+            )
+        except Exception as reasoning_error:
+            logger.debug(
+                "switch_model: could not re-resolve reasoning_config: %s",
+                reasoning_error,
+            )
+
     # ── Invalidate cached system prompt so it rebuilds next turn ──
     agent._cached_system_prompt = None
 
@@ -2087,6 +2116,11 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
+        "reasoning_config": (
+            dict(agent.reasoning_config)
+            if getattr(agent, "reasoning_config", None)
+            else None
+        ),
         "compressor_model": getattr(_cc, "model", agent.model) if _cc else agent.model,
         "compressor_base_url": getattr(_cc, "base_url", agent.base_url) if _cc else agent.base_url,
         "compressor_api_key": getattr(_cc, "api_key", "") if _cc else "",

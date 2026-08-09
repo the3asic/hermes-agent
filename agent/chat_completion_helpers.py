@@ -1635,6 +1635,30 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 api_mode=agent.api_mode,
             )
 
+        # Provider fallback may change the effective model. Re-resolve the
+        # per-model/global setting unless a gateway session/channel pinned the
+        # reasoning value for this turn.
+        if getattr(agent, "_reasoning_config_fixed", False) is not True:
+            try:
+                from hermes_cli.config import load_config
+                from hermes_constants import resolve_reasoning_config
+
+                agent.reasoning_config = resolve_reasoning_config(
+                    load_config() or {}, agent.model
+                )
+                logger.info(
+                    "Fallback %s: reasoning_config resolved: %s",
+                    agent.model,
+                    agent.reasoning_config,
+                )
+            except Exception as reasoning_error:
+                logger.debug(
+                    "Failed to resolve reasoning_config for fallback %s; "
+                    "keeping current: %s",
+                    agent.model,
+                    reasoning_error,
+                )
+
         # Keep the prompt's self-identity in sync with the model actually
         # answering, so "what model are you?" doesn't report the primary.
         rewrite_prompt_model_identity(agent, fb_model, fb_provider)

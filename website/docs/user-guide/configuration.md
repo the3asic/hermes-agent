@@ -1816,11 +1816,36 @@ discord:
   require_mention: true          # Require @mention to respond in server channels
   free_response_channels: ""     # Comma-separated channel IDs where bot responds without @mention
   auto_thread: true              # Auto-create threads on @mention in channels
+  channel_overrides:
+    "100000000000000001":
+      provider: anthropic
+      model: claude-opus-4.6
+      reasoning_effort: high
+      fallback_providers:
+        - provider: openrouter
+          model: anthropic/claude-sonnet-4.6
 ```
 
 - `require_mention` — when `true` (default), the bot only responds in server channels when mentioned with `@BotName`. DMs always work without mention.
 - `free_response_channels` — comma-separated list of channel IDs where the bot responds to every message without requiring a mention.
 - `auto_thread` — when `true` (default), mentions in channels automatically create a thread for the conversation, keeping channels clean (similar to Slack threading).
+- `channel_overrides` — per-channel/thread runtime policy. Supported fields are `model`, `provider`, `system_prompt`, `reasoning_effort`, and `fallback_providers`. For reasoning and fallback, an omitted exact-thread field inherits the parent field; an omitted parent field inherits model/global reasoning or the global fallback chain. `reasoning_effort: false`/`none` disables reasoning, while `fallback_providers: []` disables fallback for that channel.
+
+A session `/reasoning` setting beats channel reasoning. A session `/model`
+setting beats the channel's primary model/provider but leaves the effective
+channel fallback chain intact. Channel fallback entries use the same format and
+parser as top-level `fallback_providers`; keep secrets in `.env` and use
+`key_env` when a custom endpoint needs a named credential.
+
+Writing a block into YAML does not prove the gateway uses it. Run
+`hermes config check` and a runtime resolver/behavior test. In a source checkout:
+
+```bash
+python -m pytest -q tests/gateway/test_config.py tests/gateway/test_channel_overrides.py
+```
+
+See the [Discord guide](/user-guide/messaging/discord#discordchannel_overrides)
+for exact/parent/global precedence and explicit-disable examples.
 
 ## Security
 

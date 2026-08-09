@@ -1,7 +1,10 @@
 """Tests for config.yaml structure validation (validate_config_structure)."""
 
+from types import SimpleNamespace
 
-from hermes_cli.config import validate_config_structure, ConfigIssue
+import pytest
+
+from hermes_cli.config import ConfigIssue, config_command, validate_config_structure
 
 
 class TestCustomProvidersValidation:
@@ -168,6 +171,131 @@ class TestFallbackModelValidation:
             "fallback_model": ["openrouter:anthropic/claude-sonnet-4"],
         })
         assert any("fallback_model[0]" in i.message and "should be a dict" in i.message for i in issues)
+
+
+class TestChannelOverrideValidation:
+    def test_supported_live_shape_has_no_override_issues(self):
+        issues = validate_config_structure(
+            {
+                "platforms": {
+                    "discord": {
+                        "extra": {"plugin_owned": True},
+                        "channel_overrides": {
+                            "123": {
+                                "model": "gpt-5",
+                                "provider": "openai",
+                                "system_prompt": "Be concise.",
+                                "reasoning_effort": False,
+                                "fallback_providers": [
+                                    {"provider": "anthropic", "model": "claude-sonnet-4.6"},
+                                ],
+                            },
+                        },
+                    },
+                },
+            }
+        )
+        assert not [i for i in issues if "channel_overrides" in i.message]
+
+    def test_unknown_key_reports_precise_path_as_error(self):
+        issues = validate_config_structure(
+            {
+                "platforms": {
+                    "discord": {
+                        "channel_overrides": {"123": {"reasoning": "high"}},
+                    },
+                },
+            }
+        )
+        assert any(
+            issue.severity == "error"
+            and "platforms.discord.channel_overrides.123.reasoning" in issue.message
+            and "unknown" in issue.message.lower()
+            for issue in issues
+        )
+
+    @pytest.mark.parametrize(
+        ("override", "path"),
+        [
+            ("not-a-mapping", "platforms.discord.channel_overrides.123"),
+            ({"model": ["gpt-5"]}, "platforms.discord.channel_overrides.123.model"),
+            ({"reasoning_effort": True}, "platforms.discord.channel_overrides.123.reasoning_effort"),
+            ({"fallback_providers": {}}, "platforms.discord.channel_overrides.123.fallback_providers"),
+            (
+                {"fallback_providers": ["openrouter:gpt-5"]},
+                "platforms.discord.channel_overrides.123.fallback_providers[0]",
+            ),
+            (
+                {"fallback_providers": [{"provider": "openrouter"}]},
+                "platforms.discord.channel_overrides.123.fallback_providers[0].model",
+            ),
+        ],
+    )
+    def test_malformed_fields_report_actionable_paths(self, override, path):
+        issues = validate_config_structure(
+            {
+                "platforms": {
+                    "discord": {"channel_overrides": {"123": override}},
+                },
+            }
+        )
+        assert any(path in issue.message for issue in issues)
+
+    def test_invalid_reasoning_value_warns_with_allowed_values(self):
+        issues = validate_config_structure(
+            {
+                "platforms": {
+                    "discord": {
+                        "channel_overrides": {
+                            "123": {"reasoning_effort": "turbo"},
+                        },
+                    },
+                },
+            }
+        )
+        issue = next(i for i in issues if ".reasoning_effort" in i.message)
+        assert issue.severity == "warning"
+        assert "minimal" in issue.hint
+        assert "false" in issue.hint
+
+    def test_unrelated_platform_extra_keys_are_not_rejected(self):
+        issues = validate_config_structure(
+            {
+                "platforms": {
+                    "discord": {
+                        "extra": {
+                            "arbitrary_plugin_setting": {"nested": True},
+                        },
+                    },
+                },
+            }
+        )
+        assert not [i for i in issues if "arbitrary_plugin_setting" in i.message]
+
+    def test_config_check_reads_yaml_reports_path_and_fails(self, tmp_path, monkeypatch, capsys):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  discord:\n"
+            "    channel_overrides:\n"
+            "      '123':\n"
+            "        mystery_field: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr("hermes_cli.config.REQUIRED_ENV_VARS", {})
+        monkeypatch.setattr("hermes_cli.config.OPTIONAL_ENV_VARS", {})
+        monkeypatch.setattr("hermes_cli.config.check_config_version", lambda: (1, 1))
+        monkeypatch.setattr("hermes_cli.config.get_missing_config_fields", lambda: [])
+
+        with pytest.raises(SystemExit) as exc:
+            config_command(SimpleNamespace(config_command="check"))
+
+        assert exc.value.code == 1
+        output = capsys.readouterr().out
+        assert "platforms.discord.channel_overrides.123.mystery_field" in output
+        assert "model, provider, system_prompt, reasoning_effort, fallback_providers" in output
 
 
 class TestMissingModelSection:

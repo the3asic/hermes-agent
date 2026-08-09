@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import ChannelOverride, GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
 
@@ -266,6 +266,79 @@ class TestRunBackgroundTask:
         assert "Hello from background!" in content
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_discord_channel_contract_reaches_agent_constructor(self, monkeypatch):
+        """The resolved lane values must reach the real AIAgent creation site."""
+        from gateway import run as gateway_run
+
+        channel_chain = [
+            {
+                "provider": "custom",
+                "model": "channel-fallback",
+                "base_url": "https://fallback.example/v1",
+                "key_env": "CHANNEL_FALLBACK_KEY",
+            },
+        ]
+        runner = _make_runner()
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "channel": ChannelOverride(
+                            reasoning_effort=False,
+                            fallback_providers=channel_chain,
+                        ),
+                    },
+                ),
+            },
+        )
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("primary-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(
+            return_value={"enabled": False}
+        )
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(
+            return_value={
+                "model": "primary-model",
+                "runtime": {"api_key": "test-key"},
+                "request_overrides": None,
+            }
+        )
+        runner._refresh_fallback_model = MagicMock(
+            return_value=[{"provider": "global", "model": "global-fallback"}]
+        )
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.extract_media = MagicMock(return_value=([], "done"))
+        mock_adapter.extract_images = MagicMock(return_value=([], "done"))
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            user_id="user",
+            chat_id="channel",
+            user_name="tester",
+        )
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+
+        with patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "done",
+                "messages": [],
+            }
+            mock_agent_cls.return_value = mock_agent
+
+            await runner._run_background_task("test", source, "bg_test")
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["fallback_model"] == channel_chain
+        assert kwargs["fallback_model"] is not channel_chain
+        assert kwargs["reasoning_config"] == {"enabled": False}
+        assert mock_agent._reasoning_config_fixed is True
 
     @pytest.mark.asyncio
     async def test_media_files_routed_by_type(self, monkeypatch):

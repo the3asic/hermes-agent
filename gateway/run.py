@@ -2491,6 +2491,39 @@ def _get_channel_override(
     return None
 
 
+def _get_channel_override_field(
+    config: GatewayConfig,
+    platform: Platform,
+    chat_id: str,
+    field_name: str,
+    *,
+    thread_id: Optional[str] = None,
+    parent_id: Optional[str] = None,
+) -> Any:
+    """Resolve one field while allowing an exact entry to omit it.
+
+    ``None`` means absent and continues inheritance. Falsey values such as
+    ``False`` and ``[]`` are explicit and stop lookup.
+    """
+    platforms = getattr(config, "platforms", None)
+    if not platforms:
+        return None
+    platform_config = platforms.get(platform)
+    if not platform_config or not platform_config.channel_overrides:
+        return None
+    overrides = platform_config.channel_overrides
+    for key in _channel_override_lookup_keys(
+        chat_id, thread_id=thread_id, parent_id=parent_id
+    ):
+        override = overrides.get(key)
+        if override is None:
+            continue
+        value = getattr(override, field_name, None)
+        if value is not None:
+            return value
+    return None
+
+
 def _resolve_hermes_bin() -> Optional[list[str]]:
     """Resolve the Hermes update command as argv parts.
 
@@ -4851,23 +4884,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return getattr(self, "_ephemeral_system_prompt", None) or ""
 
     @staticmethod
-    def _load_reasoning_config() -> dict | None:
+    def _load_reasoning_config(model: str = "") -> dict | None:
         """Load reasoning effort from config.yaml.
 
-        Reads agent.reasoning_effort from config.yaml. Valid: "none",
-        "minimal", "low", "medium", "high", "xhigh", "max", "ultra". Returns None to use
-        default (medium).
+        Resolves the effective model's ``agent.reasoning_overrides`` entry
+        before global ``agent.reasoning_effort``. Returns None to use the
+        provider default.
         """
-        from hermes_constants import parse_reasoning_effort
+        from hermes_constants import resolve_reasoning_config
+
         cfg = _load_gateway_runtime_config()
-        # Keep the raw value — coercing with ``or ""`` turns a YAML boolean
-        # False (``reasoning_effort: false``/``off``/``no``) into "", silently
-        # re-enabling thinking for users who explicitly disabled it.
-        effort = cfg_get(cfg, "agent", "reasoning_effort", default="")
-        result = parse_reasoning_effort(effort)
-        if effort and str(effort).strip() and result is None:
-            logger.warning("Unknown reasoning_effort '%s', using default (medium)", effort)
-        return result
+        return resolve_reasoning_config(cfg, model)
 
     @staticmethod
     def _parse_reasoning_command_args(raw_args: str) -> tuple[str, bool]:
@@ -4900,8 +4927,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
+        model: str = "",
     ) -> dict | None:
-        """Resolve reasoning effort for a session, honoring session overrides."""
+        """Resolve session, Discord-lane, per-model, then global reasoning."""
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
             try:
@@ -4911,8 +4939,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
         if resolved_session_key and resolved_session_key in overrides:
-            return overrides[resolved_session_key]
-        return self._load_reasoning_config()
+            return dict(overrides[resolved_session_key])
+
+        if (
+            source is not None
+            and source.platform == Platform.DISCORD
+            and getattr(self, "config", None) is not None
+        ):
+            lane_effort = _get_channel_override_field(
+                self.config,
+                Platform.DISCORD,
+                source.chat_id or "",
+                "reasoning_effort",
+                thread_id=getattr(source, "thread_id", None),
+                parent_id=getattr(source, "parent_chat_id", None),
+            )
+            if lane_effort is not None:
+                from hermes_constants import parse_reasoning_effort
+
+                parsed = parse_reasoning_effort(lane_effort)
+                if parsed is not None:
+                    return parsed
+        return self._load_reasoning_config(model)
+
+    def _has_scoped_reasoning_override(
+        self,
+        *,
+        source: Optional[SessionSource] = None,
+        session_key: Optional[str] = None,
+    ) -> bool:
+        """Return whether session or Discord-lane reasoning stays turn-fixed."""
+        resolved_session_key = session_key
+        if not resolved_session_key and source is not None:
+            try:
+                resolved_session_key = self._session_key_for_source(source)
+            except Exception:
+                resolved_session_key = None
+
+        overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
+        if resolved_session_key and resolved_session_key in overrides:
+            return True
+        if (
+            source is None
+            or source.platform != Platform.DISCORD
+            or getattr(self, "config", None) is None
+        ):
+            return False
+        return _get_channel_override_field(
+            self.config,
+            Platform.DISCORD,
+            source.chat_id or "",
+            "reasoning_effort",
+            thread_id=getattr(source, "thread_id", None),
+            parent_id=getattr(source, "parent_chat_id", None),
+        ) is not None
 
     def _set_session_reasoning_override(
         self,
@@ -5107,6 +5187,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return self._fallback_model
         self._fallback_model = get_fallback_chain(cfg) or None
         return self._fallback_model
+
+    def _resolve_session_fallback_chain(
+        self,
+        *,
+        source: Optional[SessionSource],
+        global_chain: list | None,
+    ) -> list:
+        """Resolve Discord exact/parent fallback fields before the global chain.
+
+        The canonical parser returns fresh entry dictionaries, so assigning the
+        result to an AIAgent cannot mutate ``GatewayConfig`` or the global chain.
+        """
+        selected = global_chain or []
+        if (
+            source is not None
+            and source.platform == Platform.DISCORD
+            and getattr(self, "config", None) is not None
+        ):
+            lane_chain = _get_channel_override_field(
+                self.config,
+                Platform.DISCORD,
+                source.chat_id or "",
+                "fallback_providers",
+                thread_id=getattr(source, "thread_id", None),
+                parent_id=getattr(source, "parent_chat_id", None),
+            )
+            if lane_chain is not None:
+                selected = lane_chain
+        return get_fallback_chain({"fallback_providers": selected})
 
     @staticmethod
     def _apply_fallback_chain_to_agent(agent: Any, chain: list | None) -> None:
@@ -13473,7 +13582,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
-            reasoning_config = self._resolve_session_reasoning_config(source=source)
+            reasoning_config = self._resolve_session_reasoning_config(
+                source=source, model=model
+            )
+            reasoning_is_scoped = self._has_scoped_reasoning_override(source=source)
+            fallback_chain = self._resolve_session_fallback_chain(
+                source=source,
+                global_chain=self._refresh_fallback_model(),
+            )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
@@ -13523,9 +13639,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     session_db=getattr(self._session_db, "_db", self._session_db),
-                    # Reload from disk — do not reuse the startup snapshot (#60955).
-                    fallback_model=self._refresh_fallback_model(),
+                    fallback_model=fallback_chain,
                 )
+                agent._reasoning_config_fixed = reasoning_is_scoped
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
@@ -16035,6 +16151,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         cache_keys: dict | None = None,
         user_id: str | None = None,
         user_id_alt: str | None = None,
+        reasoning_config: dict | None = None,
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -16062,6 +16179,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         broke #27371's per-user-peer contract in multi-user gateways.
         Per-user agent rebuilds in shared threads trade prompt-cache
         warmth for correct memory attribution.
+
+        ``reasoning_config`` is the effective per-turn value. It participates
+        because scoped reasoning also controls model-switch/fallback behavior
+        stored on the cached agent.
         """
         import hashlib, json as _j
 
@@ -16082,8 +16203,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime.get("provider", ""),
                 runtime.get("api_mode", ""),
                 sorted(enabled_toolsets) if enabled_toolsets else [],
-                # reasoning_config excluded — it's set per-message on the
-                # cached agent and doesn't affect system prompt or tools.
+                reasoning_config,
                 ephemeral_prompt or "",
                 _cache_keys_sorted,
                 str(user_id or ""),
@@ -18224,6 +18344,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source,
                 session_key=session_key,
+                model=model,
+            )
+            reasoning_is_scoped = self._has_scoped_reasoning_override(
+                source=source,
+                session_key=session_key,
+            )
+            fallback_chain = self._resolve_session_fallback_chain(
+                source=source,
+                global_chain=self._refresh_fallback_model(),
             )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
@@ -18354,6 +18483,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 cache_keys=self._extract_cache_busting_config(user_config),
                 user_id=getattr(source, "user_id", None),
                 user_id_alt=getattr(source, "user_id_alt", None),
+                reasoning_config=reasoning_config,
             )
             agent = None
             reused_cached_agent = False
@@ -18455,7 +18585,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # serialization (_running_agents) keeps this safe post-lock.
             if reused_cached_agent and agent is not None:
                 self._apply_fallback_chain_to_agent(
-                    agent, self._refresh_fallback_model(),
+                    agent, fallback_chain,
                 )
 
             # Lock released — now schedule cleanup of any cross-process-evicted
@@ -18510,8 +18640,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
                     session_db=getattr(self._session_db, "_db", self._session_db),
-                    # Reload from disk — do not reuse the startup snapshot (#60955).
-                    fallback_model=self._refresh_fallback_model(),
+                    fallback_model=fallback_chain,
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
@@ -18581,6 +18710,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.notice_clear_callback = None
             agent.event_callback = _event_callback_sync
             agent.reasoning_config = reasoning_config
+            agent._reasoning_config_fixed = reasoning_is_scoped
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
 

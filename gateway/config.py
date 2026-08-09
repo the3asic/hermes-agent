@@ -13,10 +13,12 @@ import os
 import json
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Callable
+from typing import Any, Callable, ClassVar, Dict, List, Optional, Union
 from enum import Enum
 
-from hermes_cli.config import get_hermes_home
+from hermes_cli.config import CHANNEL_OVERRIDE_SUPPORTED_FIELDS, get_hermes_home
+from hermes_cli.fallback_config import get_fallback_chain
+from hermes_constants import parse_reasoning_effort
 from agent.secret_scope import current_secret_scope, get_secret as _get_secret
 from utils import is_truthy_value
 
@@ -409,7 +411,7 @@ class SessionResetPolicy:
 @dataclass
 class ChannelOverride:
     """
-    Per-channel override for model, provider, and system prompt.
+    Per-channel override for model, provider, reasoning, fallback, and prompt.
 
     Used in config under platforms.<name>.channel_overrides[channel_id].
     Enables different channels (e.g. Discord #daily vs #dev) to use different
@@ -418,6 +420,10 @@ class ChannelOverride:
     model: Optional[str] = None
     provider: Optional[str] = None
     system_prompt: Optional[str] = None
+    reasoning_effort: Optional[Union[str, bool]] = None
+    fallback_providers: Optional[List[Dict[str, Any]]] = None
+
+    SUPPORTED_FIELDS: ClassVar[tuple[str, ...]] = CHANNEL_OVERRIDE_SUPPORTED_FIELDS
 
     def to_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
@@ -427,16 +433,111 @@ class ChannelOverride:
             out["provider"] = self.provider
         if self.system_prompt is not None:
             out["system_prompt"] = self.system_prompt
+        if self.reasoning_effort is not None:
+            out["reasoning_effort"] = self.reasoning_effort
+        if self.fallback_providers is not None:
+            out["fallback_providers"] = [
+                dict(entry) for entry in self.fallback_providers
+            ]
         return out
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ChannelOverride":
+        if data is None:
+            return cls()
+
+        if not isinstance(data, dict):
+            raise TypeError(
+                f"channel override must be a mapping, got {type(data).__name__}"
+            )
         if not data:
             return cls()
+
+        unknown = sorted(
+            str(field_name)
+            for field_name in data
+            if field_name not in cls.SUPPORTED_FIELDS
+        )
+        if unknown:
+            raise ValueError(
+                "Unknown channel override field(s): "
+                + ", ".join(unknown)
+                + ". Supported fields: "
+                + ", ".join(cls.SUPPORTED_FIELDS)
+            )
+
+        for field_name in ("model", "provider", "system_prompt"):
+            value = data.get(field_name)
+            if value is not None and not isinstance(value, str):
+                raise TypeError(
+                    f"{field_name} must be a string, got {type(value).__name__}"
+                )
+
+        reasoning_effort = data.get("reasoning_effort")
+        if reasoning_effort is not None:
+            if reasoning_effort is True or not isinstance(
+                reasoning_effort, (str, bool)
+            ):
+                raise TypeError(
+                    "reasoning_effort must be an effort string or false, got "
+                    f"{type(reasoning_effort).__name__}"
+                )
+            parsed_reasoning = parse_reasoning_effort(reasoning_effort)
+            if parsed_reasoning is None:
+                logger.warning(
+                    "Unknown channel reasoning_effort '%s'; inheriting parent/global reasoning",
+                    reasoning_effort,
+                )
+                reasoning_effort = None
+            elif parsed_reasoning.get("enabled"):
+                reasoning_effort = parsed_reasoning["effort"]
+            else:
+                reasoning_effort = False
+
+        fallback_providers = None
+        if "fallback_providers" in data:
+            raw_fallbacks = data["fallback_providers"]
+            if not isinstance(raw_fallbacks, list):
+                raise TypeError(
+                    "fallback_providers must be a list, got "
+                    f"{type(raw_fallbacks).__name__}"
+                )
+            for index, entry in enumerate(raw_fallbacks):
+                if not isinstance(entry, dict):
+                    raise TypeError(
+                        f"fallback_providers[{index}] must be a mapping, got "
+                        f"{type(entry).__name__}"
+                    )
+                for required in ("provider", "model"):
+                    value = entry.get(required)
+                    if not isinstance(value, str) or not value.strip():
+                        raise ValueError(
+                            f"fallback_providers[{index}].{required} must be a non-empty string"
+                        )
+                for optional in (
+                    "base_url",
+                    "api_mode",
+                    "transport",
+                    "api_key",
+                    "key_env",
+                    "api_key_env",
+                ):
+                    if optional in entry and entry[optional] is not None and not isinstance(
+                        entry[optional], str
+                    ):
+                        raise TypeError(
+                            f"fallback_providers[{index}].{optional} must be a string"
+                        )
+            fallback_providers = get_fallback_chain(
+                {"fallback_providers": raw_fallbacks}
+            )
+
         return cls(
             model=data.get("model"),
             provider=data.get("provider"),
             system_prompt=data.get("system_prompt"),
+            reasoning_effort=reasoning_effort,
+            fallback_providers=fallback_providers,
         )
 
 
@@ -470,7 +571,7 @@ class PlatformConfig:
     # gateway/platforms/base.py.
     typing_indicator: bool = True
 
-    # Per-channel model/provider/system_prompt overrides (channel_id -> ChannelOverride)
+    # Per-channel runtime overrides (channel_id -> ChannelOverride)
     channel_overrides: Dict[str, ChannelOverride] = field(default_factory=dict)
 
     # Platform-specific settings
@@ -520,11 +621,22 @@ class PlatformConfig:
             _typing = extra.get("typing_indicator")
 
         channel_overrides: Dict[str, ChannelOverride] = {}
-        raw_overrides = data.get("channel_overrides") or {}
-        if isinstance(raw_overrides, dict):
-            for cid, ov_data in raw_overrides.items():
-                if isinstance(ov_data, dict):
-                    channel_overrides[str(cid)] = ChannelOverride.from_dict(ov_data)
+        raw_overrides = data.get("channel_overrides", {})
+        if raw_overrides is None or not isinstance(raw_overrides, dict):
+            raise TypeError(
+                "channel_overrides must be a mapping, got "
+                f"{type(raw_overrides).__name__}"
+            )
+        for cid, ov_data in raw_overrides.items():
+            if not isinstance(ov_data, dict):
+                raise TypeError(
+                    f"channel_overrides.{cid} must be a mapping, got "
+                    f"{type(ov_data).__name__}"
+                )
+            try:
+                channel_overrides[str(cid)] = ChannelOverride.from_dict(ov_data)
+            except (TypeError, ValueError) as exc:
+                raise type(exc)(f"channel_overrides.{cid}: {exc}") from exc
 
         return cls(
             enabled=_coerce_bool(data.get("enabled"), False),
@@ -839,9 +951,9 @@ class GatewayConfig:
                 continue
             try:
                 platform = Platform(platform_name)
-                platforms[platform] = PlatformConfig.from_dict(platform_data)
             except ValueError:
-                pass  # Skip unknown platforms
+                continue  # Skip unknown platforms
+            platforms[platform] = PlatformConfig.from_dict(platform_data)
         
         reset_by_type = {}
         for type_name, policy_data in _coerce_dict(data.get("reset_by_type", {})).items():
@@ -1243,15 +1355,18 @@ def load_gateway_config() -> GatewayConfig:
                 has_channel_overrides = "channel_overrides" in platform_cfg
                 if has_channel_overrides:
                     raw_overrides = platform_cfg.get("channel_overrides")
+                    plat_data, _extra = _ensure_platform_extra_dict(
+                        platforms_data, plat.value
+                    )
                     if isinstance(raw_overrides, dict):
-                        plat_data, _extra = _ensure_platform_extra_dict(
-                            platforms_data, plat.value
-                        )
                         plat_data["channel_overrides"] = {
                             str(cid): ov_data
                             for cid, ov_data in raw_overrides.items()
-                            if isinstance(ov_data, dict)
                         }
+                    else:
+                        # Preserve malformed input so PlatformConfig.from_dict
+                        # rejects it instead of silently treating it as absent.
+                        plat_data["channel_overrides"] = raw_overrides
                 enabled_was_explicit = _cfg_toplevel and "enabled" in platform_cfg
                 if not bridged and not enabled_was_explicit and not has_channel_overrides:
                     continue

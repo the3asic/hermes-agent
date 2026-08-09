@@ -5247,6 +5247,30 @@ _VALID_CUSTOM_PROVIDER_FIELDS = {
 # Fields that look like they should be inside custom_providers, not at root
 _CUSTOM_PROVIDER_LIKE_FIELDS = {"base_url", "api_key", "rate_limit_delay", "api_mode"}
 
+# Per-channel runtime overrides are intentionally a small, closed schema.
+# Platform-specific extension settings continue to live under ``extra`` and
+# are not validated against this set.
+CHANNEL_OVERRIDE_SUPPORTED_FIELDS = (
+    "model",
+    "provider",
+    "system_prompt",
+    "reasoning_effort",
+    "fallback_providers",
+)
+_CHANNEL_OVERRIDE_SUPPORTED_FIELD_SET = frozenset(CHANNEL_OVERRIDE_SUPPORTED_FIELDS)
+_FALLBACK_PROVIDER_STRING_FIELDS = frozenset(
+    {
+        "provider",
+        "model",
+        "base_url",
+        "api_mode",
+        "transport",
+        "api_key",
+        "key_env",
+        "api_key_env",
+    }
+)
+
 
 @dataclass
 class ConfigIssue:
@@ -5255,6 +5279,196 @@ class ConfigIssue:
     severity: str  # "error", "warning"
     message: str
     hint: str
+
+
+def _validate_fallback_provider_list(
+    raw: Any,
+    path: str,
+    issues: List["ConfigIssue"],
+) -> None:
+    """Validate the canonical plural fallback-provider list shape."""
+    if not isinstance(raw, list):
+        issues.append(
+            ConfigIssue(
+                "error",
+                f"{path} must be a YAML list, got {type(raw).__name__}",
+                "Use a list of entries with provider and model fields; use [] to disable fallback.",
+            )
+        )
+        return
+
+    for index, entry in enumerate(raw):
+        entry_path = f"{path}[{index}]"
+        if not isinstance(entry, dict):
+            issues.append(
+                ConfigIssue(
+                    "error",
+                    f"{entry_path} must be a mapping, got {type(entry).__name__}",
+                    "Each fallback entry needs provider and model fields.",
+                )
+            )
+            continue
+
+        for required in ("provider", "model"):
+            field_path = f"{entry_path}.{required}"
+            value = entry.get(required)
+            if value is None or value == "":
+                issues.append(
+                    ConfigIssue(
+                        "error",
+                        f"{field_path} is required",
+                        f"Add a non-empty string for {required}.",
+                    )
+                )
+            elif not isinstance(value, str):
+                issues.append(
+                    ConfigIssue(
+                        "error",
+                        f"{field_path} must be a string, got {type(value).__name__}",
+                        f"Quote the {required} value in YAML.",
+                    )
+                )
+            elif not value.strip():
+                issues.append(
+                    ConfigIssue(
+                        "error",
+                        f"{field_path} must not be blank",
+                        f"Set {required} to a usable value.",
+                    )
+                )
+
+        for field_name in sorted(
+            _FALLBACK_PROVIDER_STRING_FIELDS - {"provider", "model"}
+        ):
+            if field_name not in entry or entry[field_name] is None:
+                continue
+            if not isinstance(entry[field_name], str):
+                issues.append(
+                    ConfigIssue(
+                        "error",
+                        f"{entry_path}.{field_name} must be a string, got "
+                        f"{type(entry[field_name]).__name__}",
+                        f"Quote the {field_name} value in YAML.",
+                    )
+                )
+
+
+def _iter_channel_override_sections(config: Dict[str, Any]):
+    """Yield ``(path, value)`` pairs without inspecting platform ``extra``."""
+    platforms = config.get("platforms")
+    if isinstance(platforms, dict):
+        for platform_name, platform_cfg in platforms.items():
+            if isinstance(platform_cfg, dict) and "channel_overrides" in platform_cfg:
+                yield (
+                    f"platforms.{platform_name}.channel_overrides",
+                    platform_cfg.get("channel_overrides"),
+                )
+
+    gateway_cfg = config.get("gateway")
+    gateway_platforms = (
+        gateway_cfg.get("platforms") if isinstance(gateway_cfg, dict) else None
+    )
+    if isinstance(gateway_platforms, dict):
+        for platform_name, platform_cfg in gateway_platforms.items():
+            if isinstance(platform_cfg, dict) and "channel_overrides" in platform_cfg:
+                yield (
+                    f"gateway.platforms.{platform_name}.channel_overrides",
+                    platform_cfg.get("channel_overrides"),
+                )
+
+    # The user-facing messaging config also accepts top-level platform blocks,
+    # for example ``discord.channel_overrides``. Only inspect mappings that
+    # explicitly contain this field; all sibling/plugin-owned keys remain free.
+    for platform_name, platform_cfg in config.items():
+        if platform_name in {"platforms", "gateway"}:
+            continue
+        if isinstance(platform_cfg, dict) and "channel_overrides" in platform_cfg:
+            yield (
+                f"{platform_name}.channel_overrides",
+                platform_cfg.get("channel_overrides"),
+            )
+
+
+def _validate_channel_override_sections(
+    config: Dict[str, Any], issues: List["ConfigIssue"]
+) -> None:
+    from hermes_constants import parse_reasoning_effort
+
+    for section_path, raw_overrides in _iter_channel_override_sections(config):
+        if not isinstance(raw_overrides, dict):
+            issues.append(
+                ConfigIssue(
+                    "error",
+                    f"{section_path} must be a mapping, got {type(raw_overrides).__name__}",
+                    "Map each Discord channel or thread ID to an override mapping.",
+                )
+            )
+            continue
+
+        for channel_id, override in raw_overrides.items():
+            override_path = f"{section_path}.{channel_id}"
+            if not isinstance(override, dict):
+                issues.append(
+                    ConfigIssue(
+                        "error",
+                        f"{override_path} must be a mapping, got {type(override).__name__}",
+                        "Set supported fields under this channel or thread ID.",
+                    )
+                )
+                continue
+
+            for field_name in override:
+                if field_name in _CHANNEL_OVERRIDE_SUPPORTED_FIELD_SET:
+                    continue
+                issues.append(
+                    ConfigIssue(
+                        "error",
+                        f"{override_path}.{field_name} is an unknown channel override field",
+                        "Supported fields: "
+                        + ", ".join(CHANNEL_OVERRIDE_SUPPORTED_FIELDS),
+                    )
+                )
+
+            for field_name in ("model", "provider", "system_prompt"):
+                if field_name not in override or override[field_name] is None:
+                    continue
+                if not isinstance(override[field_name], str):
+                    issues.append(
+                        ConfigIssue(
+                            "error",
+                            f"{override_path}.{field_name} must be a string, got "
+                            f"{type(override[field_name]).__name__}",
+                            f"Quote the {field_name} value in YAML.",
+                        )
+                    )
+
+            if "reasoning_effort" in override and override["reasoning_effort"] is not None:
+                reasoning = override["reasoning_effort"]
+                reasoning_path = f"{override_path}.reasoning_effort"
+                if reasoning is True or not isinstance(reasoning, (str, bool)):
+                    issues.append(
+                        ConfigIssue(
+                            "error",
+                            f"{reasoning_path} must be an effort string or false, got "
+                            f"{type(reasoning).__name__}",
+                            "Use minimal, low, medium, high, xhigh, max, ultra, none, or false.",
+                        )
+                    )
+                elif parse_reasoning_effort(reasoning) is None:
+                    issues.append(
+                        ConfigIssue(
+                            "warning",
+                            f"{reasoning_path} has an unknown value and will inherit its parent/global setting",
+                            "Use minimal, low, medium, high, xhigh, max, ultra, none, or false.",
+                        )
+                    )
+
+            if "fallback_providers" in override:
+                _validate_fallback_provider_list(
+                    override["fallback_providers"],
+                    f"{override_path}.fallback_providers",
+                    issues,
+                )
 
 
 def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["ConfigIssue"]:
@@ -5272,6 +5486,8 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             return [ConfigIssue("error", "Could not load config.yaml", "Run 'hermes setup' to create a valid config")]
 
     issues: List[ConfigIssue] = []
+
+    _validate_channel_override_sections(config, issues)
 
     # ── custom_providers must be a list, not a dict ──────────────────────
     cp = config.get("custom_providers")
@@ -8357,8 +8573,22 @@ def config_command(args):
             print()
             print(color(f"  {len(missing_config)} new config option(s) available", Colors.YELLOW))
             print("    Run 'hermes config migrate' to add them")
-        
+
+        structure_issues = validate_config_structure()
+        if structure_issues:
+            print()
+            print(color("  Config structure issues:", Colors.BOLD))
+            for issue in structure_issues:
+                marker = "✗" if issue.severity == "error" else "⚠"
+                marker_color = Colors.RED if issue.severity == "error" else Colors.YELLOW
+                print(color(f"    {marker} {issue.message}", marker_color))
+                if issue.hint:
+                    for hint_line in issue.hint.splitlines():
+                        print(color(f"      {hint_line}", Colors.DIM))
+
         print()
+        if any(issue.severity == "error" for issue in structure_issues):
+            sys.exit(1)
     
     else:
         print(f"Unknown config command: {subcmd}")

@@ -864,6 +864,20 @@ platform_toolsets:
 #   reactions: true                  # Show processing reactions (default: true)
 #   history_backfill: true           # Recover missed channel messages on mention (default: true)
 #   history_backfill_limit: 50       # Max messages to scan backwards (default: 50)
+#   channel_overrides:
+#     "100000000000000001":
+#       provider: anthropic
+#       model: claude-opus-4.6
+#       system_prompt: Focus on code review in this channel.
+#       reasoning_effort: high       # minimal|low|medium|high|xhigh|max|ultra|none|false
+#       fallback_providers:          # Same entry format as the top-level chain
+#         - provider: openrouter
+#           model: anthropic/claude-sonnet-4.6
+#     "100000000000000002":
+#       fallback_providers: []       # Explicitly disable fallback for this channel/thread
+#
+# Validate edits with `hermes config check`, then run a runtime behavior test.
+# Merely writing valid YAML does not prove the gateway resolver applies it.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Available toolsets (use these names in platform_toolsets or the toolsets list)

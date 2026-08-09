@@ -823,6 +823,116 @@ def parse_reasoning_effort(effort) -> dict | None:
     return None
 
 
+def _canonical_model_variants(model: str) -> list[str]:
+    """Generate bounded spelling variants for per-model config matching."""
+    import re
+
+    def _dash_to_dot(value: str) -> str:
+        return re.sub(r"(\d)-(\d)", r"\1.\2", value)
+
+    def _dot_to_dash(value: str) -> str:
+        return re.sub(r"(\d)\.(\d)", r"\1-\2", value)
+
+    seen: set[str] = set()
+    variants: list[str] = []
+
+    def _add(value: str) -> None:
+        if value and value not in seen:
+            seen.add(value)
+            variants.append(value)
+
+    def _add_with_derivatives(value: str) -> None:
+        _add(value)
+        all_dashed = value.replace(".", "-")
+        all_dotted = value.replace("-", ".")
+        _add(all_dashed)
+        _add(all_dotted)
+        _add(_dash_to_dot(value))
+        _add(_dot_to_dash(value))
+        _add(_dash_to_dot(all_dashed))
+        _add(_dot_to_dash(all_dotted))
+
+    _add_with_derivatives(model)
+    parts = model.split("/")
+    if len(parts) >= 2:
+        _add_with_derivatives(parts[-1])
+    if len(parts) >= 3:
+        _add_with_derivatives("/".join(parts[1:]))
+
+    known_providers = (
+        "anthropic",
+        "openai",
+        "google",
+        "openrouter",
+        "groq",
+        "mistral",
+        "xai",
+        "cohere",
+        "perplexity",
+        "together",
+        "fireworks",
+        "deepseek",
+    )
+    for variant in [value for value in variants if "/" not in value]:
+        for provider in known_providers:
+            _add(f"{provider}/{variant}")
+
+    known_aggregators = ("openrouter", "opencode", "fireworks", "groq", "together")
+    for variant in [value for value in variants if value.count("/") == 1]:
+        for aggregator in known_aggregators:
+            _add(f"{aggregator}/{variant}")
+
+    return variants
+
+
+def resolve_per_model_reasoning_effort(
+    model: str, overrides: dict | None
+) -> dict | None:
+    """Resolve a per-model reasoning override across common model spellings."""
+    if not overrides or not isinstance(overrides, dict) or not model:
+        return None
+
+    for variant in _canonical_model_variants(model):
+        if variant in overrides:
+            result = parse_reasoning_effort(overrides[variant])
+            if result is not None:
+                return result
+    return None
+
+
+def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
+    """Resolve per-model reasoning first, then the global agent setting."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    agent_cfg = cfg.get("agent")
+    if not isinstance(agent_cfg, dict):
+        agent_cfg = {}
+
+    if not model:
+        model_cfg = cfg.get("model")
+        if isinstance(model_cfg, str):
+            model = model_cfg.strip()
+        elif isinstance(model_cfg, dict):
+            model = str(
+                model_cfg.get("default") or model_cfg.get("model") or ""
+            ).strip()
+
+    per_model = resolve_per_model_reasoning_effort(
+        model, agent_cfg.get("reasoning_overrides") or {}
+    )
+    if per_model is not None:
+        return per_model
+
+    effort = agent_cfg.get("reasoning_effort", "")
+    result = parse_reasoning_effort(effort)
+    if effort and str(effort).strip() and result is None:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Unknown reasoning_effort '%s', using default (medium)", effort
+        )
+    return result
+
+
 def is_termux() -> bool:
     """Return True when running inside a Termux (Android) environment.
 
