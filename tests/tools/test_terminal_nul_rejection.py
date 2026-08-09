@@ -40,3 +40,22 @@ def test_lifecycle_guard_tolerates_nul_in_candidate_path():
         "python malformed\x00path.py",
         cwd="/tmp",
     )
+
+
+def test_lifecycle_guard_skips_nul_in_referenced_script_path():
+    assert not contains_gateway_lifecycle_command_or_referenced_script(
+        'bash "malformed\x00path.sh"',
+        cwd="/tmp",
+    )
+
+
+def test_lifecycle_guard_skips_nul_in_nested_remote_script_path():
+    def _read_remote_script(path: str):
+        assert path == "/remote/outer.sh"
+        return 'bash "malformed\x00path.sh"'
+
+    assert not contains_gateway_lifecycle_command_or_referenced_script(
+        "bash /remote/outer.sh",
+        cwd="/tmp",
+        read_remote_script=_read_remote_script,
+    )

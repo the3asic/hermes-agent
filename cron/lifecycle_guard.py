@@ -170,7 +170,9 @@ def contains_launchctl_submit_command(command: str) -> bool:
     return False
 
 
-def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Path:
+def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Optional[Path]:
+    if "\x00" in candidate:
+        return None
     path = Path(candidate).expanduser()
     if not path.is_absolute():
         path = Path(cwd or Path.cwd()) / path
@@ -192,7 +194,9 @@ def _iter_referenced_shell_scripts(
 
         if executable_name in {".", "source"}:
             if len(segment) > index + 1:
-                yield _resolve_terminal_script_path(segment[index + 1], cwd)
+                path = _resolve_terminal_script_path(segment[index + 1], cwd)
+                if path is not None:
+                    yield path
             continue
 
         if executable_name in _SHELL_EXECUTABLES:
@@ -216,7 +220,9 @@ def _iter_referenced_shell_scripts(
                 "-c",
                 "--command",
             }:
-                yield _resolve_terminal_script_path(arguments[arg_index], cwd)
+                path = _resolve_terminal_script_path(arguments[arg_index], cwd)
+                if path is not None:
+                    yield path
             continue
 
         # A bare "/" token is pathlib's division operator in Python sources
@@ -226,7 +232,9 @@ def _iter_referenced_shell_scripts(
         # (#77131). Skip pure-separator tokens.
         if executable.strip("/"):
             if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
-                yield _resolve_terminal_script_path(executable, cwd)
+                path = _resolve_terminal_script_path(executable, cwd)
+                if path is not None:
+                    yield path
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
