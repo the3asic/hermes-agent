@@ -6,7 +6,9 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import pytest
 from pathlib import Path
 from unittest.mock import patch
@@ -1044,3 +1046,88 @@ class TestSessionDiff:
         assert result["success"] is True
         assert "feature.py" in result["diff"]
         assert "+x = 1" in result["diff"]
+
+
+class TestCheckpointStoreSerialization:
+    def test_writers_enter_repair_phase_one_at_a_time(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base,
+        )
+        active = 0
+        peak = 0
+        probe_lock = threading.Lock()
+
+        def repair_probe(_store):
+            nonlocal active, peak
+            with probe_lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.05)
+            with probe_lock:
+                active -= 1
+            return 0
+
+        monkeypatch.setattr(
+            "tools.checkpoint_manager._repair_invalid_loose_refs", repair_probe,
+        )
+        projects = []
+        for name in ("one", "two"):
+            project = tmp_path / name
+            project.mkdir()
+            (project / "main.py").write_text(f"name = {name!r}\n")
+            projects.append(project)
+
+        def take(project):
+            manager = CheckpointManager(
+                enabled=True, max_snapshots=5, max_total_size_mb=0,
+            )
+            return manager.ensure_checkpoint(str(project), "concurrent")
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(take, projects))
+
+        assert results == [True, True]
+        assert peak == 1
+
+    def test_invalid_loose_ref_is_quarantined_and_packed_tip_survives(
+        self, work_dir, checkpoint_base, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base,
+        )
+        manager = CheckpointManager(
+            enabled=True, max_snapshots=5, max_total_size_mb=0,
+        )
+        assert manager.ensure_checkpoint(str(work_dir), "baseline")
+
+        store = _store_path(checkpoint_base)
+        ref = _ref_name(_project_hash(str(work_dir)))
+        subprocess.run(
+            ["git", "--git-dir", str(store), "pack-refs", "--all"],
+            check=True, capture_output=True, text=True,
+        )
+        loose_ref = store / ref
+        loose_ref.parent.mkdir(parents=True, exist_ok=True)
+        loose_ref.write_text("0" * 40 + "\n", encoding="ascii")
+
+        manager.new_turn()
+        (work_dir / "main.py").write_text("print('recovered')\n")
+        assert manager.ensure_checkpoint(str(work_dir), "after repair")
+
+        resolved = subprocess.run(
+            ["git", "--git-dir", str(store), "rev-parse", "--verify", ref],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        assert resolved != "0" * 40
+        quarantined = list(
+            (checkpoint_base / "corrupt-refs").glob(
+                "*/refs/hermes/" + _project_hash(str(work_dir))
+            )
+        )
+        assert len(quarantined) == 1
+        subprocess.run(
+            ["git", "--git-dir", str(store), "fsck", "--no-reflogs"],
+            check=True, capture_output=True, text=True,
+        )

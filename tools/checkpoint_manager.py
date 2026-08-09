@@ -55,7 +55,10 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -70,6 +73,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 CHECKPOINT_BASE = get_hermes_home() / "checkpoints"
+_CHECKPOINT_THREAD_LOCK = threading.RLock()
 
 # Single shared store directory under CHECKPOINT_BASE.
 _STORE_DIRNAME = "store"
@@ -364,6 +368,117 @@ def _run_git(
     except Exception as exc:
         logger.error("Unexpected git error running %s: %s", " ".join(cmd), exc, exc_info=True)
         return False, "", str(exc)
+
+
+def _repair_invalid_loose_refs(store: Path) -> int:
+    """Quarantine invalid loose refs so an intact packed ref can surface.
+
+    A crash or an unsafe concurrent git gc --prune=now can leave a loose ref
+    pointing at an object that no longer exists. Git prefers loose refs over
+    packed refs, so one damaged file otherwise poisons every store-wide GC.
+    """
+    refs_root = store / _REFS_PREFIX
+    if not refs_root.exists():
+        return 0
+    ok, _, stderr = _run_git(
+        ["show-ref"], store, str(store.parent), allowed_returncodes={1, 128},
+    )
+    if ok or "bad ref" not in stderr.lower():
+        return 0
+    repaired = 0
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    quarantine_root = store.parent / "corrupt-refs" / stamp
+    for ref_path in refs_root.rglob("*"):
+        if not ref_path.is_file() or ref_path.is_symlink():
+            continue
+        try:
+            oid = ref_path.read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError):
+            oid = ""
+        object_ok = False
+        if re.fullmatch(r"[0-9a-fA-F]{40,64}", oid):
+            object_ok, _, _ = _run_git(
+                ["cat-file", "-e", f"{oid}^{{commit}}"],
+                store, str(store.parent), allowed_returncodes={1, 128},
+            )
+        if object_ok:
+            continue
+        relative = ref_path.relative_to(store)
+        quarantine_path = quarantine_root / relative
+        try:
+            quarantine_path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(ref_path, quarantine_path)
+            repaired += 1
+            logger.warning(
+                "Quarantined invalid checkpoint ref %s; packed history will be reused when valid",
+                relative.as_posix(),
+            )
+        except OSError as exc:
+            logger.error("Could not quarantine invalid checkpoint ref %s: %s", ref_path, exc)
+    if repaired:
+        ok, _, stderr = _run_git(
+            ["show-ref"], store, str(store.parent), allowed_returncodes={1, 128},
+        )
+        if not ok and "bad ref" in stderr.lower():
+            logger.error(
+                "Checkpoint store still contains an invalid packed ref after loose-ref repair: %s",
+                stderr,
+            )
+    return repaired
+
+
+@contextmanager
+def _checkpoint_store_lock(store: Path):
+    """Serialize shared-store writers across threads and processes."""
+    store.mkdir(parents=True, exist_ok=True)
+    lock_path = store / ".checkpoint-store.lock"
+    with _CHECKPOINT_THREAD_LOCK:
+        with lock_path.open("a+b") as handle:
+            try:
+                os.chmod(lock_path, 0o600)
+            except OSError:
+                pass
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                if handle.read(1) == b"":
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                _repair_invalid_loose_refs(store)
+                yield
+            finally:
+                if os.name == "nt":
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _serialized_default_store_write(func):
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        with _checkpoint_store_lock(_store_path(CHECKPOINT_BASE)):
+            return func(*args, **kwargs)
+    return wrapped
+
+
+def _serialized_checkpoint_maintenance(func):
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        base = kwargs.get("checkpoint_base")
+        if base is None and len(args) >= 3:
+            base = args[2]
+        with _checkpoint_store_lock(_store_path(base or CHECKPOINT_BASE)):
+            return func(*args, **kwargs)
+    return wrapped
 
 
 # ---------------------------------------------------------------------------
@@ -995,6 +1110,7 @@ class CheckpointManager:
     # Internal
     # ------------------------------------------------------------------
 
+    @_serialized_default_store_write
     def _take(self, working_dir: str, reason: str) -> bool:
         """Take a snapshot.  Returns True on success."""
         store = _store_path(CHECKPOINT_BASE)
@@ -1480,6 +1596,7 @@ def _dir_has_any_entry(directory: Path) -> bool:
     return False
 
 
+@_serialized_checkpoint_maintenance
 def prune_checkpoints(
     retention_days: int = 7,
     delete_orphans: bool = True,
