@@ -2288,6 +2288,24 @@ def terminal_tool(
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
                 "status": "error",
             }, ensure_ascii=False)
+        # CPython's subprocess/path APIs reject embedded NUL bytes with
+        # ``ValueError: embedded null byte``. Reject them before environment
+        # creation and lifecycle/security scanning so a malformed model tool
+        # call fails immediately and returns guidance it can act on. The two
+        # characters ``\\0`` remain valid shell text; only an actual NUL is
+        # rejected here.
+        if "\x00" in command:
+            logger.warning("Rejected terminal command containing an embedded NUL byte")
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": (
+                    "Invalid command: embedded NUL bytes cannot be executed. "
+                    "Use an escaped shell sequence such as \\\\0, or write binary "
+                    "data through a file/API instead."
+                ),
+                "status": "error",
+            }, ensure_ascii=False)
 
         # Get configuration
         config = _get_env_config()
