@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -232,6 +233,35 @@ def test_reader_loop_streams_incremental_chunks_from_read1(registry, monkeypatch
     assert session.exited is True
     assert session.exit_code == 0
     assert moved == ["proc_reader_live"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell redirection semantics")
+def test_reader_loop_does_not_mark_redirected_live_process_exited(registry, tmp_path):
+    """EOF from redirected stdout must not become ``exit_code=None``.
+
+    A background Codex command redirected all output into artifact files. Its
+    capture pipe reached EOF immediately while the worker PID kept running;
+    the reader's old five-second wait then timed out and emitted a false
+    completion notification with ``exit code None``.
+    """
+    output_path = tmp_path / "worker.log"
+    command = (
+        f"{shlex.quote(sys.executable)} -c "
+        f"{shlex.quote('import time; time.sleep(1.0)')} "
+        f"> {shlex.quote(str(output_path))} 2>&1"
+    )
+    session = registry.spawn_local(command=command)
+
+    # The capture pipe closes immediately because stdout/stderr were redirected,
+    # but the actual worker must remain tracked until its real process exit.
+    time.sleep(0.2)
+    assert session.process.poll() is None
+    assert session.exited is False
+    assert session.exit_code is None
+
+    assert _wait_until(lambda: session.exited, timeout=5.0)
+    assert session.exit_code == 0
+    assert session.id in registry._finished
 
 
 # =========================================================================
@@ -969,6 +999,22 @@ class TestProcessToolHandler:
 # =========================================================================
 
 from tools.process_registry import format_process_notification
+
+
+def test_format_process_notification_never_prints_exit_code_none():
+    text = format_process_notification({
+        "type": "completion",
+        "session_id": "proc_unknown_status",
+        "command": "worker > events.jsonl 2>stderr.log",
+        "exit_code": None,
+        "completion_reason": "exited",
+        "output": "",
+    })
+
+    assert text is not None
+    assert "exit code None" not in text
+    assert "is no longer running" in text
+    assert "exit status unavailable" in text
 
 
 def test_drain_notifications_completion_callback_exception_fails_closed(registry):

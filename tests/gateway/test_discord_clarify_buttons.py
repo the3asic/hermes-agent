@@ -195,6 +195,42 @@ class TestClarifyOtherButton:
         assert pending is None or pending.awaiting_text is False
 
 
+class TestClarifyChoiceTimeout:
+    """Expired buttons must degrade to a usable typed-answer prompt."""
+
+    def setup_method(self):
+        _clear_clarify_state()
+
+    @pytest.mark.asyncio
+    async def test_timeout_enables_text_fallback_and_updates_message(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("cid-timeout", "sk-timeout", "Pick", ["alpha", "beta"])
+        view = ClarifyChoiceView(
+            choices=["alpha", "beta"],
+            clarify_id="cid-timeout",
+            allowed_user_ids={"42"},
+        )
+        embed = MagicMock()
+        message = SimpleNamespace(embeds=[embed], edit=AsyncMock())
+        view._message = message
+
+        await view.on_timeout()
+
+        pending = cm.get_pending_for_session("sk-timeout")
+        assert pending is not None
+        assert pending.awaiting_text is True
+        assert all(child.disabled for child in view.children)
+        embed.set_footer.assert_called_once_with(
+            text="⏱ Buttons expired — reply with your answer"
+        )
+        message.edit.assert_awaited_once_with(embed=embed, view=view)
+
+        assert cm.resolve_text_response_for_session("sk-timeout", "继续") is True
+        assert pending.response == "继续"
+        assert pending.event.is_set()
+
+
 # ===========================================================================
 # DiscordAdapter.send_clarify integration
 # ===========================================================================

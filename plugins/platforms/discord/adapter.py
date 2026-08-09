@@ -9356,6 +9356,21 @@ def _define_discord_view_classes() -> None:
             self.resolved = True
             for child in self.children:
                 child.disabled = True
+            # Discord button views expire before the gateway's clarify wait
+            # (normally 5 minutes vs. agent.clarify_timeout, commonly 10-60
+            # minutes). Keep the pending question usable by switching it to
+            # text-capture mode: the user's next ordinary message can answer
+            # it instead of being rejected as unrelated prose while the old
+            # agent turn remains blocked.
+            try:
+                from tools.clarify_gateway import mark_awaiting_text
+                mark_awaiting_text(self.clarify_id)
+            except Exception:
+                logger.debug(
+                    "Discord clarify timeout failed to enable text fallback (id=%s)",
+                    self.clarify_id,
+                    exc_info=True,
+                )
             # Visually update the Discord message so buttons appear disabled.
             msg = getattr(self, '_message', None)
             if msg:
@@ -9363,7 +9378,7 @@ def _define_discord_view_classes() -> None:
                     embed = msg.embeds[0] if msg.embeds else None
                     if embed:
                         embed.color = discord.Color.greyple()
-                        embed.set_footer(text="⏱ Prompt expired — no action taken")
+                        embed.set_footer(text="⏱ Buttons expired — reply with your answer")
                     await msg.edit(embed=embed, view=self)
                 except Exception:
                     pass

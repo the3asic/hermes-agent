@@ -1058,11 +1058,22 @@ class ProcessRegistry:
                     _append_chunk(tail)
             except Exception:
                 pass
-            # Always reap the child to prevent zombie processes.
+            # Always reap the child to prevent zombie processes. EOF on our
+            # capture pipe does NOT prove the child exited: a shell command may
+            # redirect stdout/stderr to artifact files and then exec the real
+            # worker, leaving our pipe with no writers while the same Popen PID
+            # continues running. The old five-second wait timed out and still
+            # marked that live worker exited with ``returncode=None``.
+            #
+            # This reader thread owns completion tracking for local processes,
+            # so waiting for the actual child is intentional. The thread is a
+            # daemon and kill()/shutdown will terminate the child, unblocking
+            # wait normally.
             try:
-                session.process.wait(timeout=5)
+                session.process.wait()
             except Exception as e:
-                logger.debug("Process wait timed out or failed: %s", e)
+                logger.debug("Process wait failed: %s", e)
+                return
             session.exited = True
             if session.completion_reason != "killed":
                 session.exit_code = session.process.returncode
@@ -2392,11 +2403,18 @@ def format_process_notification(evt: dict) -> "str | None":
         _status = "failed to start"
     elif _exit == 0:
         _status = "completed normally"
+    elif _exit is None:
+        _status = "is no longer running"
     else:
         _status = "exited"
+    _exit_detail = (
+        "exit status unavailable"
+        if _exit is None
+        else f"exit code {_exit}{_signal}"
+    )
     return (
         f"[IMPORTANT: Background process {_sid} {_status} "
-        f"(exit code {_exit}{_signal}).\n"
+        f"({_exit_detail}).\n"
         f"Command: {_cmd}\n"
         f"Output:\n{_out}]"
     )

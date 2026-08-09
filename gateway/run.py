@@ -22176,10 +22176,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         new_output = redact_terminal_output(
                             new_output, getattr(session, "command", "") or ""
                         )
-                    message_text = (
-                        f"[Background process {session_id} finished with exit code {session.exit_code}~ "
-                        f"Here's the final output:\n{new_output}]"
-                    )
+                    if session.exit_code is None:
+                        message_text = (
+                            f"[Background process {session_id} is no longer running; "
+                            f"exit status is unavailable~ Here's the final output:\n{new_output}]"
+                        )
+                    else:
+                        message_text = (
+                            f"[Background process {session_id} finished with exit code {session.exit_code}~ "
+                            f"Here's the final output:\n{new_output}]"
+                        )
                     adapter = None
                     for p, a in self.adapters.items():
                         if p.value == platform_name:
