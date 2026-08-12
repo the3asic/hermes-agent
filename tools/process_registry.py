@@ -32,10 +32,13 @@ Usage:
 import codecs
 import json
 import logging
+import math
 import os
 import platform
+import re
 import shlex
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -55,11 +58,69 @@ logger = logging.getLogger(__name__)
 # Checkpoint file for crash recovery (gateway only)
 CHECKPOINT_PATH = get_hermes_home() / "processes.json"
 
+# Read-only, content-free snapshot for an external observability reader.  This
+# is deliberately separate from CHECKPOINT_PATH: processes.json is a private
+# crash-recovery checkpoint and is not an exporter contract.
+AGENT_RUNS_OBSERVABILITY_PATH = (
+    get_hermes_home() / "runtime" / "agent-runs-observability.json"
+)
+AGENT_RUNS_OBSERVABILITY_SCHEMA = "hermes.agent_runs_observability.v1"
+AGENT_RUNS_OBSERVATION_SCOPE = "orchestration"
+
 # Limits
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
 FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
 MAX_ACTIVE_PROCESS_AGE = 86400  # 24h default — see session_reset.bg_process_max_age_hours (#29177)
+MAX_OBSERVABILITY_RUNS = MAX_PROCESSES
+OBSERVABILITY_OUTPUT_WRITE_INTERVAL_SECONDS = 1.0
+
+_OBSERVABILITY_COMPLETION_REASONS = frozenset({
+    "exited",
+    "killed",
+    "lost",
+    "failed_start",
+    "already_exited",
+    "unknown",
+})
+_OBSERVABILITY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_OBSERVABILITY_HOST_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _safe_observability_timestamp(value: Any) -> Optional[float]:
+    """Return a finite positive timestamp, never a synthetic zero."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return number
+
+
+def _safe_observability_exit_code(value: Any) -> Optional[int]:
+    """Return a bounded integer exit code, preserving unknown as null."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < -(2 ** 31) or value > (2 ** 31 - 1):
+        return None
+    return value
+
+
+def _safe_observability_host_alias(value: Any) -> str:
+    """Validate the non-secret orchestration host label used for grouping."""
+    if not isinstance(value, str):
+        return "unknown"
+    alias = value.strip()
+    if not _OBSERVABILITY_HOST_ALIAS_RE.fullmatch(alias):
+        return "unknown"
+    return alias
+
+
+def _default_orchestration_host_alias() -> str:
+    try:
+        return _safe_observability_host_alias(socket.gethostname())
+    except Exception:
+        return "unknown"
 
 # Watch pattern rate limiting — PER SESSION.
 # Hard rule: at most ONE watch-match notification every WATCH_MIN_INTERVAL_SECONDS.
@@ -107,6 +168,9 @@ class ProcessSession:
     termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
     output_buffer: str = ""                     # Rolling output (last MAX_OUTPUT_CHARS)
     max_output_chars: int = MAX_OUTPUT_CHARS
+    ended_at: Optional[float] = None             # time.time() of terminal transition
+    last_output_at: Optional[float] = None       # None means no live output observation
+    output_history_available: Optional[bool] = True  # None after checkpoint recovery
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     # Watcher/notification metadata (persisted for crash recovery)
@@ -162,6 +226,10 @@ class ProcessRegistry:
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
+        self._snapshot_write_lock = threading.Lock()
+        self._snapshot_rate_limit_lock = threading.Lock()
+        self._snapshot_last_write_monotonic = 0.0
+        self._orchestration_host_alias = _default_orchestration_host_alias()
 
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
@@ -232,6 +300,34 @@ class ProcessRegistry:
             sink(session, chunk)
         except Exception:
             pass
+
+    def _record_output_observation(self, session: ProcessSession, chunk: str) -> None:
+        """Record content-free output availability and refresh the snapshot."""
+        if not chunk:
+            return
+        with session._lock:
+            first_output = session.last_output_at is None
+            session.last_output_at = time.time()
+            session.output_history_available = True
+        # First output is useful immediately. After that, cap snapshot writes so
+        # a noisy process cannot turn every pipe chunk into a filesystem write.
+        # Terminal transitions always force a final snapshot separately.
+        should_write = False
+        with self._snapshot_rate_limit_lock:
+            now = time.monotonic()
+            if (
+                first_output
+                or now - self._snapshot_last_write_monotonic
+                >= OBSERVABILITY_OUTPUT_WRITE_INTERVAL_SECONDS
+            ):
+                # Reserve this interval before releasing the lock. Without the
+                # reservation, concurrent reader threads can all observe the
+                # same stale timestamp and serialize a burst of redundant
+                # snapshot writes through _snapshot_write_lock.
+                self._snapshot_last_write_monotonic = now
+                should_write = True
+        if should_write:
+            self._write_observability_snapshot()
 
     def _check_watch_patterns(self, session: ProcessSession, new_text: str) -> None:
         """Scan new output for watch patterns and queue notifications.
@@ -505,6 +601,7 @@ class ProcessRegistry:
             if session.exited:
                 return session
             session.exited = True
+            session.ended_at = session.ended_at or time.time()
             # Recovered sessions no longer have a waitable handle, so the real
             # exit code is unavailable once the original process object is gone.
             session.exit_code = None
@@ -734,6 +831,7 @@ class ProcessRegistry:
                 user_shell = _find_shell()
                 pty_env = _sanitize_subprocess_env(os.environ, env_vars)
                 pty_env["PYTHONUNBUFFERED"] = "1"
+                pty_env["HERMES_PROCESS_ID"] = session.id
                 pty_proc = _PtyProcessCls.spawn(
                     [user_shell, "-lic", f"set +m; {safe_command}"],
                     cwd=session.cwd,
@@ -760,6 +858,7 @@ class ProcessRegistry:
                     self._running[session.id] = session
 
                 self._write_checkpoint()
+                self._write_observability_snapshot()
                 return session
 
             except ImportError:
@@ -776,6 +875,10 @@ class ProcessRegistry:
         # stdout is a pipe, hiding output from process(action="poll")).
         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
         bg_env["PYTHONUNBUFFERED"] = "1"
+        # Infrastructure-owned opaque join key for a cooperating remote runner.
+        # The child may carry this value to a remote process observation, while
+        # task text, commands, paths and chat metadata stay out of the contract.
+        bg_env["HERMES_PROCESS_ID"] = session.id
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
         proc = subprocess.Popen(
@@ -812,6 +915,7 @@ class ProcessRegistry:
                 self._running[session.id] = session
 
             self._write_checkpoint()
+            self._write_observability_snapshot()
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
             # descendants spawned via setsid) before re-raising so they do not
@@ -871,7 +975,10 @@ class ProcessRegistry:
         log_path = f"{temp_dir}/hermes_bg_{session.id}.log"
         pid_path = f"{temp_dir}/hermes_bg_{session.id}.pid"
         exit_path = f"{temp_dir}/hermes_bg_{session.id}.exit"
-        quoted_command = shlex.quote(command)
+        remote_command = (
+            f"export HERMES_PROCESS_ID={shlex.quote(session.id)}; {command}"
+        )
+        quoted_command = shlex.quote(remote_command)
         quoted_temp_dir = shlex.quote(temp_dir)
         quoted_log_path = shlex.quote(log_path)
         quoted_pid_path = shlex.quote(pid_path)
@@ -907,12 +1014,15 @@ class ProcessRegistry:
                 session.completion_reason = "failed_start"
                 session.termination_source = "failed_start"
                 session.output_buffer = result.get("output", "").strip()
+                if session.output_buffer:
+                    session.last_output_at = time.time()
         except Exception as e:
             session.exited = True
             session.exit_code = -1
             session.completion_reason = "failed_start"
             session.termination_source = "failed_start"
             session.output_buffer = f"Failed to start: {e}"
+            session.last_output_at = time.time()
 
         if not session.exited:
             # Start a poller thread that periodically reads the log file
@@ -929,9 +1039,18 @@ class ProcessRegistry:
             self._prune_if_needed()
             if not session.exited:
                 self._running[session.id] = session
+            else:
+                # A failed launch is still a real terminal lifecycle event.
+                # Retain it like other finished sessions so the next unrelated
+                # snapshot write cannot make the failure disappear.
+                self._finished[session.id] = session
+                session.ended_at = session.ended_at or time.time()
+                session._completion_event.set()
 
         if not session.exited:
             self._write_checkpoint()
+
+        self._write_observability_snapshot(extra_sessions=[session] if session.exited else None)
 
         return session
 
@@ -979,6 +1098,7 @@ class ProcessRegistry:
                 session.output_buffer += chunk
                 if len(session.output_buffer) > session.max_output_chars:
                     session.output_buffer = session.output_buffer[-session.max_output_chars:]
+            self._record_output_observation(session, chunk)
             self._check_watch_patterns(session, chunk)
             self._emit_output(session, chunk)
 
@@ -1103,6 +1223,7 @@ class ProcessRegistry:
                         if len(session.output_buffer) > session.max_output_chars:
                             session.output_buffer = session.output_buffer[-session.max_output_chars:]
                     if delta:
+                        self._record_output_observation(session, delta)
                         self._check_watch_patterns(session, delta)
                         self._emit_output(session, delta)
 
@@ -1151,6 +1272,7 @@ class ProcessRegistry:
                 session.output_buffer += text
                 if len(session.output_buffer) > session.max_output_chars:
                     session.output_buffer = session.output_buffer[-session.max_output_chars:]
+            self._record_output_observation(session, text)
             self._check_watch_patterns(session, text)
             self._emit_output(session, text)
 
@@ -1196,11 +1318,14 @@ class ProcessRegistry:
         with the reader thread), the second call is a no-op — no duplicate
         completion notification is enqueued.
         """
+        with session._lock:
+            session.ended_at = session.ended_at or time.time()
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
         session._completion_event.set()
         self._write_checkpoint()
+        self._write_observability_snapshot()
 
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
@@ -1442,6 +1567,8 @@ class ProcessRegistry:
             if session.completion_reason != "killed":
                 session.exit_code = rc
                 session.completion_reason = "exited"
+        if drained:
+            self._record_output_observation(session, drained)
         logger.info(
             "Reconciled session %s: direct child exited with code %s but reader "
             "was still blocked (orphaned pipe). Flipped to exited.",
@@ -1463,6 +1590,8 @@ class ProcessRegistry:
 
         with session._lock:
             output_preview = strip_ansi(session.output_buffer[-1000:]) if session.output_buffer else ""
+            if not session.detached:
+                session.output_history_available = True
 
         result = {
             "session_id": session.id,
@@ -1502,6 +1631,8 @@ class ProcessRegistry:
 
         with session._lock:
             full_output = strip_ansi(session.output_buffer)
+            if not session.detached:
+                session.output_history_available = True
 
         lines = full_output.splitlines()
         total_lines = len(lines)
@@ -1719,6 +1850,7 @@ class ProcessRegistry:
                         "its original runtime handle is no longer available"
                     ),
                 }
+            killed_at = time.time()
             # Capture output before marking consumed, then mark consumed before
             # exposing ``exited`` to watcher tasks. This closes the delayed
             # notification race without discarding the terminal transcript.
@@ -1730,6 +1862,7 @@ class ProcessRegistry:
                 session.exit_code = -15  # SIGTERM
                 session.completion_reason = "killed"
                 session.termination_source = source
+                session.ended_at = killed_at
             self._move_to_finished(session)
             self._write_checkpoint()
             return {
@@ -2064,6 +2197,106 @@ class ProcessRegistry:
 
     # ----- Checkpoint (crash recovery) -----
 
+    @staticmethod
+    def _observability_run_entry(session: ProcessSession) -> dict:
+        """Build one bounded, content-free orchestration lifecycle record."""
+        proc_id = session.id if (
+            isinstance(session.id, str)
+            and _OBSERVABILITY_ID_RE.fullmatch(session.id)
+        ) else "unknown"
+        state = "finished" if session.exited else "running"
+        reason = str(session.completion_reason or "unknown").lower()
+        if not session.exited or reason not in _OBSERVABILITY_COMPLETION_REASONS:
+            reason = None if not session.exited else "unknown"
+
+        with session._lock:
+            started_at = _safe_observability_timestamp(session.started_at)
+            ended_at = (
+                _safe_observability_timestamp(session.ended_at)
+                if session.exited else None
+            )
+            last_output_at = _safe_observability_timestamp(session.last_output_at)
+            history_available = session.output_history_available
+            if not isinstance(history_available, bool):
+                history_available = None
+            output_available = None
+            if history_available is True:
+                output_available = bool(session.output_buffer)
+
+        return {
+            "proc_id": proc_id,
+            "orchestration_state": state,
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "exit_code": (
+                _safe_observability_exit_code(session.exit_code)
+                if session.exited else None
+            ),
+            "completion_reason": reason,
+            "last_output_at": last_output_at,
+            "last_output_available": output_available,
+            "output_history_available": history_available,
+        }
+
+    def _write_observability_snapshot(
+        self,
+        *,
+        extra_sessions: Optional[List[ProcessSession]] = None,
+    ) -> None:
+        """Atomically publish the ProcessRegistry-owned read-only snapshot.
+
+        The snapshot describes orchestration only.  It intentionally carries
+        neither a PID nor resource counters, because a local PID may be an SSH
+        wrapper while execution happens on another machine.  A separate remote
+        observer joins on the opaque ``proc_id`` and remains authoritative for
+        remote execution identity and resource use.
+        """
+        try:
+            with self._snapshot_write_lock:
+                with self._lock:
+                    tracked = list(self._running.values()) + list(self._finished.values())
+                by_id = {session.id: session for session in tracked}
+                for session in extra_sessions or ():
+                    by_id.setdefault(session.id, session)
+                sessions = sorted(
+                    by_id.values(),
+                    key=lambda item: (
+                        _safe_observability_timestamp(item.started_at) or 0.0,
+                        str(item.id),
+                    ),
+                )[-MAX_OBSERVABILITY_RUNS:]
+
+                generated_at = time.time()
+                snapshot = {
+                    "schema_version": AGENT_RUNS_OBSERVABILITY_SCHEMA,
+                    "observation_scope": AGENT_RUNS_OBSERVATION_SCOPE,
+                    "orchestration_host_alias": _safe_observability_host_alias(
+                        self._orchestration_host_alias
+                    ),
+                    "generated_at": generated_at,
+                    "freshness": {
+                        "observed_at": generated_at,
+                        "max_age_seconds": None,
+                    },
+                    "runs": [self._observability_run_entry(session) for session in sessions],
+                }
+
+                path = AGENT_RUNS_OBSERVABILITY_PATH
+                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                try:
+                    path.parent.chmod(0o700)
+                except OSError:
+                    pass
+                from utils import atomic_json_write
+                atomic_json_write(path, snapshot, mode=0o600, sort_keys=True)
+                self._snapshot_last_write_monotonic = time.monotonic()
+        except Exception as exc:
+            logger.debug(
+                "Failed to write agent-runs observability snapshot: %s",
+                exc,
+                exc_info=True,
+            )
+
     def _write_checkpoint(self):
         """Write running process metadata to checkpoint file atomically."""
         try:
@@ -2163,6 +2396,8 @@ class ProcessRegistry:
                 pid_scope=pid_scope,
                 cwd=entry.get("cwd"),
                 started_at=entry.get("started_at", time.time()),
+                last_output_at=None,
+                output_history_available=None,
                 detached=True,  # Can't read output, but can report status + kill
                 watcher_platform=entry.get("watcher_platform", ""),
                 watcher_chat_id=entry.get("watcher_chat_id", ""),
@@ -2195,6 +2430,7 @@ class ProcessRegistry:
                 })
 
         self._write_checkpoint()
+        self._write_observability_snapshot()
 
         return recovered
 
