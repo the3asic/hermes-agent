@@ -5975,12 +5975,12 @@ def _get_cached_client(
     if client is not None and _aux_probe_active():
         # Availability probes answer "resolvable?" and must leave the cache untouched: the
         # probe stub (bare, or wrapped in a Codex/Anthropic adapter whose leaf is the stub)
-        # shares the runtime key, and a cached one is served to every later caller.
+        # shares the runtime key, and a cached one is served to every later caller — the
+        # next probe dies in _compat_model() on stub attribute access, so check_fns flip to
+        # False and vision tools vanish for the process lifetime (#87654).
         return client, model or default_model
     if client is not None:
         with _client_cache_lock:
-            if isinstance(client, _AuxProbeClientStub):
-                return client, default_model
             if cache_key not in _client_cache:
                 # FIFO safety-belt eviction. Do NOT close evicted clients: another caller may be
                 # mid-request on one; refcount/GC handles it.
