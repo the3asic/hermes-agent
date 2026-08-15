@@ -1171,7 +1171,13 @@ def _annotate_lightpanda_fallback(result: Dict[str, Any], reason: str) -> Dict[s
 
 
 def _copy_fallback_warning(target: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
-    """Copy browser fallback metadata from an internal result into a tool response."""
+    """Copy browser metadata that must survive high-level response shaping."""
+    # agent-browser 0.34 returns recovery metadata with strict tab pinning.
+    # Preserve it for the model, but do not automatically adopt or open a tab.
+    if result.get("code") == "tab_gone":
+        target["code"] = "tab_gone"
+        if "data" in result:
+            target["data"] = result["data"]
     if result.get("fallback_warning"):
         target["fallback_warning"] = result["fallback_warning"]
         target["browser_engine"] = result.get("browser_engine")
@@ -2839,15 +2845,20 @@ def _run_browser_command(
         logger.warning("Failed to create browser session for task=%s: %s", task_id, e)
         return {"success": False, "error": f"Failed to create browser session: {str(e)}"}
 
-    # Build the command with the appropriate backend flag.
-    # Cloud mode: --cdp <websocket_url> connects to Browserbase.
+    # Build the command with the appropriate backend flags.
+    # CDP mode: the per-task named session pins one target on the shared endpoint.
     # Local mode: --session <name> launches a local headless Chromium.
     # The rest of the command (--json, command, args) is identical.
     if session_info.get("cdp_url"):
-        # Cloud mode — connect to remote Browserbase browser via CDP
-        # IMPORTANT: Do NOT use --session with --cdp. In agent-browser >=0.13,
-        # --session creates a local browser instance and silently ignores --cdp.
-        backend_args = ["--cdp", session_info["cdp_url"]]
+        # agent-browser 0.34+ supports this combination: --pin-tab persists a
+        # target binding for the named session instead of adopting another tab.
+        backend_args = [
+            "--session",
+            session_info["session_name"],
+            "--cdp",
+            session_info["cdp_url"],
+            "--pin-tab",
+        ]
     else:
         # Local mode — launch Chromium (headless by default, headed when configured)
         backend_args = ["--session", session_info["session_name"]]
@@ -3524,10 +3535,11 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
 
         return json.dumps(response, ensure_ascii=False)
     else:
-        return json.dumps({
+        response = {
             "success": False,
             "error": result.get("error", "Navigation failed")
-        }, ensure_ascii=False)
+        }
+        return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
 def browser_snapshot(
@@ -3926,6 +3938,20 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
 
     console_result = _run_browser_command(effective_task_id, "console", console_args)
     errors_result = _run_browser_command(effective_task_id, "errors", error_args)
+
+    # The normal console path tolerates one unavailable stream and returns the
+    # other. A pinned tab disappearing is different: both streams refer to the
+    # same invalid binding, so surface its structured recovery metadata.
+    for command_result in (console_result, errors_result):
+        if command_result.get("code") == "tab_gone":
+            response = {
+                "success": False,
+                "error": command_result.get("error", "Pinned browser tab is gone"),
+            }
+            return json.dumps(
+                _copy_fallback_warning(response, command_result),
+                ensure_ascii=False,
+            )
 
     messages = []
     if console_result.get("success"):
