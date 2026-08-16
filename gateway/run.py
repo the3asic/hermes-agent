@@ -25364,7 +25364,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             f"[Background process {session_id} is no longer running; "
                             f"exit status is unavailable~ Here's the final output:\n{new_output}]"
                         )
-                        )
                     else:
                         message_text = (
                             f"[Background process {session_id} finished with exit code {session.exit_code}~ "

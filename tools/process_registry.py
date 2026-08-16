@@ -2898,7 +2898,7 @@ class ProcessRegistry:
                 })
 
         self._write_checkpoint(extra_entries=unresolved_scope_entries)
-
+        self._write_observability_snapshot()
 
         return recovered
 
