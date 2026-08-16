@@ -55,8 +55,9 @@ import json
 import logging
 import os
 import re
-import subprocess
 import shutil
+import signal
+import subprocess
 import sys
 import tempfile
 import threading

@@ -74,11 +74,6 @@ _ALLOWED: dict[tuple[str, str], str] = {
         "Fallback after resolve_uv(), plus the except-branch for the "
         "hermes_cli import guard."
     ),
-    ("tools/browser_use_cli.py", "uv"): (
-        "install_cli()'s fallback after ensure_uv() misses — a user-installed "
-        "uv on PATH is a legitimate last rung before giving up with install "
-        "guidance."
-    ),
     ("tools/browser_tool.py", "node"): (
         "Capability preflight must inspect the Node that a concrete agent-browser "
         "candidate will execute from its own directory plus the exact subprocess "
