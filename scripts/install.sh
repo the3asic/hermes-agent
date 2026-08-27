@@ -786,6 +786,102 @@ check_git() {
     exit 1
 }
 
+# Node deps below (install_node_deps) build native addons — most notably
+# node-pty, which every install needs — via node-gyp. node-gyp needs a C/C++
+# toolchain (make + a compiler); Python and make are already covered by
+# check_python/check_node's prerequisites, but the compiler itself was never
+# checked, so a missing g++/clang++ only surfaced as a wall of node-gyp/make
+# output deep inside `npm install`, with no earlier, actionable warning.
+# Best-effort like install_system_packages: warns and lets the caller decide
+# whether to proceed rather than aborting the whole install (unlike git,
+# which is hard-required much earlier for clone_repo).
+check_cxx_compiler() {
+    log_info "Checking for a C++ compiler (needed to build native Node modules like node-pty)..."
+
+    if command -v g++ &> /dev/null || command -v clang++ &> /dev/null; then
+        log_success "C++ compiler found"
+        HAS_CXX_COMPILER=true
+        return 0
+    fi
+
+    HAS_CXX_COMPILER=false
+    log_warn "No C++ compiler found"
+
+    case "$OS" in
+        macos)
+            # Same Command Line Tools path as attempt_install_git — CLT provides
+            # git AND a compiler, so this is usually already satisfied by the
+            # check_git step above. Handles the case where git was present
+            # without CLT (e.g. installed via Homebrew) so CLT never triggered.
+            log_info "Attempting to install Xcode Command Line Tools (provides a C++ compiler)..."
+            log_info "If a macOS dialog appears, click \"Install\" and accept the license."
+            xcode-select --install >/dev/null 2>&1 || true
+            local waited=0
+            local timeout=900
+            while [ "$waited" -lt "$timeout" ]; do
+                if command -v g++ &> /dev/null || command -v clang++ &> /dev/null; then
+                    log_success "C++ compiler installed"
+                    HAS_CXX_COMPILER=true
+                    return 0
+                fi
+                sleep 5
+                waited=$((waited + 5))
+                if [ $((waited % 60)) -eq 0 ]; then
+                    log_info "Still waiting for Command Line Tools install ($((waited / 60))m)..."
+                fi
+            done
+            ;;
+        linux)
+            local sudo_cmd=""
+            if [ "$(id -u 2>/dev/null || echo 1000)" -ne 0 ]; then
+                command -v sudo >/dev/null 2>&1 && sudo_cmd="sudo"
+            fi
+            log_info "Attempting to install a C++ compiler automatically..."
+            case "$DISTRO" in
+                ubuntu|debian)
+                    log_info "Installing build-essential via apt..."
+                    $sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+                    $sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential >/dev/null 2>&1 || true
+                    ;;
+                fedora)
+                    log_info "Installing gcc-c++ via dnf..."
+                    $sudo_cmd dnf install -y gcc-c++ >/dev/null 2>&1 || true
+                    ;;
+                arch)
+                    log_info "Installing base-devel via pacman..."
+                    $sudo_cmd pacman -S --noconfirm base-devel >/dev/null 2>&1 || true
+                    ;;
+            esac
+            if command -v g++ &> /dev/null || command -v clang++ &> /dev/null; then
+                log_success "C++ compiler installed"
+                HAS_CXX_COMPILER=true
+                return 0
+            fi
+            ;;
+    esac
+
+    log_warn "Could not install a C++ compiler automatically."
+    log_warn "Node steps that compile native modules (e.g. node-pty) will fail below until one is installed."
+    log_info "Install it manually, then re-run this installer:"
+    case "$OS" in
+        linux)
+            case "$DISTRO" in
+                ubuntu|debian) log_info "  sudo apt install build-essential" ;;
+                fedora)        log_info "  sudo dnf install gcc-c++" ;;
+                arch)          log_info "  sudo pacman -S base-devel" ;;
+                *)             log_info "  Install a C++ compiler (g++/gcc-c++) via your package manager" ;;
+            esac
+            ;;
+        android)
+            log_info "  pkg install clang"
+            ;;
+        macos)
+            log_info "  xcode-select --install"
+            ;;
+    esac
+    return 1
+}
+
 # The dependency tree's real Node floor is >=22.22.0, set by react-router 8.3.0
 # (`engines.node`), with Vite ^8 next at `^20.19 || >=22.12`. Keep this in sync
 # with the root package.json — a gate looser than the manifest lets an install
@@ -2501,6 +2597,37 @@ install_browser_use_cli() {
     fi
 }
 
+cua_driver_runtime_compatible() {
+    local driver_path version_output manifest_output
+    local major minor
+    driver_path="$(command -v cua-driver 2>/dev/null)" || return 1
+    version_output="$("$driver_path" --version 2>/dev/null)" || return 1
+    if [[ ! "$version_output" =~ ([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+        return 1
+    fi
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+    if (( major == 0 && minor < 20 )); then
+        return 1
+    fi
+    manifest_output="$("$driver_path" manifest 2>/dev/null)" || return 1
+    local required
+    for required in \
+        '"mcp_invocation"' \
+        '"--socket"' \
+        '"--grant"' \
+        '"--permission-mode"' \
+        '"--capability-manifest"' \
+        '"--approve-capability-manifest"' \
+        '"--embedded"'; do
+        case "$manifest_output" in
+            *"$required"*) ;;
+            *) return 1 ;;
+        esac
+    done
+    return 0
+}
+
 install_computer_use_driver() {
     # cua-driver powers the computer_use toolset (background desktop control).
     # Provision it at install time so enabling the tool later — via
@@ -2519,8 +2646,11 @@ install_computer_use_driver() {
             ;;
     esac
     if command -v cua-driver >/dev/null 2>&1; then
-        log_success "Computer Use driver (cua-driver) already installed"
-        return 0
+        if cua_driver_runtime_compatible; then
+            log_success "Computer Use driver (cua-driver) already installed and compatible"
+            return 0
+        fi
+        log_warn "Existing cua-driver is old or incomplete; repairing it"
     fi
     # Non-admin macOS accounts can't receive the CuaDriver.app bundle in
     # /Applications; skip cleanly instead of failing loudly (#47865 class).
@@ -3323,6 +3453,7 @@ run_stage_body() {
             check_python
             check_git
             check_node
+            check_cxx_compiler
             check_network_prerequisites
             install_system_packages
             ;;
@@ -3465,6 +3596,7 @@ main() {
     check_python
     check_git
     check_node
+    check_cxx_compiler
     check_network_prerequisites
     install_system_packages
 
