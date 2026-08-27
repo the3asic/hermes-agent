@@ -637,6 +637,46 @@ class TestDiscordSkillCmdKeyDispatch:
 class TestTelegramMenuCommands:
     """Integration: telegram_menu_commands enforces the 32-char limit."""
 
+    def test_configured_priority_skill_survives_menu_cap(self, tmp_path, monkeypatch):
+        """A prioritized skill must be sorted before skill-slot trimming."""
+        from unittest.mock import patch
+
+        local_dir = tmp_path / "skills"
+        local_dir.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    extra:\n"
+            "      command_menu:\n"
+            "        priority: z-skill\n"
+        )
+        fake_cmds = {
+            "/a-skill": {
+                "name": "a-skill",
+                "description": "Alphabetically first",
+                "skill_md_path": f"{local_dir}/a-skill/SKILL.md",
+                "skill_dir": f"{local_dir}/a-skill",
+            },
+            "/z-skill": {
+                "name": "z-skill",
+                "description": "Explicitly prioritized",
+                "skill_md_path": f"{local_dir}/z-skill/SKILL.md",
+                "skill_dir": f"{local_dir}/z-skill",
+            },
+        }
+
+        with (
+            patch("hermes_cli.commands.telegram_bot_commands", return_value=[("help", "Help")]),
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+        ):
+            menu, hidden = telegram_menu_commands(max_commands=2)
+
+        assert [name for name, _desc in menu] == ["help", "z_skill"]
+        assert hidden == 1
+
 
 
 
