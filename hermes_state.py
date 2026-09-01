@@ -78,6 +78,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     escape_like as _escape_like,
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
+    FTS_STALE_HEALTH_REASON,
     FTS_REBUILD_DEFERRAL_KEY,
     FTS_SQL,
     FTS_STALE_KEY,
@@ -3300,6 +3301,22 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         # working), so tokenizer absence must never classify as corruption.
         load_fts5_cjk_extension(conn)
         conn.execute("PRAGMA journal_mode").fetchone()
+
+        # A stale marker is the durable handoff from live fail-open to the
+        # explicit offline repair command. Check it before integrity/FTS
+        # probes: the detached index is expected to remain corrupt until that
+        # command runs, and scanning it first would hide the actionable state
+        # behind a generic malformed-page error.
+        try:
+            if conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+                (FTS_STALE_KEY,),
+            ).fetchone():
+                return FTS_STALE_HEALTH_REASON
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+
         rows = conn.execute("PRAGMA integrity_check").fetchall()
         problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
         if problems:
@@ -3698,7 +3715,8 @@ def _repair_state_db_schema_locked(
     # repaired the file, in which case redoing the surgery would undo its
     # work on a now-healthy DB (the repair/re-corrupt cascade this lock
     # exists to break).
-    if _db_opens_cleanly(db_path) is None:
+    probe_reason = _db_opens_cleanly(db_path)
+    if probe_reason is None:
         report["repaired"] = True
         report["strategy"] = "already_healthy"
         return report
@@ -3765,7 +3783,27 @@ def _repair_state_db_schema_locked(
             # full disks, I/O, permission and lock failures are environmental
             # aborts, not evidence that the strategy cannot repair this image.
             report["_repair_attempted"] = True
-            _run_repair_strategies(scratch, report)
+            if probe_reason == FTS_STALE_HEALTH_REASON:
+                # A live SessionDB deliberately detached corrupt FTS triggers
+                # and left a durable marker. Rebuild only inside this explicit
+                # offline repair, and do it on the isolated snapshot before
+                # transactional promotion to the live database.
+                try:
+                    repair_db = SessionDB(
+                        db_path=scratch, allow_fts_rebuild=True
+                    )
+                    repair_db.close()
+                    if _db_opens_cleanly(scratch) is None:
+                        report["repaired"] = True
+                        report["strategy"] = "rebuild_stale_fts_offline"
+                except sqlite3.DatabaseError as exc:
+                    logger.warning(
+                        "state.db explicit stale-FTS rebuild failed on the "
+                        "repair snapshot: %s",
+                        exc,
+                    )
+            if not report.get("repaired"):
+                _run_repair_strategies(scratch, report)
             if report.get("repaired"):
                 try:
                     # Do not os.replace the live DB: Windows rejects
@@ -3947,7 +3985,7 @@ def _run_repair_strategies(
     except sqlite3.DatabaseError as exc:
         logger.warning("state.db dedup repair pass failed: %s", exc)
 
-    # ── Strategy 2: drop all FTS schema, VACUUM, rebuild on next open ──
+    # ── Strategy 2: drop all FTS schema, VACUUM, defer rebuild ──
     #
     # The destructive one, and the reason this whole path now runs on a
     # scratch copy. VACUUM rebuilds the file from the schema SQLite can still
@@ -3972,14 +4010,39 @@ def _run_repair_strategies(
             conn.close()
         reason = _db_opens_cleanly(db_path)
         if reason is None:
-            report["repaired"] = True
-            report["strategy"] = "drop_fts_rebuild"
-            logger.warning(
-                "state.db schema repaired by dropping FTS schema; indexes "
-                "will rebuild from messages on next open: %s", db_path
-            )
-            return report
-        report["error"] = reason
+            # The canonical database is healthy, but rebuilding a multi-GB
+            # derived index is intentionally not moved back onto gateway
+            # startup. Persist the stale marker on this safe snapshot and
+            # promote the degraded-but-writable database transactionally.
+            try:
+                marker_conn = _connect_repair_durable(db_path)
+                try:
+                    marker_conn.execute(
+                        "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (FTS_STALE_KEY,),
+                    )
+                    marker_conn.commit()
+                finally:
+                    marker_conn.close()
+            except sqlite3.DatabaseError as marker_exc:
+                report["error"] = str(marker_exc)
+                logger.warning(
+                    "Could not persist stale FTS marker after drop: %s",
+                    marker_exc,
+                )
+            else:
+                report["repaired"] = True
+                report["strategy"] = "drop_fts_deferred"
+                report["error"] = None
+                logger.warning(
+                    "state.db canonical tables repaired; corrupt FTS indexes "
+                    "remain detached for explicit offline rebuild: %s",
+                    db_path,
+                )
+                return report
+        else:
+            report["error"] = reason
     except sqlite3.DatabaseError as exc:
         report["error"] = str(exc)
 
@@ -4804,13 +4867,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception:
             logger.debug("Could not close a SessionDB connection", exc_info=True)
 
-    def __init__(self, db_path: Path = None, read_only: bool = False):
+    def __init__(
+        self,
+        db_path: Path = None,
+        read_only: bool = False,
+        *,
+        allow_fts_rebuild: bool = False,
+    ):
         self.db_path = db_path or _default_db_path()
         # Fail hard (before any connection/pragma/mkdir) if a pytest-context
         # process resolved the developer's production state.db — see the
         # live-DB test-isolation guard block near _default_db_path().
         _ensure_test_isolation(self.db_path)
         self.read_only = read_only
+        # Full FTS rebuild is an unbounded maintenance operation. Only the
+        # explicit offline repair command opts in; ordinary gateway, desktop,
+        # CLI, and search opens always degrade to canonical LIKE search.
+        self._allow_fts_rebuild = bool(allow_fts_rebuild)
 
         self._lock = threading.Lock()
         # Read-path split (WAL only): recall/browse queries borrow a
@@ -5786,12 +5859,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     continue
                 # Corrupt FTS shadow tables make every write raise the
                 # malformed/corrupt error class through the FTS sync triggers
-                # while the canonical messages table is intact. Never run a
-                # full-message FTS5 rebuild from this live persistence path:
-                # on a multi-gigabyte state.db that can hold the writer lock
-                # for minutes. Atomically detach the derived indexes instead,
-                # then retry the canonical write. The existing stale-open and
-                # explicit repair paths retain rebuild ownership.
+                # while the canonical messages table is intact. Recover here,
+                # at the shared persistence boundary, so every caller gets the
+                # same guarantee. First try the cheap in-place repair. If that
+                # one-shot path is unavailable or corruption recurs, detach the
+                # derived indexes and retry against the canonical tables.
+                if self._try_runtime_fts_rebuild(exc):
+                    continue
+                if self._fts_stale or not self._fts_enabled:
+                    continue
                 if self._enter_fts_fail_open(exc):
                     continue
                 raise
@@ -6016,6 +6092,84 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 pass
         return signalled
 
+    def _try_runtime_fts_rebuild(self, exc: sqlite3.DatabaseError) -> bool:
+        """One-shot in-place FTS rebuild after a corrupt-index write failure.
+
+        Returns True when a rebuild was performed and the failed write should
+        be retried; False when the error isn't the FTS-corruption class, FTS
+        is disabled, or a rebuild was already attempted for this instance.
+
+        Live gateways do not rebuild here. FTS5 ``'rebuild'`` scans every
+        canonical message while holding the SQLite write lock; on the
+        production 9GB store that turned one bad search index into a 15-minute
+        message outage and then a gateway crash. The default path detaches
+        the derived indexes and retries the canonical write. An explicit
+        offline maintenance command can rebuild them later. The environment
+        switch is retained only as an emergency escape hatch for small,
+        disposable profiles by constructing ``SessionDB(...,
+        allow_fts_rebuild=True)`` from an offline maintenance command.
+        """
+        if self._fts_runtime_rebuild_attempted:
+            return False
+        if not self._fts_enabled:
+            return False
+        if not self._is_fts_write_corruption_error(exc):
+            return False
+        # Set the one-shot flag before the foreign-holder check: even when
+        # the rebuild is skipped, the fail-open path that follows persists
+        # the FTS_STALE_KEY marker so the next process startup will retry
+        # via _recover_stale_fts (which has its own holder guard). Setting
+        # the flag here also avoids re-running the expensive psutil scan on
+        # every subsequent corrupted write through this instance.
+        self._fts_runtime_rebuild_attempted = True
+        if not self._allow_fts_rebuild:
+            logger.warning(
+                "state.db FTS corruption detected; deferring index rebuild to "
+                "explicit offline maintenance and keeping canonical writes "
+                "available."
+            )
+            self._enter_fts_fail_open(exc)
+            return False
+
+        # The explicit override is intended for offline maintenance or small,
+        # disposable profiles. Even then, refuse an in-place rebuild while a
+        # foreign process still holds the database or its WAL sidecars.
+        foreign_holders = self._foreign_state_db_holders()
+        if foreign_holders:
+            logger.warning(
+                "Skipping automatic state.db FTS rebuild while foreign "
+                "processes hold the database or WAL sidecars (%s); detaching "
+                "FTS sync so canonical writes can continue.",
+                foreign_holders,
+            )
+            self._enter_fts_fail_open(exc)
+            return False
+        logger.warning(
+            "state.db write failed with an FTS-corruption error (%s) — "
+            "attempting one-shot in-place FTS rebuild; canonical message "
+            "rows are preserved.", exc,
+        )
+        try:
+            rebuilt = self.rebuild_fts()
+        except Exception as rebuild_exc:
+            logger.error(
+                "In-place FTS rebuild failed (%s); the database needs the "
+                "full offline repair path (repair_state_db_schema).",
+                rebuild_exc,
+            )
+            return False
+        if not rebuilt:
+            logger.error(
+                "In-place FTS rebuild made no progress; the database needs "
+                "the full offline repair path (repair_state_db_schema)."
+            )
+            return False
+        logger.warning(
+            "state.db FTS indexes rebuilt in place (%d); retrying the failed write.",
+            rebuilt,
+        )
+        return True
+
     def _enter_fts_fail_open(self, exc: sqlite3.DatabaseError) -> bool:
         """Detach corrupt FTS indexes so canonical writes can continue.
 
@@ -6068,7 +6222,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         logger.error(
             "state.db FTS indexes remain corrupt (%s); disabled FTS sync and "
             "retrying the canonical write. Search temporarily uses LIKE until "
-            "a later SessionDB open rebuilds the indexes.",
+            "the explicit hermes sessions repair command rebuilds them.",
             exc,
         )
         return True

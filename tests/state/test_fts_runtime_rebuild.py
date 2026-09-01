@@ -8,9 +8,10 @@ the in-memory session advanced while disk silently fell behind — surfacing
 later as "Persisted transcript lagged live cached history" amnesia.
 
 The fix records a durable stale marker, detaches the FTS sync triggers, and
-retries the canonical write immediately. Live search degrades to canonical
-``LIKE`` queries. The existing guarded stale-open or explicit repair path may
-rebuild later, outside the failed live write/search operation.
+retries the canonical write immediately. Search degrades to ``LIKE`` and
+ordinary opens keep the derived indexes detached. Only the explicit offline
+repair path may perform the unbounded full-message rebuild and restore the
+triggers.
 """
 
 import json
@@ -30,6 +31,7 @@ from hermes_state import (
     SCHEMA_SQL,
     SessionDB,
     _FTS_TRIGGERS,
+    repair_state_db_schema,
     _concrete_state_db_holder_pids,
     _is_inactive_orphan_desktop_holder,
 )
@@ -429,6 +431,7 @@ class TestRuntimeFtsRebuild:
 
         results = db.search_messages("needle")
 
+        assert db._fts_runtime_rebuild_attempted is True
         assert db._fts_stale is True
         assert _meta_value(db_path, FTS_STALE_KEY) == "1"
         assert _base_fts_triggers(db_path) == set()
@@ -459,13 +462,16 @@ class TestRuntimeFtsRebuild:
         # >=3 CJK chars per token → routed to the trigram branch.
         results = db.search_messages("大别山项目")
 
+        assert db._fts_runtime_rebuild_attempted is True
         assert db._fts_stale is True
         assert _meta_value(db_path, FTS_STALE_KEY) == "1"
         assert _base_fts_triggers(db_path) == set()
         assert results
         assert any("大别山项目" in (r.get("snippet") or "") for r in results)
 
-    def test_corruption_fails_open_and_rebuilds_on_reopen(self, db, tmp_path):
+    def test_corruption_stays_detached_until_explicit_offline_repair(
+        self, db, tmp_path
+    ):
         if not db._fts_enabled:
             pytest.skip("FTS5 unavailable in this build")
         db_path = tmp_path / "state.db"
@@ -486,18 +492,30 @@ class TestRuntimeFtsRebuild:
         assert results
         assert any("corruption survives" in row["snippet"] for row in results)
 
-        # A later open atomically rebuilds all canonical rows before triggers
-        # return, then clears the durable breadcrumb.
+        # Ordinary opens stay bounded and keep the derived indexes detached.
         db.close()
         reopened = SessionDB(db_path=db_path)
         try:
-            assert reopened._fts_stale is False
-            assert _meta_value(db_path, FTS_STALE_KEY) is None
-            assert _base_fts_triggers(db_path) == set(_FTS_TRIGGERS)
+            assert reopened._fts_stale is True
+            assert _meta_value(db_path, FTS_STALE_KEY) == "1"
+            assert _base_fts_triggers(db_path) == set()
             results = reopened.search_messages("corruption survives")
             assert results
         finally:
             reopened.close()
+
+        # The explicit repair path is allowed to perform the unbounded rebuild.
+        report = repair_state_db_schema(db_path, backup=False)
+        assert report["repaired"] is True
+        assert report["strategy"] == "rebuild_stale_fts_offline"
+        repaired = SessionDB(db_path=db_path)
+        try:
+            assert repaired._fts_stale is False
+            assert _meta_value(db_path, FTS_STALE_KEY) is None
+            assert _base_fts_triggers(db_path) == set(_FTS_TRIGGERS)
+            assert repaired.search_messages("corruption survives")
+        finally:
+            repaired.close()
 
     def test_non_fts_write_error_after_fail_open_raises_not_hangs(
         self, db, tmp_path
@@ -645,7 +663,7 @@ class TestRuntimeFtsRebuild:
             lambda self: [(4242, str(db_path) + "-wal")],
             raising=False,
         )
-        reopened = SessionDB(db_path=db_path)
+        reopened = SessionDB(db_path=db_path, allow_fts_rebuild=True)
         try:
             assert reopened._fts_stale is True
             assert _meta_value(db_path, FTS_STALE_KEY) == "1"
@@ -698,7 +716,7 @@ class TestRuntimeFtsRebuild:
         )
         monkeypatch.setattr(hermes_state_schema.time, "time", lambda: 120.0)
 
-        reopened = SessionDB(db_path=db_path)
+        reopened = SessionDB(db_path=db_path, allow_fts_rebuild=True)
         try:
             assert reaped == [(4242, str(db_path) + "-wal")]
             assert reopened._fts_stale is False
@@ -708,7 +726,9 @@ class TestRuntimeFtsRebuild:
         finally:
             reopened.close()
 
-    def test_legacy_inline_fts_fails_open_and_recovers(self, tmp_path, monkeypatch):
+    def test_legacy_inline_fts_waits_for_offline_repair(
+        self, tmp_path, monkeypatch
+    ):
         db_path = tmp_path / "legacy-state.db"
         raw = sqlite3.connect(str(db_path))
         raw.executescript(SCHEMA_SQL)
@@ -741,13 +761,11 @@ class TestRuntimeFtsRebuild:
 
         recovered = SessionDB(db_path=db_path)
         try:
-            assert recovered._fts_stale is False
-            assert _meta_value(db_path, FTS_STALE_KEY) is None
+            assert recovered._fts_stale is True
+            assert _meta_value(db_path, FTS_STALE_KEY) == "1"
             assert recovered.search_messages("canonical survives")
         finally:
             recovered.close()
-
-
 def _corrupt_canonical_btree(db_path):
     """Physically damage every ``messages`` table B-tree leaf page.
 

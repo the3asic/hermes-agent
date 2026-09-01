@@ -668,11 +668,11 @@ When a session expires:
 
 ## State database and FTS recovery
 
-The canonical transcript lives in the `sessions` and `messages` tables. FTS5
-tables and their sync triggers are derived indexes that can be detached and
-rebuilt without deleting canonical messages. See
-[`docs/state-db-recovery.md`](state-db-recovery.md) for the bounded live failure
-mode and the explicit repair procedure.
+The canonical transcript is stored in the sessions and messages tables. FTS5
+tables and their sync triggers are derived search indexes; they can be detached
+and rebuilt without deleting canonical messages. For the incident-safe online
+failure mode and the required stopped-gateway repair procedure, see
+[`docs/state-db-recovery.md`](state-db-recovery.md).
 
 ### Reset Policy (per-platform/type, in config.yaml)
 

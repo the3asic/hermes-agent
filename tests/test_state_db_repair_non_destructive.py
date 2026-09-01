@@ -115,6 +115,52 @@ def _make_repair_test_db(path: Path, *, journal_mode: str = "delete") -> None:
         conn.close()
 
 
+def test_drop_fts_fallback_publishes_degraded_offline_repair(
+    tmp_path, monkeypatch
+):
+    """The final scratch strategy may restore canonical writes without FTS.
+
+    It must publish a durable stale marker and report the degraded repair as
+    successful so the transactional caller can promote the safe snapshot.
+    Ordinary gateway startup then stays bounded and leaves the full derived
+    index rebuild to the next explicit offline repair.
+    """
+    db = tmp_path / "state.db"
+    _make_repair_test_db(db)
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            "CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT)"
+        )
+        conn.commit()
+
+    health_results = iter(
+        ("fts still corrupt", "btree still corrupt", "schema still corrupt", None)
+    )
+    monkeypatch.setattr(
+        hermes_state,
+        "_db_opens_cleanly",
+        lambda _path: next(health_results),
+    )
+    report = {
+        "repaired": False,
+        "strategy": None,
+        "backup_path": None,
+        "error": None,
+    }
+
+    result = hermes_state._run_repair_strategies(db, report)
+
+    assert result["repaired"] is True
+    assert result["strategy"] == "drop_fts_deferred"
+    with sqlite3.connect(str(db)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (hermes_state.FTS_STALE_KEY,),
+        ).fetchone() == ("1",)
+
+
 def _leave_hot_wal_row(db_path: str) -> None:
     """Commit a WAL frame, then die without letting sqlite3 close the DB."""
     conn = sqlite3.connect(db_path, isolation_level=None)

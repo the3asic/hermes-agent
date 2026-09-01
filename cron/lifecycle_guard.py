@@ -941,6 +941,7 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         # tokenized into a bogus script path by the recursion (#77703). A
         # guarded read must never crash the guard, so treat either as
         # "nothing to scan" (mirrors the resolve() ValueError guard below).
+
         return None, False
     try:
         metadata = os.fstat(descriptor)

@@ -41,7 +41,9 @@ def _install_command_stubs(monkeypatch, tmp_path, process):
     monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda _cmd: False)
     monkeypatch.setattr(bt, "_chromium_installed", lambda: True)
     monkeypatch.setattr(bt, "_start_browser_cleanup_thread", lambda: None)
-    monkeypatch.setattr(bt, "_ensure_cdp_supervisor", lambda _tid: None)
+    monkeypatch.setattr(
+        bt, "_ensure_cdp_supervisor", lambda _tid, **_kwargs: None
+    )
     monkeypatch.setattr(bt, "_stop_cdp_supervisor", lambda _tid: None)
     monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
     monkeypatch.setattr(bt, "_write_owner_pid", lambda *_args: None)
@@ -105,7 +107,9 @@ class TestNextUseRecycles:
         monkeypatch.setattr(bt, "_start_browser_cleanup_thread", lambda: None)
         monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
         monkeypatch.setattr(bt, "_get_cloud_provider", lambda: None)
-        monkeypatch.setattr(bt, "_ensure_cdp_supervisor", lambda _tid: None)
+        monkeypatch.setattr(
+            bt, "_ensure_cdp_supervisor", lambda _tid, **_kwargs: None
+        )
 
         cleanups = []
 
@@ -255,7 +259,9 @@ class TestFreshSessionClearsStaleFlag:
         monkeypatch.setattr(bt, "_start_browser_cleanup_thread", lambda: None)
         monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
         monkeypatch.setattr(bt, "_get_cloud_provider", lambda: None)
-        monkeypatch.setattr(bt, "_ensure_cdp_supervisor", lambda _tid: None)
+        monkeypatch.setattr(
+            bt, "_ensure_cdp_supervisor", lambda _tid, **_kwargs: None
+        )
         monkeypatch.setattr(
             bt, "_create_local_session", lambda _tid: {"session_name": "fresh"}
         )

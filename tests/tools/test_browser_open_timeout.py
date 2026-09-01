@@ -109,7 +109,11 @@ class TestCommandTimeoutRecovery:
         monkeypatch.setattr(bt, "_find_agent_browser", lambda: "agent-browser")
         monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda _cmd: False)
         monkeypatch.setattr(bt, "_start_browser_cleanup_thread", lambda: None)
-        monkeypatch.setattr(bt, "_ensure_cdp_supervisor", lambda _: supervisor_events.append("ensure"))
+        monkeypatch.setattr(
+            bt,
+            "_ensure_cdp_supervisor",
+            lambda _task_id, **_kwargs: supervisor_events.append("ensure"),
+        )
         monkeypatch.setattr(bt, "_stop_cdp_supervisor", lambda _: supervisor_events.append("stop"))
         monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
         monkeypatch.setattr(bt, "_write_owner_pid", lambda *_args: None)
@@ -136,7 +140,10 @@ class TestCommandTimeoutRecovery:
         monkeypatch.setattr(bt, "_get_cloud_provider", lambda: provider)
         bt.cleanup_browser(task_id)
         provider.close_session.assert_called_once_with("cloud-session-1")
-        assert supervisor_events == ["ensure", "stop", "stop"]
+        # Timeout eviction stops the poisoned supervisor once. The ABM task
+        # lifecycle fence then stops publication before cleanup and the exact
+        # session cleanup repeats the idempotent stop before provider teardown.
+        assert supervisor_events == ["ensure", "stop", "stop", "stop"]
 
     def test_stale_timeout_cannot_remove_concurrent_replacement(self, tmp_path):
         stale, replacement = {"session_name": "stale"}, {"session_name": "replacement"}
