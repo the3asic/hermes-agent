@@ -19172,6 +19172,7 @@ class TestResolveRuntimeWithFallback:
         assert resolution.runtime == expected
         assert resolution.selected_model is None
         assert resolution.used_fallback is False
+        assert resolution.fallback_entry is None
 
     def test_auth_error_tries_fallback_chain(self, monkeypatch):
         """On AuthError from primary, walk fallback_providers chain."""
@@ -19188,10 +19189,11 @@ class TestResolveRuntimeWithFallback:
             "hermes_cli.runtime_provider.resolve_runtime_provider",
             fake_resolve,
         )
+        fallback_entry = {"provider": "deepseek", "model": "deepseek-v4-pro"}
         monkeypatch.setattr(
             server,
             "_load_fallback_model",
-            lambda: [{"provider": "deepseek", "model": "deepseek-v4-pro"}],
+            lambda: [fallback_entry],
         )
         resolution = server._resolve_runtime_with_fallback(
             {"requested": "openai-codex"},
@@ -19199,6 +19201,7 @@ class TestResolveRuntimeWithFallback:
         assert resolution.runtime == fallback_runtime
         assert resolution.selected_model == "deepseek-v4-pro"
         assert resolution.used_fallback is True
+        assert resolution.fallback_entry == fallback_entry
 
     def test_auth_error_skips_provider_only_fallback(self, monkeypatch):
         """Auth fallback requires one complete provider/model pair."""
@@ -19345,7 +19348,11 @@ class TestResolveRuntimeWithFallback:
 
         def fake_agent(**kwargs):
             captured.update(kwargs)
-            return types.SimpleNamespace(model=kwargs.get("model"))
+            return types.SimpleNamespace(
+                model=kwargs.get("model"),
+                _primary_runtime={},
+                _runtime_reasoning_entry=None,
+            )
 
         monkeypatch.delenv("HERMES_MODEL", raising=False)
         monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
@@ -19355,8 +19362,16 @@ class TestResolveRuntimeWithFallback:
             "_load_cfg",
             lambda: {
                 "model": {"default": "gpt-5.5", "provider": "openai-codex"},
+                "agent": {
+                    "reasoning_effort": "medium",
+                    "reasoning_overrides": {"deepseek-v4-pro": "high"},
+                },
                 "fallback_providers": [
-                    {"provider": "deepseek", "model": "deepseek-v4-pro"},
+                    {
+                        "provider": "deepseek",
+                        "model": "deepseek-v4-pro",
+                        "reasoning_effort": "max",
+                    },
                 ],
             },
         )
@@ -19377,12 +19392,25 @@ class TestResolveRuntimeWithFallback:
                 "base_url": "https://chatgpt.com/backend-api/codex",
                 "api_key": "stale-codex-token",
             },
+            reasoning_config_override={"enabled": True, "effort": "low"},
         )
 
         assert agent.model == "deepseek-v4-pro"
         assert captured["provider"] == "deepseek"
         assert captured["base_url"] == "https://fallback.invalid/v1"
         assert captured["api_key"] == "fb-tok"
+        assert captured["reasoning_config"] == {
+            "enabled": True,
+            "effort": "max",
+        }
+        assert agent._runtime_reasoning_entry["reasoning_effort"] == "max"
+        assert agent._primary_runtime["reasoning_policy_entry"][
+            "reasoning_effort"
+        ] == "max"
+        assert agent._primary_runtime["reasoning_config"] == {
+            "enabled": True,
+            "effort": "max",
+        }
 
 
 def test_get_usage_does_not_substitute_cumulative_total_for_context_used():

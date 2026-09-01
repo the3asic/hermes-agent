@@ -52,6 +52,7 @@ def _make_runner(history: list[dict[str, str]]):
     )
     runner.session_store = MagicMock()
     runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.get_model_override.return_value = None
     runner.session_store.load_transcript.return_value = history
     runner.session_store.rewrite_transcript = MagicMock()
     runner.session_store.update_session = MagicMock()
@@ -102,6 +103,64 @@ async def test_compress_command_works_when_auto_compaction_disabled():
     assert "Compressed:" in result
     agent_instance._compress_context.assert_called_once()
     assert agent_instance._compress_context.call_args.kwargs.get("force") is True
+
+
+@pytest.mark.asyncio
+async def test_compress_command_filters_and_applies_fallback_reasoning_policy():
+    history = _make_history()
+    compressed = [history[0], {"role": "assistant", "content": "summary"}]
+    runner = _make_runner(history)
+    agent_instance = MagicMock()
+    agent_instance._primary_runtime = {}
+    agent_instance._fallback_activated = False
+    agent_instance._active_fallback_entry = None
+    agent_instance._runtime_reasoning_entry = None
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.session_id = "sess-1"
+    agent_instance._compress_context.return_value = (compressed, "")
+    agent_instance._compression_skipped_due_to_lock = False
+    fallback_entry = {
+        "provider": "zai",
+        "model": "fallback-model",
+        "reasoning_effort": "low",
+    }
+
+    with (
+        patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={
+                "api_key": "fallback-key",
+                "base_url": "https://fallback.example/v1",
+                "provider": "zai",
+                "api_mode": "chat_completions",
+                "model": "fallback-model",
+                "_resolved_fallback_entry": dict(fallback_entry),
+            },
+        ),
+        patch("gateway.run._resolve_gateway_model", return_value="primary-model"),
+        patch(
+            "gateway.run._load_gateway_runtime_config",
+            return_value={"agent": {"reasoning_effort": "max"}},
+        ),
+        patch("run_agent.AIAgent", return_value=agent_instance) as agent_cls,
+        patch(
+            "agent.model_metadata.estimate_request_tokens_rough",
+            side_effect=lambda messages, **_kwargs: 100 if messages == history else 60,
+        ),
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    assert "Compressed:" in result
+    kwargs = agent_cls.call_args.kwargs
+    assert "_resolved_fallback_entry" not in kwargs
+    assert kwargs["model"] == "fallback-model"
+    assert kwargs["reasoning_config"] == {"enabled": True, "effort": "low"}
+    assert agent_instance._runtime_reasoning_entry == fallback_entry
+    assert agent_instance._primary_runtime["reasoning_policy_entry"] == fallback_entry
 
 
 @pytest.mark.asyncio

@@ -8879,6 +8879,7 @@ class _RuntimeFallbackResolution(NamedTuple):
     runtime: dict
     selected_model: str | None
     used_fallback: bool
+    fallback_entry: dict | None
 
 
 def _resolve_runtime_with_fallback(
@@ -8900,6 +8901,7 @@ def _resolve_runtime_with_fallback(
             resolve_runtime_provider(**kwargs),
             None,
             False,
+            None,
         )
     except AuthError as primary_exc:
         fb_chain = _load_fallback_model() or []
@@ -8931,7 +8933,12 @@ def _resolve_runtime_with_fallback(
                     fb_provider,
                     fb_model,
                 )
-                return _RuntimeFallbackResolution(runtime, fb_model, True)
+                return _RuntimeFallbackResolution(
+                    runtime,
+                    fb_model,
+                    True,
+                    dict(entry),
+                )
             except Exception:
                 continue
         raise
@@ -9076,6 +9083,31 @@ def _make_agent(
             if not resolution.selected_model:
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
+    fallback_entry = (
+        dict(resolution.fallback_entry)
+        if resolution.used_fallback
+        and isinstance(resolution.fallback_entry, dict)
+        else None
+    )
+    if fallback_entry is not None:
+        try:
+            from hermes_constants import resolve_fallback_reasoning_config
+
+            effective_reasoning = resolve_fallback_reasoning_config(
+                cfg,
+                str(model or ""),
+                fallback_entry,
+            )
+        except Exception:
+            # The session override belongs to the failed primary route.
+            effective_reasoning = None
+    else:
+        effective_reasoning = (
+            reasoning_config_override
+            if reasoning_config_override is not None
+            else _load_reasoning_config(str(model or ""))
+        )
+
     _pr = _load_provider_routing()
     agent = AIAgent(
         model=model,
@@ -9093,11 +9125,7 @@ def _make_agent(
         # display detail).  See cli.py PR (decoupling fix) for the matching
         # change on the classic CLI side.
         verbose_logging=False,
-        reasoning_config=(
-            reasoning_config_override
-            if reasoning_config_override is not None
-            else _load_reasoning_config(str(model or ""))
-        ),
+        reasoning_config=effective_reasoning,
         service_tier=(
             service_tier_override
             if service_tier_override is not None
@@ -9132,6 +9160,15 @@ def _make_agent(
         )
     agent._context_cwd_is_launch_artifact = bool(
         context_cwd_is_launch_artifact
+    )
+    from agent.agent_runtime_helpers import (
+        apply_initial_reasoning_policy_provenance,
+    )
+
+    apply_initial_reasoning_policy_provenance(
+        agent,
+        fallback_entry,
+        effective_reasoning,
     )
     return agent
 

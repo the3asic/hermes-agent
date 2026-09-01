@@ -1522,6 +1522,35 @@ def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
     return result
 
 
+def resolve_fallback_reasoning_config(
+    cfg: dict | None,
+    model: str,
+    fallback_entry: dict | None,
+) -> dict | None:
+    """Resolve effort for one active fallback entry.
+
+    A session override belongs to the session's selected primary model; it must
+    not silently infect every fallback. Each fallback may pin its own
+    ``reasoning_effort``. When omitted, the fallback target uses the normal
+    per-model override, then global policy.
+    """
+    if isinstance(fallback_entry, dict) and "reasoning_effort" in fallback_entry:
+        raw_effort = fallback_entry.get("reasoning_effort")
+        parsed = parse_reasoning_effort(raw_effort)
+        if parsed is not None:
+            return parsed
+        if raw_effort not in (None, ""):
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Unknown fallback reasoning_effort %r for model %s; "
+                "using model/global policy",
+                raw_effort,
+                model,
+            )
+    return resolve_reasoning_config(cfg, model)
+
+
 def is_termux() -> bool:
     """Return True when running inside a Termux (Android) environment.
 

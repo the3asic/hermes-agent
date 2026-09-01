@@ -4589,7 +4589,9 @@ class GatewaySlashCommandsMixin:
             # "local" vs "cli" mismatch.
             from gateway.run import (
                 _GATEWAY_HYGIENE_PLATFORM,
+                _apply_route_reasoning_policy_to_agent,
                 _platform_config_key,
+                _resolve_gateway_reasoning_for_route,
                 _seed_hygiene_system_prompt,
             )
             platform_key = (
@@ -4618,6 +4620,23 @@ class GatewaySlashCommandsMixin:
                 )
             if not runtime_kwargs.get("api_key"):
                 return t("gateway.compress.no_provider")
+            turn_route = self._resolve_turn_agent_config(
+                "", model, runtime_kwargs
+            )
+            runtime_kwargs = dict(turn_route["runtime"])
+            model = turn_route["model"]
+            _compress_fallback_entry = turn_route.get("fallback_entry")
+            _compress_reasoning = (
+                _resolve_gateway_reasoning_for_route(
+                    self,
+                    source=source,
+                    session_key=session_key,
+                    model=model,
+                    fallback_entry=_compress_fallback_entry,
+                )
+                if isinstance(_compress_fallback_entry, dict)
+                else None
+            )
 
             # Pass the FULL transcript (tool results included) — same
             # rationale as the session-hygiene auto-compress in
@@ -4702,6 +4721,12 @@ class GatewaySlashCommandsMixin:
                 enabled_toolsets=["memory"],
                 session_id=session_entry.session_id,
                 session_db=getattr(self._session_db, "_db", self._session_db),
+                reasoning_config=_compress_reasoning,
+            )
+            _apply_route_reasoning_policy_to_agent(
+                tmp_agent,
+                _compress_fallback_entry,
+                _compress_reasoning,
             )
             _seed_hygiene_system_prompt(tmp_agent, session_row)
             # Keep the real source platform during construction so external

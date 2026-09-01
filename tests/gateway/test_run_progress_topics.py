@@ -955,6 +955,127 @@ class QueuedFailedEmptyAgent:
         }
 
 
+class QueuedFooterAgent:
+    """Expose distinct per-turn counters/model effort across a queued chain."""
+
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.tools = []
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.model = "glm-5.3"
+        self.reasoning_config = {"enabled": True, "effort": "max"}
+        self.session_prompt_tokens = 10_000
+        self.session_completion_tokens = 500
+        self.session_api_calls = 0
+        self.session_usage_report_calls = 0
+        self.context_compressor = SimpleNamespace(
+            last_prompt_tokens=0,
+            context_length=1_000_000,
+        )
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        self.session_prompt_tokens += 2_500
+        self.session_completion_tokens += 400
+        self.session_api_calls += 1
+        self.session_usage_report_calls += 1
+        self.context_compressor.last_prompt_tokens = 50_000
+        if type(self).calls == 1:
+            final_response = "first response"
+        else:
+            self.model = "gpt-5.6-sol"
+            self.reasoning_config = {"enabled": True, "effort": "high"}
+            final_response = "follow-up processed"
+        if self.stream_delta_callback:
+            self.stream_delta_callback(final_response)
+        return {
+            "final_response": final_response,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class MissingUsageFooterAgent:
+    """One completed provider call returns no usage metadata."""
+
+    def __init__(self, **kwargs):
+        self.tools = []
+        self.model = "glm-5.3"
+        self.reasoning_config = {"enabled": True, "effort": "max"}
+        self.session_prompt_tokens = 10_000
+        self.session_completion_tokens = 500
+        self.session_api_calls = 2
+        self.session_usage_report_calls = 2
+        self.context_compressor = SimpleNamespace(
+            last_prompt_tokens=50_000,
+            context_length=1_000_000,
+        )
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class MixedUsageFooterAgent(MissingUsageFooterAgent):
+    """Two-call tool loop has usage for only one provider response."""
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.session_prompt_tokens += 2_500
+        self.session_completion_tokens += 400
+        self.session_api_calls += 1
+        self.session_usage_report_calls += 1
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 2,
+        }
+
+
+class RouteReasoningCaptureAgent:
+    """Capture main TurnRunner fallback policy after constructor filtering."""
+
+    init_kwargs = {}
+    seen_reasoning = None
+    seen_policy_entry = None
+
+    def __init__(self, **kwargs):
+        type(self).init_kwargs = dict(kwargs)
+        self.tools = []
+        self.model = kwargs.get("model")
+        self.reasoning_config = kwargs.get("reasoning_config")
+        self._fallback_activated = False
+        self._active_fallback_entry = None
+        self._runtime_reasoning_entry = None
+        self._primary_runtime = {}
+        self.session_prompt_tokens = 0
+        self.session_completion_tokens = 0
+        self.session_usage_report_calls = 0
+        self.context_compressor = SimpleNamespace(
+            last_prompt_tokens=0,
+            context_length=1_000_000,
+        )
+
+    def run_conversation(
+        self,
+        message=None,
+        conversation_history=None,
+        task_id=None,
+        user_message=None,
+        **_kwargs,
+    ):
+        type(self).seen_reasoning = self.reasoning_config
+        type(self).seen_policy_entry = self._runtime_reasoning_entry
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 0,
+        }
+
+
 class BackgroundReviewAgent:
     def __init__(self, **kwargs):
         self.background_review_callback = kwargs.get("background_review_callback")
@@ -1006,6 +1127,7 @@ async def _run_with_agent(
     adapter_cls=ProgressCaptureAdapter,
     user_id=None,
     scope_id=None,
+    runtime_data=None,
 ):
     if config_data:
         import yaml
@@ -1026,7 +1148,11 @@ async def _run_with_agent(
     if config_data and "streaming" in config_data:
         runner.config.streaming = StreamingConfig.from_dict(config_data["streaming"])
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: dict(runtime_data or {"api_key": "***"}),
+    )
     source = SessionSource(
         platform=platform,
         chat_id=chat_id,
@@ -1255,6 +1381,237 @@ async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monke
     assert result["final_response"] == "final response 2"
     assert "I'll inspect the repo first." in sent_texts
     assert "final response 1" in sent_texts
+
+
+@pytest.mark.asyncio
+async def test_run_agent_queued_message_adds_one_footer_per_visible_turn(
+    monkeypatch, tmp_path
+):
+    QueuedFooterAgent.calls = 0
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedFooterAgent,
+        session_id="sess-queued-footer",
+        pending_text="queued follow-up",
+        config_data={
+            "agent": {"reasoning_effort": "max"},
+            "display": {
+                "tool_progress": "off",
+                "runtime_footer": {
+                    "enabled": True,
+                    "fields": [
+                        "model_last",
+                        "reasoning_effort",
+                        "tokens_turn",
+                    ],
+                },
+            }
+        },
+    )
+
+    first_turn_sends = [
+        call["content"] for call in adapter.sent if "first response" in call["content"]
+    ]
+    assert first_turn_sends == [
+        "first response\n\n"
+        "model(last):glm-5.3 · effort(req,last):max · "
+        "tokens(reported):2.5k in/400 out"
+    ]
+    assert first_turn_sends[0].count("model(last):") == 1
+
+    # The recursive result keeps only the second logical turn's own runtime
+    # metadata; the outer caller will append its footer exactly once.
+    assert result["final_response"] == "follow-up processed"
+    assert result["model_last"] == "gpt-5.6-sol"
+    assert result["reasoning_effort"] == "high"
+    assert result["turn_input_tokens"] == 2_500
+    assert result["turn_output_tokens"] == 400
+
+
+@pytest.mark.asyncio
+async def test_run_agent_streamed_queued_turn_sends_one_trailing_footer(
+    monkeypatch, tmp_path
+):
+    QueuedFooterAgent.calls = 0
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedFooterAgent,
+        session_id="sess-streamed-queued-footer",
+        pending_text="queued follow-up",
+        config_data={
+            "agent": {"reasoning_effort": "max"},
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": False,
+                "runtime_footer": {
+                    "enabled": True,
+                    "fields": [
+                        "model_last",
+                        "reasoning_effort",
+                        "tokens_turn",
+                    ],
+                },
+            },
+            "streaming": {
+                "enabled": True,
+                "edit_interval": 0.01,
+                "buffer_threshold": 1,
+            },
+        },
+    )
+
+    first_footer = (
+        "model(last):glm-5.3 · effort(req,last):max · "
+        "tokens(reported):2.5k in/400 out"
+    )
+    visible_text = [call["content"] for call in adapter.sent + adapter.edits]
+    assert [text for text in visible_text if first_footer in text] == [first_footer]
+    assert result["final_response"] == "follow-up processed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "agent_cls,expected_tokens,expected_status",
+    [
+        (MissingUsageFooterAgent, (None, None), None),
+        (MixedUsageFooterAgent, (2_500, 400), "reported_partial"),
+    ],
+)
+async def test_run_agent_labels_or_hides_incomplete_provider_usage(
+    monkeypatch, tmp_path, agent_cls, expected_tokens, expected_status
+):
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        agent_cls,
+        session_id=f"sess-{agent_cls.__name__}",
+        config_data={"display": {"tool_progress": "off"}},
+    )
+
+    assert result["final_response"] == "done"
+    assert (
+        result["turn_input_tokens"],
+        result["turn_output_tokens"],
+    ) == expected_tokens
+    assert result["token_usage_status"] == expected_status
+
+
+@pytest.mark.asyncio
+async def test_main_turn_pre_resolved_fallback_uses_entry_effort(
+    monkeypatch, tmp_path
+):
+    RouteReasoningCaptureAgent.init_kwargs = {}
+    RouteReasoningCaptureAgent.seen_reasoning = None
+    RouteReasoningCaptureAgent.seen_policy_entry = None
+    fallback_entry = {
+        "provider": "zai",
+        "model": "fallback-model",
+        "reasoning_effort": "low",
+    }
+
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        RouteReasoningCaptureAgent,
+        session_id="sess-pre-resolved-fallback",
+        config_data={
+            "model": {"provider": "primary", "default": "primary-model"},
+            "agent": {"reasoning_effort": "max"},
+            "display": {"tool_progress": "off"},
+        },
+        runtime_data={
+            "api_key": "fallback-key",
+            "base_url": "https://fallback.example/v1",
+            "provider": "zai",
+            "api_mode": "chat_completions",
+            "model": "fallback-model",
+            "_resolved_fallback_entry": dict(fallback_entry),
+        },
+    )
+
+    assert result["final_response"] == "done"
+    assert "_resolved_fallback_entry" not in RouteReasoningCaptureAgent.init_kwargs
+    assert RouteReasoningCaptureAgent.init_kwargs["model"] == "fallback-model"
+    assert RouteReasoningCaptureAgent.seen_reasoning == {
+        "enabled": True,
+        "effort": "low",
+    }
+    assert RouteReasoningCaptureAgent.seen_policy_entry == fallback_entry
+
+
+@pytest.mark.asyncio
+async def test_background_turn_pre_resolved_fallback_uses_entry_effort(
+    monkeypatch, tmp_path
+):
+    RouteReasoningCaptureAgent.init_kwargs = {}
+    RouteReasoningCaptureAgent.seen_reasoning = None
+    RouteReasoningCaptureAgent.seen_policy_entry = None
+    fallback_entry = {
+        "provider": "zai",
+        "model": "fallback-model",
+        "reasoning_effort": "low",
+    }
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = RouteReasoningCaptureAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"agent": {"reasoning_effort": "max"}},
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_runtime_config",
+        lambda: {"agent": {"reasoning_effort": "max"}},
+    )
+
+    adapter = ProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    runner._resolve_session_agent_runtime = lambda **_kwargs: (
+        "fallback-model",
+        {
+            "api_key": "fallback-key",
+            "base_url": "https://fallback.example/v1",
+            "provider": "zai",
+            "api_mode": "chat_completions",
+            "model": "fallback-model",
+            "_resolved_fallback_entry": dict(fallback_entry),
+        },
+    )
+    runner._resolve_enabled_toolsets_for_source = lambda *_args, **_kwargs: []
+    runner._resolve_session_service_tier = lambda **_kwargs: None
+    runner._refresh_fallback_model = lambda: None
+    runner._cleanup_agent_resources = lambda _agent: None
+
+    async def _run_inline(fn, *args):
+        return fn(*args)
+
+    runner._run_in_executor_with_context = _run_inline
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+
+    await runner._run_background_task_inner(
+        "background prompt",
+        source,
+        "background-fallback",
+    )
+
+    assert "_resolved_fallback_entry" not in RouteReasoningCaptureAgent.init_kwargs
+    assert RouteReasoningCaptureAgent.init_kwargs["model"] == "fallback-model"
+    assert RouteReasoningCaptureAgent.seen_reasoning == {
+        "enabled": True,
+        "effort": "low",
+    }
+    assert RouteReasoningCaptureAgent.seen_policy_entry == fallback_entry
 
 
 @pytest.mark.asyncio

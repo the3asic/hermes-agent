@@ -430,6 +430,165 @@ def test_codex_provider_uses_config_model(monkeypatch):
     assert shell.model != "should-be-ignored"
 
 
+def test_cli_auth_fallback_reasoning_is_target_owned_across_agent_init(
+    monkeypatch,
+):
+    """A second credential refresh must not turn auth fallback into primary.
+
+    The CLI calls credential resolution before building the route and again in
+    ``_init_agent``.  Preserve the matched entry across both calls, ignore the
+    CLI's primary ``--reasoning`` pin, and persist the entry on the new agent.
+    """
+    cli = _import_cli()
+    from unittest.mock import MagicMock
+
+    from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+
+    class _Shell(CLIAgentSetupMixin):
+        def _normalize_model_for_provider(self, _provider):
+            return False
+
+    shell = _Shell()
+    shell.requested_provider = "openai-codex"
+    shell.provider = "openai-codex"
+    shell.model = "gpt-5.6-sol"
+    shell._explicit_api_key = None
+    shell._explicit_base_url = None
+    shell.api_key = "old-key"
+    shell.base_url = "https://primary.example/v1"
+    shell.api_mode = "codex_responses"
+    shell.acp_command = None
+    shell.acp_args = []
+    shell._credential_pool = None
+    shell._provider_source = None
+    shell.agent = None
+    shell._active_agent_route_signature = None
+    shell.reasoning_config = {"enabled": True, "effort": "low"}
+    fallback_entry = {
+        "provider": "custom:glm",
+        "model": "glm-5.3",
+        "reasoning_effort": "max",
+    }
+    shell._fallback_model = [fallback_entry]
+
+    def _resolve_runtime(**kwargs):
+        if kwargs.get("requested") == "openai-codex":
+            raise AuthError("primary unavailable")
+        return {
+            "provider": "custom",
+            "requested_provider": "custom:glm",
+            "api_key": "fallback-key",
+            "base_url": "https://glm.example/v1",
+            "api_mode": "anthropic_messages",
+            "command": None,
+            "args": [],
+            "credential_pool": None,
+            "source": "test",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        _resolve_runtime,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.format_runtime_provider_error",
+        lambda exc: str(exc),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "agent": {
+                "reasoning_effort": "medium",
+                "reasoning_overrides": {"glm-5.3": "high"},
+            }
+        },
+    )
+    monkeypatch.setattr(cli, "_cprint", lambda *_args, **_kwargs: None)
+
+    assert shell._ensure_runtime_credentials() is True
+    # Exercise the CLI's second refresh: it now resolves the fallback provider
+    # directly, but the original entry must remain the route owner.
+    assert shell._ensure_runtime_credentials() is True
+    route = shell._resolve_turn_agent_config("hello")
+    assert route["reasoning_config"] == {"enabled": True, "effort": "max"}
+    assert route["fallback_entry"] == fallback_entry
+
+    shell.finalize_preloaded_skills = lambda: None
+    shell._install_tool_callbacks = lambda: None
+    shell._ensure_tirith_security = lambda: None
+    shell._session_db = MagicMock()
+    shell._resumed = False
+    shell.conversation_history = []
+    shell._single_query_mode = True
+    shell.max_tokens = None
+    shell.max_turns = 1
+    shell.run_budget_seconds = None
+    shell.enabled_toolsets = None
+    shell.disabled_toolsets = None
+    shell.verbose = False
+    shell.tool_progress_mode = "off"
+    shell.system_prompt = None
+    shell.prefill_messages = None
+    shell.service_tier = None
+    shell._providers_only = None
+    shell._providers_ignore = None
+    shell._providers_order = None
+    shell._provider_sort = None
+    shell._provider_require_params = False
+    shell._provider_data_collection = None
+    shell._openrouter_min_coding_score = None
+    shell.session_id = "cli-fallback-test"
+    shell._clarify_callback = None
+    shell._current_reasoning_callback = lambda: None
+    shell._on_thinking = None
+    shell.checkpoints_enabled = False
+    shell.checkpoint_max_snapshots = 20
+    shell.checkpoint_max_total_size_mb = 500
+    shell.checkpoint_max_file_size_mb = 10
+    shell.pass_session_id = False
+    shell.ignore_rules = True
+    shell._on_tool_progress = None
+    shell._on_tool_start = None
+    shell._on_tool_complete = None
+    shell._inline_diffs_enabled = False
+    shell.streaming_enabled = False
+    shell._stream_delta = None
+    shell._on_tool_gen_start = None
+    shell._on_notice = None
+    shell._on_notice_clear = None
+    shell._on_reaction = None
+    shell._pending_title = None
+
+    captured = {}
+
+    def _fake_agent(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            _primary_runtime={},
+            _runtime_reasoning_entry=None,
+            _print_fn=None,
+        )
+
+    monkeypatch.setattr(cli, "AIAgent", _fake_agent)
+    monkeypatch.setattr(
+        "hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build",
+        lambda **_kwargs: None,
+    )
+
+    assert shell._init_agent(
+        model_override=route["model"],
+        runtime_override=route["runtime"],
+        request_overrides=route.get("request_overrides"),
+    ) is True
+    assert captured["reasoning_config"] == {"enabled": True, "effort": "max"}
+    assert shell.agent._runtime_reasoning_entry == fallback_entry
+    assert shell.agent._primary_runtime["reasoning_policy_entry"] == fallback_entry
+    assert shell.agent._primary_runtime["reasoning_config"] == {
+        "enabled": True,
+        "effort": "max",
+    }
+
+
 
 
 
@@ -678,5 +837,4 @@ def test_custom_endpoint_key_env_is_a_valid_posix_name_for_ip_endpoints():
 
     for identity in ("127.0.0.1_8080", "0.0.0.0", "10.0.0.7:11434", "", "-–-"):
         assert _ENV_VAR_NAME_RE.match(custom_endpoint_key_env(identity)), identity
-
 

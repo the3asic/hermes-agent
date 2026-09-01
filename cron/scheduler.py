@@ -630,16 +630,20 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
         return None
 
 
-def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | None:
+def _resolve_job_reasoning_config(
+    job: dict,
+    cfg: dict,
+    model: str,
+    *,
+    fallback_entry: dict | None = None,
+) -> dict | None:
     """Resolve the effective reasoning config for a cron run.
 
-    Precedence: per-job ``reasoning_effort`` pin (validated at the store
-    choke point, ``cron/jobs.py::_normalize_reasoning_effort``) wins outright
-    over config resolution — both the global ``agent.reasoning_effort`` and
-    per-model ``agent.reasoning_overrides``. The pin is model-independent by
-    design: it also governs an auth-fallback model swap, and capability
-    clamping for the model that actually runs stays owned by the provider
-    transports at send time (exactly like config-set effort).
+    Primary precedence: per-job ``reasoning_effort`` pin (validated at the
+    store choke point, ``cron/jobs.py::_normalize_reasoning_effort``) wins over
+    per-model and global config.  An auth/runtime fallback is a different
+    target-owned route: fallback entry pin > fallback target-model override >
+    global.  The failed job/primary pin never crosses that boundary.
 
     A value that no longer parses (hand-edited jobs.json) logs a warning and
     falls back to config resolution — a bad pin must degrade the run's
@@ -648,7 +652,28 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
     Absent/None pin returns ``resolve_reasoning_config(cfg, model)``
     byte-identical, preserving pre-feature behavior.
     """
-    from hermes_constants import parse_reasoning_effort, resolve_reasoning_config
+    from hermes_constants import (
+        parse_reasoning_effort,
+        resolve_fallback_reasoning_config,
+        resolve_reasoning_config,
+    )
+
+    if isinstance(fallback_entry, dict):
+        try:
+            return resolve_fallback_reasoning_config(
+                cfg if isinstance(cfg, dict) else {},
+                str(model),
+                fallback_entry,
+            )
+        except Exception:
+            logger.debug(
+                "Job '%s': fallback reasoning policy failed for %s; using "
+                "provider default",
+                job.get("id", "?"),
+                model,
+                exc_info=True,
+            )
+            return None
 
     pinned = job.get("reasoning_effort")
     if pinned is not None:
@@ -6140,6 +6165,7 @@ def run_job(
             or configured_provider_for_drift
             or None
         )
+        resolved_fallback_entry = None
         try:
             # Do not inject HERMES_INFERENCE_PROVIDER here. resolve_runtime_provider()
             # already prefers persisted config over stale shell/env overrides when
@@ -6214,6 +6240,7 @@ def run_job(
                         fb_kwargs["explicit_api_key"] = fb_api_key
                     runtime = resolve_runtime_provider(**fb_kwargs)
                     model = fb_model
+                    resolved_fallback_entry = dict(entry)
                     logger.info(
                         "Job '%s': fallback resolved to %s model %s",
                         job_id,
@@ -6227,7 +6254,10 @@ def run_job(
                 raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
 
         reasoning_config = _resolve_job_reasoning_config(
-            job, _cfg if isinstance(_cfg, dict) else {}, str(model)
+            job,
+            _cfg if isinstance(_cfg, dict) else {},
+            str(model),
+            fallback_entry=resolved_fallback_entry,
         )
 
         # Provider/model-drift fail-closed guard (#44585).
@@ -6462,6 +6492,15 @@ def run_job(
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
+        )
+        from agent.agent_runtime_helpers import (
+            apply_initial_reasoning_policy_provenance,
+        )
+
+        apply_initial_reasoning_policy_provenance(
+            agent,
+            resolved_fallback_entry,
+            reasoning_config,
         )
         
         # Run the agent with an *inactivity*-based timeout: the job can run

@@ -3450,7 +3450,10 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "credential_pool": runtime.get("credential_pool"),
                     "request_overrides": dict(runtime.get("request_overrides") or {}),
                     "model": entry.get("model"),
-                    "request_overrides": runtime.get("request_overrides"),
+                    # Provenance only; filtered before AIAgent kwargs. Carries
+                    # target-owned reasoning policy through the pre-agent auth
+                    # fallback path instead of treating it as a session primary.
+                    "_resolved_fallback_entry": dict(entry),
                 }
             except Exception as fb_exc:
                 logger.debug("Fallback entry %s failed: %s", entry.get("provider"), fb_exc)
@@ -4579,6 +4582,265 @@ def _preserve_queued_followup_history_offset(
     merged = dict(followup_result)
     merged["history_offset"] = current_offset
     return merged
+
+
+def _gateway_turn_runtime_metadata(
+    agent: Any,
+    *,
+    prompt_tokens_start: Any,
+    completion_tokens_start: Any,
+    usage_report_calls_start: Any,
+    result_api_calls: Any,
+) -> dict[str, Any]:
+    """Snapshot honest per-turn runtime metadata from a gateway agent.
+
+    Agent token counters are cumulative for the lifetime of a cached agent, so
+    the visible turn usage is the delta from the snapshot taken immediately
+    before ``run_conversation()``.  Model and effort describe the *final* model
+    state after any fallback. Token deltas are explicitly provider-reported,
+    not a claim about unreported retries or advisor fan-out. When Hermes sees
+    logical calls without usable usage, the footer labels the known sum
+    ``reported,partial`` rather than presenting it as a complete turn total.
+    """
+    if agent is None:
+        return {}
+
+    compressor = getattr(agent, "context_compressor", None)
+    last_prompt_tokens = getattr(compressor, "last_prompt_tokens", 0) or 0
+    context_length = getattr(compressor, "context_length", 0) or 0
+    input_tokens = getattr(agent, "session_prompt_tokens", 0) or 0
+    output_tokens = getattr(agent, "session_completion_tokens", 0) or 0
+    usage_report_calls = (
+        getattr(agent, "session_usage_report_calls", 0) or 0
+    )
+
+    from gateway.runtime_footer import (
+        resolved_reasoning_effort,
+        turn_counter_delta,
+    )
+
+    turn_input_tokens = turn_counter_delta(input_tokens, prompt_tokens_start)
+    turn_output_tokens = turn_counter_delta(
+        output_tokens, completion_tokens_start
+    )
+    input_counter_valid = turn_input_tokens is not None
+    output_counter_valid = turn_output_tokens is not None
+    turn_usage_report_calls = turn_counter_delta(
+        usage_report_calls, usage_report_calls_start
+    )
+    try:
+        expected_api_calls = int(result_api_calls)
+    except (TypeError, ValueError):
+        expected_api_calls = None
+    token_usage_status = None
+    if (
+        isinstance(turn_usage_report_calls, int)
+        and turn_usage_report_calls > 0
+        and turn_input_tokens is not None
+        and turn_output_tokens is not None
+    ):
+        token_usage_status = "reported"
+        if (
+            expected_api_calls is None
+            or expected_api_calls < 0
+            or turn_usage_report_calls != expected_api_calls
+        ):
+            token_usage_status = "reported_partial"
+    else:
+        logger.info(
+            "Gateway runtime footer token usage unavailable: usable provider "
+            "usage observed for %r of %r logical turn API calls",
+            turn_usage_report_calls,
+            result_api_calls,
+        )
+        turn_input_tokens = None
+        turn_output_tokens = None
+    if not input_counter_valid:
+        logger.warning(
+            "Gateway prompt-token counter moved backwards or became invalid "
+            "during a turn (start=%r current=%r); footer usage unavailable",
+            prompt_tokens_start,
+            input_tokens,
+        )
+    if not output_counter_valid:
+        logger.warning(
+            "Gateway completion-token counter moved backwards or became "
+            "invalid during a turn (start=%r current=%r); footer usage unavailable",
+            completion_tokens_start,
+            output_tokens,
+        )
+
+    model_last = getattr(agent, "model", None)
+    return {
+        "last_prompt_tokens": last_prompt_tokens,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "usage_report_calls": usage_report_calls,
+        "turn_input_tokens": turn_input_tokens,
+        "turn_output_tokens": turn_output_tokens,
+        "token_usage_status": token_usage_status,
+        "reasoning_effort": resolved_reasoning_effort(
+            getattr(agent, "reasoning_config", None)
+        ),
+        # Keep the existing key for hooks/session consumers while exposing the
+        # explicit name to provenance-aware footer callers.
+        "model": model_last,
+        "model_last": model_last,
+        "context_length": context_length,
+    }
+
+
+def _install_gateway_turn_reasoning_resolver(
+    runner: "GatewayRunner",
+    agent: Any,
+    *,
+    source: "SessionSource",
+    session_key: Optional[str],
+) -> None:
+    """Install the active-runtime effort resolver for this gateway turn.
+
+    A cached agent can remain on its previous fallback while the primary is in
+    cooldown. The gateway initially resolves routing from the requested primary,
+    so the canonical turn prologue invokes this resolver *after* its single
+    ``_restore_primary_runtime()`` call. Primary turns honor session > model >
+    global precedence. A fallback kept active by cooldown instead uses its own
+    entry pin > target-model > global policy, never the primary session effort.
+    """
+
+    def _resolve(active_model: str = "") -> dict | None:
+        active_fallback = getattr(agent, "_runtime_reasoning_entry", None)
+        resolved = _resolve_gateway_reasoning_for_route(
+            runner,
+            source=source,
+            session_key=session_key,
+            model=active_model,
+            fallback_entry=active_fallback,
+        )
+        runner._reasoning_config = resolved
+        return resolved
+
+    # Refreshed every turn on cached agents, so it cannot retain a stale
+    # session/source binding.
+    agent._gateway_reasoning_config_resolver = _resolve
+
+
+def _resolve_gateway_reasoning_for_route(
+    runner: "GatewayRunner",
+    *,
+    source: Optional["SessionSource"],
+    session_key: Optional[str],
+    model: str,
+    fallback_entry: Any = None,
+) -> dict | None:
+    """Resolve primary/session or target-owned fallback effort for one route."""
+    if isinstance(fallback_entry, dict):
+        from hermes_constants import resolve_fallback_reasoning_config
+
+        try:
+            config = _load_gateway_runtime_config()
+        except Exception:
+            # A fallback must never inherit the failed primary/session effort
+            # merely because config reload failed. The entry pin can still be
+            # resolved against an empty config; if that also fails, use the
+            # provider default rather than crossing the policy boundary.
+            logger.debug(
+                "Fallback reasoning config reload failed; resolving entry "
+                "against provider defaults",
+                exc_info=True,
+            )
+            config = {}
+        try:
+            return resolve_fallback_reasoning_config(
+                config,
+                model,
+                fallback_entry,
+            )
+        except Exception:
+            logger.debug(
+                "Fallback reasoning policy failed for model %s; using provider default",
+                model,
+                exc_info=True,
+            )
+            return None
+    return runner._resolve_session_reasoning_config(
+        source=source,
+        session_key=session_key,
+        model=model,
+    )
+
+
+def _apply_route_reasoning_policy_to_agent(
+    agent: Any,
+    fallback_entry: Any,
+    reasoning_config: Any,
+) -> None:
+    """Align one route agent's durable reasoning-policy provenance.
+
+    A live, cooldown-held in-turn fallback keeps its active entry when the
+    requested route still describes the primary. Otherwise a non-fallback
+    route clears stale provenance so a same-runtime session/model override
+    cannot accidentally retain the previous fallback's effort.
+    """
+    primary_runtime = getattr(agent, "_primary_runtime", None)
+    if isinstance(fallback_entry, dict):
+        agent._runtime_reasoning_entry = dict(fallback_entry)
+        if isinstance(primary_runtime, dict):
+            primary_runtime["reasoning_policy_entry"] = dict(fallback_entry)
+            primary_runtime["reasoning_config"] = (
+                dict(reasoning_config)
+                if isinstance(reasoning_config, dict)
+                else None
+            )
+        return
+
+    if (
+        getattr(agent, "_fallback_activated", False)
+        and isinstance(getattr(agent, "_active_fallback_entry", None), dict)
+    ):
+        # restore_primary_runtime() has not yet decided whether the primary is
+        # available this turn. Preserve the active fallback until that single
+        # canonical restore attempt settles in build_turn_context().
+        return
+
+    agent._runtime_reasoning_entry = None
+    if isinstance(primary_runtime, dict):
+        primary_runtime["reasoning_policy_entry"] = None
+        primary_runtime["reasoning_config"] = (
+            dict(reasoning_config)
+            if isinstance(reasoning_config, dict)
+            else None
+        )
+
+
+def _gateway_runtime_footer_line(
+    agent_result: dict[str, Any],
+    source: "SessionSource",
+    *,
+    turn_seconds: Optional[float] = None,
+) -> str:
+    """Build one turn's configured footer from its finalized result shape."""
+    if not isinstance(agent_result, dict):
+        return ""
+    from gateway.runtime_footer import build_footer_line
+
+    result_seconds = agent_result.get("turn_seconds")
+    if not isinstance(result_seconds, (int, float)) or isinstance(
+        result_seconds, bool
+    ):
+        result_seconds = turn_seconds
+    return build_footer_line(
+        user_config=_load_gateway_config(),
+        platform_key=_platform_config_key(source.platform),
+        model=agent_result.get("model_last") or agent_result.get("model"),
+        context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
+        context_length=agent_result.get("context_length") or None,
+        cwd=os.environ.get("TERMINAL_CWD", ""),
+        turn_seconds=result_seconds,
+        tokens_in=agent_result.get("turn_input_tokens"),
+        tokens_out=agent_result.get("turn_output_tokens"),
+        token_usage_status=agent_result.get("token_usage_status"),
+        reasoning_effort=agent_result.get("reasoning_effort"),
+    )
 
 
 async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None:
@@ -5845,10 +6107,15 @@ class TurnRunner:
             }
 
         pr = self._runner._provider_routing
-        reasoning_config = self._runner._resolve_session_reasoning_config(
+        _pre_resolved_fallback = runtime_kwargs.get(
+            "_resolved_fallback_entry"
+        )
+        reasoning_config = _resolve_gateway_reasoning_for_route(
+            self._runner,
             source=ctx.source,
             session_key=ctx.session_key,
             model=model,
+            fallback_entry=_pre_resolved_fallback,
         )
         self._runner._reasoning_config = reasoning_config
         self._runner._service_tier = self._runner._resolve_session_service_tier(
@@ -6303,7 +6570,19 @@ class TurnRunner:
         agent.notice_callback = _notice_callback_sync
         agent.notice_clear_callback = None
         agent.event_callback = ctx._event_callback_sync
+        _route_fallback_entry = turn_route.get("fallback_entry")
+        _apply_route_reasoning_policy_to_agent(
+            agent,
+            _route_fallback_entry,
+            reasoning_config,
+        )
         agent.reasoning_config = reasoning_config
+        _install_gateway_turn_reasoning_resolver(
+            self._runner,
+            agent,
+            source=ctx.source,
+            session_key=ctx.session_key,
+        )
         agent.service_tier = self._runner._service_tier
         # Merge, never overwrite: init-time request overrides (e.g. a custom
         # provider's extra_body merged at agent construction) must survive
@@ -6904,6 +7183,17 @@ class TurnRunner:
                 ),
             )
 
+        # Cached agents keep cumulative usage counters across turns. Snapshot
+        # immediately before this turn's model loop so the runtime footer can
+        # report honest per-turn deltas instead of session totals.
+        _turn_prompt_tokens_start = getattr(agent, "session_prompt_tokens", 0) or 0
+        _turn_completion_tokens_start = (
+            getattr(agent, "session_completion_tokens", 0) or 0
+        )
+        _turn_usage_report_calls_start = (
+            getattr(agent, "session_usage_report_calls", 0) or 0
+        )
+
         _approval_session_key = ctx.session_key or ""
         _approval_session_token = set_current_session_key(_approval_session_key)
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
@@ -7037,18 +7327,27 @@ class TurnRunner:
         # Return final response, or a message if something went wrong
         final_response = result.get("final_response")
 
-        # Extract actual token counts from the agent instance used for this run
-        _last_prompt_toks = 0
-        _input_toks = 0
-        _output_toks = 0
-        _context_length = 0
+        # Extract final-model provenance and whole-turn usage from the exact
+        # cached-agent counter baseline captured immediately before the loop.
         _agent = ctx.agent_holder[0]
-        if _agent and hasattr(_agent, "context_compressor"):
-            _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
-            _input_toks = getattr(_agent, "session_prompt_tokens", 0)
-            _output_toks = getattr(_agent, "session_completion_tokens", 0)
-            _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
-        _resolved_model = getattr(_agent, "model", None) if _agent else None
+        _runtime_metadata = _gateway_turn_runtime_metadata(
+            _agent,
+            prompt_tokens_start=_turn_prompt_tokens_start,
+            completion_tokens_start=_turn_completion_tokens_start,
+            usage_report_calls_start=_turn_usage_report_calls_start,
+            result_api_calls=(
+                result.get("api_calls") if isinstance(result, dict) else None
+            ),
+        )
+        _last_prompt_toks = _runtime_metadata.get("last_prompt_tokens", 0)
+        _input_toks = _runtime_metadata.get("input_tokens", 0)
+        _output_toks = _runtime_metadata.get("output_tokens", 0)
+        _context_length = _runtime_metadata.get("context_length", 0)
+        _turn_input_toks = _runtime_metadata.get("turn_input_tokens")
+        _turn_output_toks = _runtime_metadata.get("turn_output_tokens")
+        _token_usage_status = _runtime_metadata.get("token_usage_status")
+        _reasoning_effort = _runtime_metadata.get("reasoning_effort")
+        _resolved_model = _runtime_metadata.get("model_last")
 
         # Sync session_id immediately after run_conversation(). Compression
         # can rotate before a follow-up model call fails; the failure return
@@ -7183,7 +7482,12 @@ class TurnRunner:
                 "last_prompt_tokens": _last_prompt_toks,
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
+                "turn_input_tokens": _turn_input_toks,
+                "turn_output_tokens": _turn_output_toks,
+                "token_usage_status": _token_usage_status,
+                "reasoning_effort": _reasoning_effort,
                 "model": _resolved_model,
+                "model_last": _resolved_model,
                 "context_length": _context_length,
             }
 
@@ -7264,7 +7568,12 @@ class TurnRunner:
             "last_prompt_tokens": _last_prompt_toks,
             "input_tokens": _input_toks,
             "output_tokens": _output_toks,
+            "turn_input_tokens": _turn_input_toks,
+            "turn_output_tokens": _turn_output_toks,
+            "token_usage_status": _token_usage_status,
+            "reasoning_effort": _reasoning_effort,
             "model": _resolved_model,
+            "model_last": _resolved_model,
             "context_length": _context_length,
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
@@ -8749,6 +9058,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 parent_id=parent_id,
             )
             if ch:
+                if ch.model or ch.provider:
+                    # An explicit channel route supersedes a global auth
+                    # fallback.  Never carry the fallback entry's effort onto
+                    # the channel-selected model/provider.
+                    runtime_kwargs.pop("_resolved_fallback_entry", None)
                 if ch.model:
                     model = ch.model
                 if ch.provider:
@@ -8848,9 +9162,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "capabilities": dict(runtime_kwargs.get("capabilities") or {}),
         }
         base_request_overrides = dict(runtime_kwargs.get("request_overrides") or {})
+        fallback_entry = runtime_kwargs.get("_resolved_fallback_entry")
+        if not isinstance(fallback_entry, dict):
+            fallback_entry = None
+        fallback_signature = (
+            (
+                str(fallback_entry.get("provider") or ""),
+                str(fallback_entry.get("model") or ""),
+                str(fallback_entry.get("base_url") or ""),
+                str(fallback_entry.get("reasoning_effort") or ""),
+            )
+            if fallback_entry
+            else None
+        )
         route = {
             "model": model,
             "runtime": runtime,
+            "fallback_entry": (
+                dict(fallback_entry) if fallback_entry else None
+            ),
             "signature": (
                 model,
                 runtime["provider"],
@@ -8859,6 +9189,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime["api_mode"],
                 runtime["command"],
                 tuple(runtime["args"]),
+                fallback_signature,
             ),
         }
 
@@ -21145,6 +21476,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 f"{_approx_tokens:,}",
                             )
                         elif _hyg_runtime.get("api_key"):
+                            _hyg_route = self._resolve_turn_agent_config(
+                                "", _hyg_model, _hyg_runtime
+                            )
+                            _hyg_fallback_entry = _hyg_route.get(
+                                "fallback_entry"
+                            )
+                            _hyg_reasoning = (
+                                _resolve_gateway_reasoning_for_route(
+                                    self,
+                                    source=source,
+                                    session_key=session_key,
+                                    model=_hyg_route["model"],
+                                    fallback_entry=_hyg_fallback_entry,
+                                )
+                                if isinstance(_hyg_fallback_entry, dict)
+                                else None
+                            )
                             # Pass the FULL transcript (tool results included).
                             # Filtering to user/assistant-only starved the
                             # compressor: tool results are usually the bulk of
@@ -21194,14 +21542,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     default=False,
                                 )
                                 _hyg_agent = AIAgent(
-                                    **_hyg_runtime,
-                                    model=_hyg_model,
+                                    **_hyg_route["runtime"],
+                                    model=_hyg_route["model"],
                                     max_iterations=4,
                                     quiet_mode=True,
                                     skip_memory=not _hyg_checkpoint_required,
                                     enabled_toolsets=["memory"],
                                     session_id=session_entry.session_id,
                                     session_db=_hyg_session_db,
+                                    reasoning_config=_hyg_reasoning,
+                                )
+                                _apply_route_reasoning_policy_to_agent(
+                                    _hyg_agent,
+                                    _hyg_fallback_entry,
+                                    _hyg_reasoning,
                                 )
                                 _seed_hygiene_system_prompt(
                                     _hyg_agent,
@@ -22387,14 +22741,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # text, so we fire a separate trailing send below.
             _footer_line = ""
             try:
-                from gateway.runtime_footer import build_footer_line as _bfl
-                _footer_line = _bfl(
-                    user_config=_load_gateway_config(),
-                    platform_key=_platform_config_key(source.platform),
-                    model=agent_result.get("model"),
-                    context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
-                    context_length=agent_result.get("context_length") or None,
-                    cwd=os.environ.get("TERMINAL_CWD", ""),
+                _footer_line = _gateway_runtime_footer_line(
+                    agent_result,
+                    source,
                     turn_seconds=_turn_seconds,
                 )
             except Exception as _footer_err:
@@ -24484,12 +24833,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
-            reasoning_config = self._resolve_session_reasoning_config(
-                source=source, model=model
+            turn_route = self._resolve_turn_agent_config(
+                prompt, model, runtime_kwargs
+            )
+            try:
+                _background_session_key = self._session_key_for_source(source)
+            except Exception:
+                _background_session_key = None
+            reasoning_config = _resolve_gateway_reasoning_for_route(
+                self,
+                source=source,
+                session_key=_background_session_key,
+                model=turn_route["model"],
+                fallback_entry=turn_route.get("fallback_entry"),
             )
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
-            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
 
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).
@@ -24539,6 +24898,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_db=getattr(self._session_db, "_db", self._session_db),
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
+                )
+                _apply_route_reasoning_policy_to_agent(
+                    agent,
+                    turn_route.get("fallback_entry"),
+                    reasoning_config,
                 )
                 try:
                     return agent.run_conversation(
@@ -28373,6 +28737,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         override = _apply_state.conversation.model_override if _apply_state else None
         if not override:
             return model, runtime_kwargs
+        # A session /model selection supersedes a global provider-auth
+        # fallback; do not carry that fallback entry's effort onto the chosen
+        # session runtime.
+        runtime_kwargs.pop("_resolved_fallback_entry", None)
         model = override.get("model", model)
         for key in (
             "provider",
@@ -29942,6 +30310,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "history_offset": len(history),
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
+            # The remote OpenAI-compatible finish chunk does not distinguish
+            # genuine zero usage from a provider that omitted usage, nor does
+            # it expose the remote agent's fallback-resolved model/effort.
+            # Leave all provenance fields unavailable rather than guessing.
         }
 
     # ------------------------------------------------------------------
@@ -30152,9 +30524,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        _logical_turn_started = time.monotonic()
+
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
-            return await self._run_agent_via_proxy(
+            proxy_result = await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
                 history=history,
@@ -30164,6 +30538,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 run_generation=run_generation,
                 event_message_id=event_message_id,
             )
+            if isinstance(proxy_result, dict):
+                proxy_result["turn_seconds"] = (
+                    time.monotonic() - _logical_turn_started
+                )
+            return proxy_result
 
         from run_agent import AIAgent
         import queue
@@ -31324,6 +31703,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "history_offset": 0,
                     "failed": True,
                 }
+                # The worker may still be unwinding after the watchdog fires.
+                # Its token counters and fallback model/effort are mutable and
+                # not updated atomically, so a live snapshot here can combine
+                # values from different provider calls. Fail closed: timeout
+                # diagnostics deliberately omit runtime footer provenance.
+
+            if isinstance(response, dict):
+                response["turn_seconds"] = (
+                    time.monotonic() - _logical_turn_started
+                )
 
             # Track fallback model state: if the agent switched to a
             # fallback model during this run, persist it so /model shows
@@ -31530,6 +31919,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _delivery_result = response if isinstance(response, dict) else (result or {})
                     _previewed = bool(_delivery_result.get("response_previewed"))
                     first_response = _delivery_result.get("final_response", "")
+                    try:
+                        _first_footer_line = _gateway_runtime_footer_line(
+                            _delivery_result,
+                            source,
+                        )
+                    except Exception as _footer_err:
+                        logger.debug(
+                            "queued first-response runtime_footer build failed: %s",
+                            _footer_err,
+                        )
+                        _first_footer_line = ""
                     _already_streamed = _stream_confirmed_final_delivery(
                         _sc,
                         first_response,
@@ -31552,6 +31952,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     elif first_response:
                         try:
+                            _first_delivery_text = first_response
+                            if _first_footer_line and not _already_streamed:
+                                _first_delivery_text = (
+                                    f"{first_response}\n\n{_first_footer_line}"
+                                )
                             if _already_streamed:
                                 logger.info(
                                     "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing.",
@@ -31563,7 +31968,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     session_key or "?",
                                 )
                             await self._deliver_queued_first_response(
-                                first_response,
+                                _first_delivery_text,
                                 source=source,
                                 adapter=adapter,
                                 metadata=_status_thread_metadata,
@@ -31572,6 +31977,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 deliver_media=not _delivery_result.get("failed"),
                                 stream_consumer=_sc,
                             )
+                            # A streamed body cannot be mutated after it was
+                            # sealed, so mirror the normal final-delivery path
+                            # and send this logical turn's footer once as a
+                            # small trailing message before recursing.
+                            if _first_footer_line and _already_streamed:
+                                await adapter.send(
+                                    source.chat_id,
+                                    _first_footer_line,
+                                    metadata=_status_thread_metadata,
+                                )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
                     # Release deferred bg-review notifications now that the

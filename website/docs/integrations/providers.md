@@ -1587,8 +1587,10 @@ Configure a chain of backup providers Hermes tries in order when the primary mod
 fallback_providers:
   - provider: openrouter
     model: anthropic/claude-sonnet-4
+    reasoning_effort: high       # optional; belongs to this fallback entry
   - provider: anthropic
     model: claude-sonnet-4
+    reasoning_effort: max
     # base_url: http://localhost:8000/v1    # optional, for custom endpoints
     # api_mode: chat_completions           # optional override
 ```
@@ -1602,6 +1604,12 @@ fallback_model:
 ```
 
 When activated, the fallback swaps the model and provider mid-session without losing your conversation. The chain is tried entry-by-entry; activation is one-shot per session.
+
+Fallback reasoning is target-owned, not inherited from the failed primary.
+Precedence is the entry's optional `reasoning_effort`, then the fallback
+model's `agent.reasoning_overrides` value, then global
+`agent.reasoning_effort`. A gateway session `/reasoning` override applies to
+its selected primary model and does not propagate into fallback entries.
 
 Supported providers: `openrouter`, `nous`, `novita`, `openai-codex`, `copilot`, `copilot-acp`, `anthropic`, `gemini`, `qwen-oauth`, `huggingface`, `zai`, `kimi-coding`, `kimi-coding-cn`, `minimax`, `minimax-cn`, `minimax-oauth`, `deepseek`, `nvidia`, `xai`, `xai-oauth`, `ollama-cloud`, `bedrock`, `ai-gateway`, `azure-foundry`, `opencode-zen`, `opencode-go`, `commandcode`, `commandcode-anthropic`, `kilocode`, `xiaomi`, `arcee`, `gmi`, `actual`, `stepfun`, `lmstudio`, `alibaba`, `alibaba-coding-plan`, `tencent-tokenhub`, `tencent-tokenplan`, `nebius-token-factory`, `router`, `custom`.
 

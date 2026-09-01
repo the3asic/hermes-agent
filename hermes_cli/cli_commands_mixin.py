@@ -2374,7 +2374,7 @@ class CLICommandsMixin:
                     session_id=task_id,
                     platform="cli",
                     session_db=self._session_db,
-                    reasoning_config=self.reasoning_config,
+                    reasoning_config=turn_route.get("reasoning_config"),
                     service_tier=self.service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=self._providers_only,
@@ -2385,6 +2385,15 @@ class CLICommandsMixin:
                     provider_data_collection=self._provider_data_collection,
                     openrouter_min_coding_score=self._openrouter_min_coding_score,
                     fallback_model=self._fallback_model,
+                )
+                from agent.agent_runtime_helpers import (
+                    apply_initial_reasoning_policy_provenance,
+                )
+
+                apply_initial_reasoning_policy_provenance(
+                    bg_agent,
+                    turn_route.get("fallback_entry"),
+                    turn_route.get("reasoning_config"),
                 )
                 # Silence raw spinner; route thinking through TUI widget when no foreground agent is active.
                 bg_agent._print_fn = lambda *_a, **_kw: None

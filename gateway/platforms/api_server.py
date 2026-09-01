@@ -2856,8 +2856,10 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         from run_agent import AIAgent
         from gateway.run import (
+            _apply_route_reasoning_policy_to_agent,
             _checkpoint_agent_kwargs,
             _current_max_iterations,
+            _resolve_gateway_reasoning_for_route,
             _resolve_runtime_agent_kwargs,
             _resolve_gateway_model,
             _load_gateway_config,
@@ -2888,6 +2890,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # spread → "got multiple values for keyword argument 'model'", 500ing
         # every /v1/chat/completions request while a fallback is active.
         runtime_model = runtime_kwargs.pop("model", None)
+        resolved_fallback_entry = runtime_kwargs.pop(
+            "_resolved_fallback_entry", None
+        )
+        if not isinstance(resolved_fallback_entry, dict):
+            resolved_fallback_entry = None
         if runtime_model:
             model = runtime_model
 
@@ -2955,6 +2962,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # had to re-fix here after it diverged from gateway/run.py.
         from hermes_cli.model_switch import resolve_effective_model
         if session_override:
+            # An explicit session selection is the primary for this request;
+            # it must not inherit provenance from a global auth fallback.
+            resolved_fallback_entry = None
             override_model = resolve_effective_model(session_override, None, model)
             session_provider = _clean_request_string(session_override.get("provider"))
             current_provider = _clean_request_string(runtime_kwargs.get("provider"))
@@ -2973,6 +2983,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_key or "",
                 )
         elif session_row_model and not confirmed_runtime_lock:
+            resolved_fallback_entry = None
             # Session-persisted model (raw string that resolved to no route
             # alias).  Pins this session's turns ahead of per-request body
             # values — a session's chosen model is a standing selection,
@@ -2992,6 +3003,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_key or "",
                 )
         else:
+            if (
+                confirmed_runtime_lock
+                or route is not None
+                or request_model
+                or request_provider
+            ):
+                # Browser locks, model routes, and direct request selections
+                # supersede the global route that triggered auth fallback.
+                resolved_fallback_entry = None
             if route is not None:
                 # The request's ``model`` field selected this route, so its
                 # value is the route ALIAS — never usable as a model name.
@@ -3109,12 +3129,24 @@ class APIServerAdapter(BasePlatformAdapter):
         # defaults). Resolving at function entry keyed them off
         # ``model.default`` instead — the defect e81d18dfb removed from the
         # native gateway paths. An explicit per-request reasoning parameter
-        # still wins over config.
-        reasoning_config = (
-            request_reasoning_config
-            if request_reasoning_config is not None
-            else GatewayRunner._load_reasoning_config(model)
-        )
+        # wins on an explicitly selected/primary route; a target-owned fallback
+        # deliberately ignores it.
+        if isinstance(resolved_fallback_entry, dict):
+            # Target-owned fallback policy deliberately ignores per-request
+            # and session/primary effort. Entry pin > target model > global.
+            reasoning_config = _resolve_gateway_reasoning_for_route(
+                self,
+                source=None,
+                session_key=gateway_session_key or session_id,
+                model=model,
+                fallback_entry=resolved_fallback_entry,
+            )
+        else:
+            reasoning_config = (
+                request_reasoning_config
+                if request_reasoning_config is not None
+                else GatewayRunner._load_reasoning_config(model)
+            )
 
         agent_kwargs = {
             "model": model,
@@ -3140,6 +3172,11 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
+        _apply_route_reasoning_policy_to_agent(
+            agent,
+            resolved_fallback_entry,
+            reasoning_config,
+        )
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,

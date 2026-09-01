@@ -506,6 +506,38 @@ class TestResolveReasoningConfig:
         assert resolve_reasoning_config(cfg, "gpt-5") == {"enabled": True, "effort": "medium"}
 
 
+class TestResolveFallbackReasoningConfig:
+    def test_entry_pin_wins_over_target_model_and_global(self):
+        from hermes_constants import resolve_fallback_reasoning_config
+
+        cfg = {
+            "agent": {
+                "reasoning_effort": "medium",
+                "reasoning_overrides": {"fallback-model": "max"},
+            }
+        }
+        assert resolve_fallback_reasoning_config(
+            cfg,
+            "fallback-model",
+            {"reasoning_effort": "low"},
+        ) == {"enabled": True, "effort": "low"}
+
+    def test_entry_without_pin_uses_target_model_policy(self):
+        from hermes_constants import resolve_fallback_reasoning_config
+
+        cfg = {
+            "agent": {
+                "reasoning_effort": "medium",
+                "reasoning_overrides": {"fallback-model": "high"},
+            }
+        }
+        assert resolve_fallback_reasoning_config(
+            cfg,
+            "fallback-model",
+            {},
+        ) == {"enabled": True, "effort": "high"}
+
+
 class TestReasoningOverridesDefaultConfig:
     """Tests for the agent.reasoning_overrides default config key (Task 2)."""
 

@@ -49,6 +49,7 @@ class TestFallbackChainInit:
         assert agent._fallback_chain == []
         assert agent._fallback_index == 0
         assert agent._fallback_model is None
+        assert agent._active_fallback_entry is None
 
 
 
@@ -111,6 +112,28 @@ class TestFallbackChainAdvancement:
             assert agent._fallback_index == 1
             assert agent.model == "gpt-4o"
             assert agent._fallback_activated is True
+
+    def test_entry_reasoning_effort_is_applied_and_tracked(self):
+        entry = {
+            "provider": "openai",
+            "model": "gpt-4o",
+            "reasoning_effort": "low",
+        }
+        agent = _make_agent(fallback_model=[entry])
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "gpt-4o"),
+            ),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": {"reasoning_effort": "max"}},
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent._active_fallback_entry == entry
+        assert agent.reasoning_config == {"enabled": True, "effort": "low"}
 
     def test_records_user_visible_switch_with_reason(self):
         agent = _make_agent(

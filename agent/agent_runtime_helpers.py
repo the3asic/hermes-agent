@@ -1624,6 +1624,33 @@ def drop_thinking_only_and_merge_users(
 
 
 
+def apply_initial_reasoning_policy_provenance(
+    agent,
+    fallback_entry: dict | None,
+    reasoning_config: dict | None,
+) -> None:
+    """Persist target-owned effort for an init-time fallback runtime.
+
+    CLI, TUI, cron, and gateway auth fallback can construct an agent directly
+    on a configured fallback.  That runtime is the agent's initial primary
+    snapshot (so ``_fallback_activated`` must remain false), but its reasoning
+    policy still belongs to the fallback entry rather than to the failed
+    request/session/job route.
+    """
+    if not isinstance(fallback_entry, dict):
+        return
+    policy_entry = dict(fallback_entry)
+    agent._runtime_reasoning_entry = policy_entry
+    primary_runtime = getattr(agent, "_primary_runtime", None)
+    if isinstance(primary_runtime, dict):
+        primary_runtime["reasoning_policy_entry"] = dict(policy_entry)
+        primary_runtime["reasoning_config"] = (
+            dict(reasoning_config)
+            if isinstance(reasoning_config, dict)
+            else None
+        )
+
+
 def restore_primary_runtime(agent) -> bool:
     """Restore the primary runtime at the start of a new turn.
 
@@ -1738,6 +1765,123 @@ def restore_primary_runtime(agent) -> bool:
     provider_fallback_active = bool(
         getattr(agent, "_provider_fallback_active", False)
     )
+
+    # Restoring a runtime mutates the model identity, clients, credential pool,
+    # compressor, and reasoning provenance in several stages.  Any stage can
+    # fail (client construction and context-engine update are both external
+    # extension points).  Keep the live fallback intact until the whole
+    # restore commits; otherwise the same turn can run a primary-labelled
+    # model with the fallback client or fallback-owned effort.
+    _restore_missing = object()
+    _restore_dict_fields = {"_client_kwargs", "_transport_cache"}
+    _restore_agent_fields = (
+        "model",
+        "provider",
+        "requested_provider",
+        "base_url",
+        "api_mode",
+        "api_key",
+        "client",
+        "_anthropic_client",
+        "_anthropic_api_key",
+        "_anthropic_base_url",
+        "_is_anthropic_oauth",
+        "_client_kwargs",
+        "_use_prompt_caching",
+        "_use_native_cache_layout",
+        "reasoning_config",
+        "_runtime_reasoning_entry",
+        "_active_fallback_entry",
+        "_fallback_activated",
+        "_fallback_index",
+        "_rate_limit_backoff_count",
+        "_reasoning_echo_flag",
+        "_credential_pool",
+        "_credential_pool_entry_id",
+        "_transport_cache",
+        "_provider_fallback_active",
+        "_provider_fallback_route",
+        "_cached_system_prompt",
+        "_config_context_length",
+        "_rate_limited_until",
+        "_restore_wait_logged",
+        "_consecutive_stale_streams",
+    )
+    _restore_agent_snapshot = {}
+    for _field in _restore_agent_fields:
+        _value = getattr(agent, _field, _restore_missing)
+        if _field in _restore_dict_fields and isinstance(_value, dict):
+            _value = dict(_value)
+        _restore_agent_snapshot[_field] = _value
+
+    _restore_compressor = getattr(agent, "context_compressor", None)
+    _restore_compressor_fields = (
+        "model",
+        "base_url",
+        "api_key",
+        "provider",
+        "api_mode",
+        "context_length",
+        "_base_threshold_percent",
+        "threshold_percent",
+        "threshold_tokens",
+        "_tail_token_budget",
+        "max_summary_tokens",
+        "last_prompt_tokens",
+        "last_completion_tokens",
+        "last_total_tokens",
+        "last_real_prompt_tokens",
+        "last_rough_tokens_when_real_prompt_fit",
+        "last_compression_rough_tokens",
+        "_pending_request_rough_tokens",
+        "awaiting_real_usage_after_compression",
+        "_prellm_skip_count",
+        "_fallback_compression_streak",
+        "_verify_compaction_cleared_threshold",
+        "_last_compression_made_progress",
+        "_proactive_prune_rearm_tokens",
+    )
+    _restore_compressor_snapshot = {
+        _field: getattr(_restore_compressor, _field, _restore_missing)
+        for _field in _restore_compressor_fields
+    }
+
+    def _rollback_failed_restore() -> None:
+        for _field, _value in _restore_agent_snapshot.items():
+            if _value is _restore_missing:
+                try:
+                    delattr(agent, _field)
+                except (AttributeError, TypeError):
+                    pass
+                continue
+            if _field in _restore_dict_fields and isinstance(_value, dict):
+                _value = dict(_value)
+            try:
+                setattr(agent, _field, _value)
+            except Exception:
+                logger.debug(
+                    "Could not roll back agent field %s after failed primary restore",
+                    _field,
+                    exc_info=True,
+                )
+        if _restore_compressor is not None:
+            for _field, _value in _restore_compressor_snapshot.items():
+                if _value is _restore_missing:
+                    try:
+                        delattr(_restore_compressor, _field)
+                    except (AttributeError, TypeError):
+                        pass
+                    continue
+                try:
+                    setattr(_restore_compressor, _field, _value)
+                except Exception:
+                    logger.debug(
+                        "Could not roll back context-engine field %s after "
+                        "failed primary restore",
+                        _field,
+                        exc_info=True,
+                    )
+
     try:
         # ── Core runtime state ──
         agent.model = rt["model"]
@@ -1914,12 +2058,23 @@ def restore_primary_runtime(agent) -> bool:
         # ── Restore reasoning_config if it was saved ──
         # switch_model saves reasoning_config in _primary_runtime. If the
         # snapshot predates that (older sessions), keep the current value.
-        saved_reasoning = rt.get("reasoning_config")
-        if saved_reasoning is not None:
-            agent.reasoning_config = dict(saved_reasoning)
+        if "reasoning_config" in rt:
+            saved_reasoning = rt.get("reasoning_config")
+            agent.reasoning_config = (
+                dict(saved_reasoning)
+                if isinstance(saved_reasoning, dict)
+                else None
+            )
+        saved_policy_entry = rt.get("reasoning_policy_entry")
+        agent._runtime_reasoning_entry = (
+            dict(saved_policy_entry)
+            if isinstance(saved_policy_entry, dict)
+            else None
+        )
 
         # ── Reset fallback chain for the new turn ──
         agent._fallback_activated = False
+        agent._active_fallback_entry = None
         agent._fallback_index = 0
         agent._rate_limit_backoff_count = 0  # reset exponential backoff counter
 
@@ -1952,6 +2107,7 @@ def restore_primary_runtime(agent) -> bool:
                 pass
         return True
     except Exception as e:
+        _rollback_failed_restore()
         logger.warning("Failed to restore primary runtime: %s", e)
         return False
 
@@ -3323,7 +3479,15 @@ def switch_model(
             agent.model, agent.reasoning_config,
         )
     except Exception as _reasoning_err:
-        logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
+        # The old effort belongs to the old selected route.  A deliberate
+        # model switch must fail closed to the provider default rather than
+        # snapshot stale fallback/session reasoning as the new primary.
+        agent.reasoning_config = None
+        logger.debug(
+            "switch_model: could not re-resolve reasoning_config; using "
+            "provider default: %s",
+            _reasoning_err,
+        )
 
     # ── Invalidate cached system prompt so it rebuilds next turn ──
     agent._cached_system_prompt = None
@@ -3353,6 +3517,7 @@ def switch_model(
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_config": dict(agent.reasoning_config) if getattr(agent, "reasoning_config", None) else None,
+        "reasoning_policy_entry": None,
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
         # Request-level overrides (extra_body etc.) must travel with the
         # switched-to identity; without this, a post-switch transport
@@ -3377,6 +3542,8 @@ def switch_model(
 
     # ── Reset fallback state ──
     agent._fallback_activated = False
+    agent._active_fallback_entry = None
+    agent._runtime_reasoning_entry = None
     agent._provider_fallback_active = False
     agent._provider_fallback_route = None
     agent._fallback_index = 0

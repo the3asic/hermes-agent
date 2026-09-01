@@ -4390,6 +4390,14 @@ def run_conversation(
                     agent.session_completion_tokens += completion_tokens
                     agent.session_total_tokens += total_tokens
                     agent.session_api_calls += 1
+                    # Some adapters synthesize a truthy all-zero usage object
+                    # when upstream omitted usage. A real non-empty model
+                    # request cannot have zero prompt tokens, so only count a
+                    # positive canonical prompt as a usable provider report.
+                    if prompt_tokens > 0:
+                        agent.session_usage_report_calls = (
+                            getattr(agent, "session_usage_report_calls", 0) + 1
+                        )
                     agent.session_input_tokens += canonical_usage.input_tokens
                     agent.session_output_tokens += canonical_usage.output_tokens
                     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
@@ -6549,6 +6557,17 @@ def run_conversation(
                         _retry.has_retried_429 = False
                         agent._fallback_index = 0
                         agent._fallback_activated = False
+                        agent._active_fallback_entry = None
+                        _primary_policy = (
+                            (getattr(agent, "_primary_runtime", None) or {}).get(
+                                "reasoning_policy_entry"
+                            )
+                        )
+                        agent._runtime_reasoning_entry = (
+                            dict(_primary_policy)
+                            if isinstance(_primary_policy, dict)
+                            else None
+                        )
                         continue
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():

@@ -226,6 +226,94 @@ class TestAdapterInit:
         assert captured["checkpoint_max_total_size_mb"] == 321
         assert captured["checkpoint_max_file_size_mb"] == 4
 
+    @pytest.mark.parametrize(
+        "requested_model,expected_effort,expect_fallback_policy",
+        [
+            (None, "low", True),
+            # An explicit request selection supersedes the global auth fallback,
+            # even when it happens to select the same model id.
+            ("fallback-model", "max", False),
+        ],
+    )
+    def test_create_agent_keeps_fallback_reasoning_target_owned(
+        self,
+        monkeypatch,
+        requested_model,
+        expected_effort,
+        expect_fallback_policy,
+    ):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.reasoning_config = kwargs.get("reasoning_config")
+                self._primary_runtime = {}
+                self._fallback_activated = False
+                self._active_fallback_entry = None
+                self._runtime_reasoning_entry = None
+
+        fallback_entry = {
+            "provider": "zai",
+            "model": "fallback-model",
+            "reasoning_effort": "low",
+        }
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "zai",
+                "api_key": "fallback-key",
+                "base_url": "https://fallback.example/v1",
+                "api_mode": "chat_completions",
+                "model": "fallback-model",
+                "_resolved_fallback_entry": dict(fallback_entry),
+            },
+        )
+        monkeypatch.setattr(
+            "gateway.run._resolve_gateway_model", lambda: "primary-model"
+        )
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+        monkeypatch.setattr(
+            "gateway.run._load_gateway_runtime_config",
+            lambda: {"agent": {"reasoning_effort": "high"}},
+        )
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_reasoning_config",
+            staticmethod(
+                lambda model="": {"enabled": True, "effort": "high"}
+            ),
+        )
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_fallback_model",
+            staticmethod(lambda: None),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.tools_config._get_platform_tools", lambda *_: set()
+        )
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        agent = adapter._create_agent(
+            session_id="api-session",
+            requested_model=requested_model,
+            model_options={"reasoning_effort": "max"},
+        )
+
+        assert "_resolved_fallback_entry" not in captured
+        assert captured["model"] == "fallback-model"
+        assert captured["reasoning_config"] == {
+            "enabled": True,
+            "effort": expected_effort,
+        }
+        if expect_fallback_policy:
+            assert agent._runtime_reasoning_entry == fallback_entry
+            assert agent._primary_runtime["reasoning_policy_entry"] == fallback_entry
+        else:
+            assert agent._runtime_reasoning_entry is None
+            assert agent._primary_runtime["reasoning_policy_entry"] is None
+
 
 # ---------------------------------------------------------------------------
 # Auth checking

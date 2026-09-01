@@ -963,6 +963,11 @@ def init_agent(
     # Model response configuration
     agent.max_tokens = max_tokens  # None = use model default
     agent.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
+    # Optional target-owned policy for the runtime currently serving as a
+    # configured fallback. Kept separate from transient activation flags so an
+    # init-time fallback can retain its effort after becoming the effective
+    # first runtime.
+    agent._runtime_reasoning_entry = None
     # Per-provider reasoning_content echo opt-in (see _reasoning_echo_opt_in).
     # Read once at init; switch_model / try_activate_fallback / restore
     # keep it in sync with the active provider.
@@ -1435,6 +1440,38 @@ def init_agent(
                             agent.provider = _fb["provider"]
                             agent.model = _fb_model or _fb["model"]
                             agent._fallback_activated = True
+                            agent._active_fallback_entry = dict(_fb)
+                            agent._runtime_reasoning_entry = dict(_fb)
+                            agent._reasoning_echo_flag = bool(
+                                _fb.get("reasoning_echo", False)
+                            )
+                            try:
+                                from hermes_cli.config import load_config
+                                from hermes_constants import (
+                                    resolve_fallback_reasoning_config,
+                                )
+
+                                try:
+                                    _fb_reasoning_cfg = load_config() or {}
+                                except Exception:
+                                    _fb_reasoning_cfg = {}
+                                agent.reasoning_config = (
+                                    resolve_fallback_reasoning_config(
+                                        _fb_reasoning_cfg,
+                                        agent.model,
+                                        _fb,
+                                    )
+                                )
+                            except Exception as _fb_reasoning_exc:
+                                # Never inherit the failed primary's effort into
+                                # a fallback when its own policy cannot resolve.
+                                agent.reasoning_config = None
+                                logger.debug(
+                                    "Init-time fallback reasoning resolution "
+                                    "failed for %s: %s",
+                                    agent.model,
+                                    _fb_reasoning_exc,
+                                )
                             client_kwargs = {
                                 "api_key": _fb_client.api_key,
                                 "base_url": str(_fb_client.base_url),
@@ -1582,6 +1619,9 @@ def init_agent(
         agent._fallback_chain = []
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
+    agent._active_fallback_entry = getattr(
+        agent, "_active_fallback_entry", None
+    )
     # Legacy attribute kept for backward compat (tests, external callers)
     agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
     if agent._fallback_chain and not agent.quiet_mode:
@@ -3005,6 +3045,10 @@ def init_agent(
     agent.session_completion_tokens = 0
     agent.session_total_tokens = 0
     agent.session_api_calls = 0
+    # Counts only provider calls that supplied usable token usage. Unlike
+    # session_api_calls, this deliberately does not increment for Codex
+    # app-server turns whose usage event is absent.
+    agent.session_usage_report_calls = 0
     agent.session_input_tokens = 0
     agent.session_output_tokens = 0
     agent.session_cache_read_tokens = 0
@@ -3180,6 +3224,16 @@ def init_agent(
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
+        "reasoning_config": (
+            dict(agent.reasoning_config)
+            if getattr(agent, "reasoning_config", None)
+            else None
+        ),
+        "reasoning_policy_entry": (
+            dict(agent._runtime_reasoning_entry)
+            if isinstance(agent._runtime_reasoning_entry, dict)
+            else None
+        ),
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
         # Context engine state that _try_activate_fallback() overwrites.
         # Use getattr for model/base_url/api_key/provider since plugin

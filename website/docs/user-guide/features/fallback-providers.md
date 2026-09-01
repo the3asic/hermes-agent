@@ -35,9 +35,15 @@ If you'd rather edit the YAML directly, add a top-level `fallback_providers` lis
 fallback_providers:
   - provider: openrouter
     model: anthropic/claude-sonnet-4
+    reasoning_effort: high
 ```
 
 Each entry requires both `provider` and `model`. Entries missing either field are ignored.
+
+Each entry may also set `reasoning_effort`. This effort belongs to that
+fallback target: Hermes does not copy the failed primary/session effort into
+the fallback. Resolution order is entry `reasoning_effort` → target model's
+`agent.reasoning_overrides` → global `agent.reasoning_effort`.
 
 :::note `fallback_model` vs `fallback_providers`
 `fallback_providers` (plural, list) is the current config shape and supports multiple fallbacks tried in order. `fallback_model` (singular) is the legacy single-fallback key — Hermes still honors it for back-compat, but `hermes fallback` writes the current `fallback_providers` key and migrates legacy config on write. When both are set, `fallback_providers` takes priority.

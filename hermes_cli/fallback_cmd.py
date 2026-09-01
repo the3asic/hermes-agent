@@ -13,7 +13,8 @@ Subcommands:
   hermes fallback clear    Remove all fallback entries
 
 Storage: ``fallback_providers`` in ``~/.hermes/config.yaml`` (top-level, list of
-``{provider, model, base_url?, api_mode?}`` dicts).  The legacy single-dict
+``{provider, model, reasoning_effort?, base_url?, api_mode?}`` dicts).  The
+legacy single-dict
 ``fallback_model`` format is migrated to the new list format on first add.
 """
 from __future__ import annotations
@@ -52,7 +53,13 @@ def _format_entry(entry: Dict[str, Any]) -> str:
     provider = entry.get("provider", "?")
     model = entry.get("model", "?")
     base = entry.get("base_url")
-    suffix = f"  [{base}]" if base else ""
+    effort = entry.get("reasoning_effort")
+    details = []
+    if effort is not None:
+        details.append(f"effort={effort}")
+    if base:
+        details.append(str(base))
+    suffix = f"  [{', '.join(details)}]" if details else ""
     return f"{model}  (via {provider}){suffix}"
 
 

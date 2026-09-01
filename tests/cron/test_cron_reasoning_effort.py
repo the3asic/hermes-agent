@@ -153,18 +153,54 @@ class TestSchedulerJobReasoningPrecedence:
         assert result == resolve_reasoning_config(self.CFG, "gpt-5")
         assert any("turbo" in r.message for r in caplog.records)
 
-    def test_job_effort_is_model_independent(self):
-        """Pinned effort governs whichever model actually runs (auth fallback
-        can swap the model after resolution) — the job pins intent, the
-        transport clamps capability."""
+    def test_fallback_entry_effort_beats_job_pin(self):
         from cron.scheduler import _resolve_job_reasoning_config
 
-        job = {"reasoning_effort": "ultra"}
-        for model in ("gpt-5.6-sol", "x-ai/grok-4", "gemini-3-pro", ""):
-            assert _resolve_job_reasoning_config(job, self.CFG, model) == {
-                "enabled": True,
-                "effort": "ultra",
-            }
+        result = _resolve_job_reasoning_config(
+            {"reasoning_effort": "ultra"},
+            self.CFG,
+            "anthropic/claude-opus-4.5",
+            fallback_entry={
+                "provider": "anthropic",
+                "model": "anthropic/claude-opus-4.5",
+                "reasoning_effort": "low",
+            },
+        )
+        assert result == {"enabled": True, "effort": "low"}
+
+    def test_fallback_target_override_beats_job_pin_when_entry_unpinned(self):
+        from cron.scheduler import _resolve_job_reasoning_config
+
+        result = _resolve_job_reasoning_config(
+            {"reasoning_effort": "ultra"},
+            self.CFG,
+            "anthropic/claude-opus-4.5",
+            fallback_entry={
+                "provider": "anthropic",
+                "model": "anthropic/claude-opus-4.5",
+            },
+        )
+        assert result == {"enabled": True, "effort": "xhigh"}
+
+    def test_fallback_resolver_failure_uses_provider_default(self, monkeypatch):
+        from cron.scheduler import _resolve_job_reasoning_config
+
+        monkeypatch.setattr(
+            "hermes_constants.resolve_fallback_reasoning_config",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("config unavailable")
+            ),
+        )
+        result = _resolve_job_reasoning_config(
+            {"reasoning_effort": "ultra"},
+            self.CFG,
+            "anthropic/claude-opus-4.5",
+            fallback_entry={
+                "provider": "anthropic",
+                "model": "anthropic/claude-opus-4.5",
+            },
+        )
+        assert result is None
 
 
 class TestCronjobToolReasoningEffort:

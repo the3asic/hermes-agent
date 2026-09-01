@@ -243,11 +243,18 @@ async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch
 
     class NonRotatingCompressAgent:
         last_instance = None
+        init_kwargs = None
 
         def __init__(self, **kwargs):
+            type(self).init_kwargs = dict(kwargs)
             self.model = kwargs.get("model")
             self.session_id = kwargs.get("session_id", "fake-session")
             self.compression_in_place = False  # not in-place either
+            self.reasoning_config = kwargs.get("reasoning_config")
+            self._fallback_activated = False
+            self._active_fallback_entry = None
+            self._runtime_reasoning_entry = None
+            self._primary_runtime = {}
             self._print_fn = None
             self.shutdown_memory_provider = MagicMock()
             self.close = MagicMock()
@@ -282,6 +289,7 @@ async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch
         platform=Platform.TELEGRAM,
         chat_type="group",
     )
+    runner.session_store.get_model_override.return_value = None
     runner.session_store.load_transcript.return_value = _make_history(6, content_size=400)
     runner.session_store.has_any_sessions.return_value = True
     runner.session_store.rewrite_transcript = MagicMock()
@@ -303,7 +311,23 @@ async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch
     )
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    fallback_entry = {
+        "provider": "zai",
+        "model": "fallback-model",
+        "reasoning_effort": "low",
+    }
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "api_key": "fake",
+            "base_url": "https://fallback.example/v1",
+            "provider": "zai",
+            "api_mode": "chat_completions",
+            "model": "fallback-model",
+            "_resolved_fallback_entry": dict(fallback_entry),
+        },
+    )
     monkeypatch.setattr(
         "agent.model_metadata.get_model_context_length",
         lambda *_args, **_kwargs: 100,
@@ -349,6 +373,15 @@ async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch
     # way.
     assert reset_calls == [], (
         "the degenerate no-rotate path must not clear the failure streak"
+    )
+    assert "_resolved_fallback_entry" not in NonRotatingCompressAgent.init_kwargs
+    assert NonRotatingCompressAgent.init_kwargs["model"] == "fallback-model"
+    assert NonRotatingCompressAgent.init_kwargs["reasoning_config"] == {
+        "enabled": True,
+        "effort": "low",
+    }
+    assert NonRotatingCompressAgent.last_instance._runtime_reasoning_entry == (
+        fallback_entry
     )
 
 

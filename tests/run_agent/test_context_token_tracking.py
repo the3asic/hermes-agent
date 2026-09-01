@@ -113,6 +113,29 @@ def test_openai_prompt_tokens_unchanged(monkeypatch):
     agent = _make_agent(monkeypatch, "chat_completions", "openrouter", resp)
     agent.run_conversation("hi")
     assert agent.context_compressor.last_prompt_tokens == 5000
+    assert agent.session_usage_report_calls == 1
+
+
+def test_truthy_zero_usage_is_not_counted_as_usable(monkeypatch):
+    """Adapters may synthesize a truthy all-zero object when usage is absent."""
+    resp = lambda: SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace(
+            role="assistant", content="ok", tool_calls=None,
+            reasoning_content=None,
+        ), finish_reason="stop")],
+        usage=SimpleNamespace(
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+        ),
+        model="synthetic-zero-usage",
+    )
+    agent = _make_agent(monkeypatch, "chat_completions", "openrouter", resp)
+    result = agent.run_conversation("hi")
+
+    assert result["api_calls"] == 1
+    assert agent.session_api_calls == 1
+    assert agent.session_usage_report_calls == 0
 
 
 # -- Codex: no cache fields, getattr returns 0 --

@@ -1210,6 +1210,7 @@ class TestRunJobConfigEnvVarExpansion:
              patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
              patch("run_agent.AIAgent") as mock_agent_cls:
             mock_agent = MagicMock()
+            mock_agent._primary_runtime = {}
             mock_agent.run_conversation.return_value = {"final_response": "ok"}
             mock_agent_cls.return_value = mock_agent
             success, _, _, error = run_job(job)
@@ -1220,6 +1221,14 @@ class TestRunJobConfigEnvVarExpansion:
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["provider"] == "openrouter"
         assert kwargs["model"] == "z-ai/glm-5.2"
+        assert mock_agent._runtime_reasoning_entry == {
+            "provider": "openrouter",
+            "model": "z-ai/glm-5.2",
+        }
+        assert mock_agent._primary_runtime["reasoning_policy_entry"] == {
+            "provider": "openrouter",
+            "model": "z-ai/glm-5.2",
+        }
 
 
     def test_unexpanded_ref_passthrough_when_var_unset(self, tmp_path, monkeypatch):

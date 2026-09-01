@@ -1994,13 +1994,13 @@ Notes:
 
 ### Runtime-metadata footer (gateway only)
 
-When `display.runtime_footer.enabled: true`, Hermes appends a small runtime-context footer to the **final** message of each gateway turn. The current footer can show the model, context-window percentage, and current working directory. Off by default; opt in per-gateway if your team wants every reply to include this provenance.
+When `display.runtime_footer.enabled: true`, Hermes appends a small runtime-context footer to the **final** message of each gateway turn. It can show the model, context-window percentage, turn latency, per-turn token usage, Hermes' requested reasoning effort, and current working directory. Off by default; opt in per-gateway if your team wants every reply to include this provenance.
 
 ```yaml
 display:
   runtime_footer:
     enabled: true
-    fields: ["model", "context_pct", "cwd"]   # order shown; drop any to hide
+    fields: ["model_last", "reasoning_effort", "tokens_turn", "context_pct", "latency"]
 ```
 
 Supported fields:
@@ -2008,18 +2008,35 @@ Supported fields:
 | Field | Renders | Example |
 | --- | --- | --- |
 | `model` | Bare model id, vendor prefix dropped | `gpt-5.4` |
+| `model_last` | Explicitly labelled final model after any fallback | `model(last):gpt-5.4` |
 | `context_pct` | Last-call context occupancy as a percent | `5%` |
 | `latency` | Wall-clock duration of the turn | `22s`, `1m05s` |
 | `cwd` | Home-relative working directory | `~` |
+| `tokens_in` | Raw reported input sum; skipped on detected partial coverage | `15.9k in` |
+| `tokens_out` | Raw reported output sum; skipped on detected partial coverage | `1.2k out` |
+| `tokens_turn` | Labelled known provider usage for this turn | `tokens(reported):15.9k in/1.2k out` |
+| `reasoning_effort` | Final model's Hermes request intent | `effort(req,last):max` |
 
-The default field set is `["model", "context_pct", "cwd"]`. `latency` is opt-in — add it to `fields` to use it. Fields whose data is unavailable are skipped silently rather than rendering an empty slot.
+The default field set is `["model", "context_pct", "cwd"]`. The new fields are
+opt-in. Prefer `tokens_turn` over the two raw token fields: it labels the value
+as provider-`reported`, and labels it `reported,partial` when Hermes sees a
+logical model call without usable usage. These are known deltas from the cached
+agent's counters, not a billing-complete claim about retries or advisor fan-out.
+If fallback occurs, reported tokens can include both primary and fallback
+calls; `model(last)` and `effort(req,last)` name only the final model state. The
+effort is the level Hermes requested after its precedence rules; downstream
+routers or providers may translate it, so it is not proof of how much hidden
+reasoning the provider performed. A turn with no usable positive-prompt usage
+omits tokens instead of showing a synthetic zero. Inactivity-timeout diagnostics
+also omit model/effort/tokens because the interrupted worker may still be
+unwinding. Proxy mode likewise skips provenance that its protocol cannot prove.
 
 The `/footer` slash command toggles this at runtime in any session.
 
 Example footer appended to a Telegram/Discord/Slack reply:
 
 ```
-— claude-opus-4.7 · 12 tool calls · 2m 14s · $0.042
+model(last):glm-5.3 · effort(req,last):max · tokens(reported):15.9k in/1.2k out · 68% · 42s
 ```
 
 Only the **final** message of a turn gets the footer; interim updates stay clean.

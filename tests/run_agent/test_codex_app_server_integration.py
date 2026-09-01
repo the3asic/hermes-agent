@@ -86,6 +86,22 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+        # Codex still counts the turn operationally, but missing tokenUsage
+        # must not be mistaken for a usage-bearing zero-token response.
+        assert agent.session_api_calls == 1
+        assert agent.session_usage_report_calls == 0
+        from gateway.run import _gateway_turn_runtime_metadata
+
+        metadata = _gateway_turn_runtime_metadata(
+            agent,
+            prompt_tokens_start=0,
+            completion_tokens_start=0,
+            usage_report_calls_start=0,
+            result_api_calls=result["api_calls"],
+        )
+        assert metadata["turn_input_tokens"] is None
+        assert metadata["turn_output_tokens"] is None
+
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(
@@ -123,6 +139,7 @@ class TestRunConversationCodexPath:
         assert result["last_prompt_tokens"] == 100
 
         assert agent.session_api_calls == 1
+        assert agent.session_usage_report_calls == 1
         assert agent.session_prompt_tokens == 100
         assert agent.session_completion_tokens == 25
         assert agent.session_total_tokens == 130

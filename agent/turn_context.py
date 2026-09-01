@@ -517,6 +517,22 @@ def _should_idle_compact(
     return tokens > floor_tokens
 
 
+def resolve_gateway_reasoning_after_runtime_restore(agent: Any):
+    """Apply gateway session reasoning after the active model settles.
+
+    The normal turn prologue owns the single primary-restore call. Gateway
+    agents attach a session-aware resolver before ``run_conversation()``;
+    invoking it immediately after restore guarantees session > model > global
+    precedence against the model that will actually make the first request.
+    """
+    resolver = getattr(agent, "_gateway_reasoning_config_resolver", None)
+    if not callable(resolver):
+        return getattr(agent, "reasoning_config", None)
+    resolved = resolver(getattr(agent, "model", "") or "")
+    agent.reasoning_config = resolved
+    return resolved
+
+
 @dataclass
 class TurnContext:
     """Values produced by the turn prologue and consumed by the turn loop."""
@@ -599,6 +615,7 @@ def build_turn_context(
 
     # Restore the primary runtime if the previous turn activated fallback.
     agent._restore_primary_runtime()
+    resolve_gateway_reasoning_after_runtime_restore(agent)
 
     # Tell auxiliary_client what the live main provider/model are for this turn
     # after primary restoration has settled the runtime.

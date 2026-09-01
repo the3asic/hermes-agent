@@ -2504,6 +2504,30 @@ def _fallback_reason_text(reason: "FailoverReason | None") -> str:
     return str(value or reason or "provider failure").replace("_", " ")
 
 
+def _resolve_reasoning_config_for_active_model(
+    agent,
+    model: str,
+    fallback_entry: dict | None = None,
+):
+    """Resolve request effort for a newly active fallback model.
+
+    Fallback effort belongs to the target entry/model. It deliberately does
+    not inherit a gateway session override from the failed primary model.
+    """
+    from hermes_cli.config import load_config
+    from hermes_constants import resolve_fallback_reasoning_config
+
+    try:
+        cfg = load_config() or {}
+    except Exception:
+        # Entry pins are self-contained and still resolve against an empty
+        # config. Never fall back to the failed primary's live effort.
+        cfg = {}
+    return resolve_fallback_reasoning_config(
+        cfg, model, fallback_entry
+    )
+
+
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
@@ -2740,6 +2764,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
+        agent._active_fallback_entry = dict(fb)
+        agent._runtime_reasoning_entry = dict(fb)
 
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream
@@ -2870,26 +2896,28 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             )
 
         # Re-resolve reasoning_config for the new fallback model (Closes #21256).
-        # Shared chokepoint: per-model override > global reasoning_effort
-        # (YAML boolean False = disabled). Wrapped in try/except because a
-        # config load failure must not kill the swap.
+        # Precedence is fallback-entry pin > target-model override > global.
+        # A session override belongs to the failed primary and is intentionally
+        # not propagated across the swap.
+        # Wrapped in try/except because a config load failure must not kill the
+        # swap.
         try:
-            from hermes_cli.config import load_config
-            from hermes_constants import resolve_reasoning_config
-
-            agent.reasoning_config = resolve_reasoning_config(
-                load_config() or {}, agent.model
+            agent.reasoning_config = _resolve_reasoning_config_for_active_model(
+                agent, agent.model, fb
             )
             logger.info(
                 "Fallback %s: reasoning_config resolved: %s",
                 agent.model, agent.reasoning_config,
             )
         except Exception as _reasoning_err:
+            # Target policy failed closed. Inheriting the failed primary's
+            # effort would make fallback behavior depend on unrelated session
+            # state and violates entry ownership.
+            agent.reasoning_config = None
             logger.debug(
-                "Failed to resolve reasoning_config for fallback %s; keeping current: %s",
+                "Failed to resolve reasoning_config for fallback %s; using provider default: %s",
                 agent.model, _reasoning_err,
             )
-            # Keep whatever reasoning_config was active — don't break the fallback swap.
 
         # Re-resolve extra_body for the fallback provider (Closes #75091).
         # The OLD provider's custom_providers-contributed extra_body (e.g. a

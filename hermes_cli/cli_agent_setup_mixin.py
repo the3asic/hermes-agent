@@ -66,6 +66,7 @@ class CLIAgentSetupMixin:
         )
 
         _primary_exc = None
+        resolved_fallback_entry = self._matching_runtime_fallback_entry()
         runtime = None
         try:
             runtime = resolve_runtime_provider(
@@ -103,6 +104,7 @@ class CLIAgentSetupMixin:
                         _cprint(f"⚠️  Primary auth failed — switching to fallback: {_fb_provider} / {_fb_model}")
                         self.requested_provider = _fb_provider
                         self.model = _fb_model
+                        resolved_fallback_entry = dict(_fb)
                         _primary_exc = None
                         break
                     except Exception:
@@ -209,6 +211,7 @@ class CLIAgentSetupMixin:
         # Normalize model for the resolved provider (e.g. swap non-Codex
         # models when provider is openai-codex).  Fixes #651.
         model_changed = self._normalize_model_for_provider(resolved_provider)
+        self._resolved_fallback_entry = resolved_fallback_entry
 
         # AIAgent/OpenAI client holds auth at init time, so rebuild if key,
         # routing, or the effective model changed.
@@ -217,6 +220,55 @@ class CLIAgentSetupMixin:
             self._active_agent_route_signature = None
 
         return True
+
+    def _matching_runtime_fallback_entry(
+        self,
+        *,
+        model: str | None = None,
+        requested_provider: str | None = None,
+    ) -> dict | None:
+        """Return the init-time fallback entry that still owns this route."""
+        entry = getattr(self, "_resolved_fallback_entry", None)
+        if not isinstance(entry, dict):
+            return None
+        active_model = str(model if model is not None else self.model or "").strip()
+        active_provider = str(
+            requested_provider
+            if requested_provider is not None
+            else getattr(self, "requested_provider", self.provider) or ""
+        ).strip().lower()
+        entry_model = str(entry.get("model") or "").strip()
+        entry_provider = str(entry.get("provider") or "").strip().lower()
+        if active_model != entry_model or active_provider != entry_provider:
+            return None
+        return dict(entry)
+
+    def _resolve_cli_route_reasoning(
+        self,
+        *,
+        model: str,
+        requested_provider: str | None,
+    ) -> tuple[dict | None, dict | None]:
+        """Resolve primary or target-owned init-fallback reasoning policy."""
+        fallback_entry = self._matching_runtime_fallback_entry(
+            model=model,
+            requested_provider=requested_provider,
+        )
+        if not isinstance(fallback_entry, dict):
+            return self.reasoning_config, None
+        try:
+            from hermes_cli.config import load_config
+            from hermes_constants import resolve_fallback_reasoning_config
+
+            reasoning_config = resolve_fallback_reasoning_config(
+                load_config() or {},
+                model,
+                fallback_entry,
+            )
+        except Exception:
+            # Never inherit --reasoning or /reasoning from the failed primary.
+            reasoning_config = None
+        return reasoning_config, fallback_entry
 
     def _runtime_credentials_ready(self) -> bool:
         """Silently probe whether any inference provider can be resolved.
@@ -338,9 +390,25 @@ class CLIAgentSetupMixin:
             "args": list(self.acp_args or []),
             "credential_pool": getattr(self, "_credential_pool", None),
         }
+        reasoning_config, fallback_entry = self._resolve_cli_route_reasoning(
+            model=self.model,
+            requested_provider=runtime["requested_provider"],
+        )
+        fallback_signature = (
+            (
+                str(fallback_entry.get("provider") or ""),
+                str(fallback_entry.get("model") or ""),
+                str(fallback_entry.get("base_url") or ""),
+                str(fallback_entry.get("reasoning_effort") or ""),
+            )
+            if fallback_entry
+            else None
+        )
         route = {
             "model": self.model,
             "runtime": runtime,
+            "reasoning_config": reasoning_config,
+            "fallback_entry": fallback_entry,
             "signature": (
                 self.model,
                 runtime["provider"],
@@ -349,6 +417,7 @@ class CLIAgentSetupMixin:
                 runtime["api_mode"],
                 runtime["command"],
                 tuple(runtime["args"]),
+                fallback_signature,
             ),
         }
 
@@ -516,6 +585,12 @@ class CLIAgentSetupMixin:
                 "credential_pool": getattr(self, "_credential_pool", None),
             }
             effective_model = model_override or self.model
+            effective_reasoning, fallback_entry = (
+                self._resolve_cli_route_reasoning(
+                    model=effective_model,
+                    requested_provider=runtime.get("requested_provider"),
+                )
+            )
             self.agent = AIAgent(
                 model=effective_model,
                 api_key=runtime.get("api_key"),
@@ -536,7 +611,7 @@ class CLIAgentSetupMixin:
                 tool_progress_mode=getattr(self, "tool_progress_mode", "all"),
                 ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
                 prefill_messages=self.prefill_messages or None,
-                reasoning_config=self.reasoning_config,
+                reasoning_config=effective_reasoning,
                 service_tier=self.service_tier,
                 request_overrides=request_overrides,
                 providers_allowed=self._providers_only,
@@ -578,6 +653,15 @@ class CLIAgentSetupMixin:
                 notice_clear_callback=self._on_notice_clear,
                 reaction_callback=self._on_reaction,
             )
+            from agent.agent_runtime_helpers import (
+                apply_initial_reasoning_policy_provenance,
+            )
+
+            apply_initial_reasoning_policy_provenance(
+                self.agent,
+                fallback_entry,
+                effective_reasoning,
+            )
             # Store reference for atexit memory provider shutdown.
             # NOTE: this MUST write to the ``cli`` module's global, not a
             # local module global. ``_run_cleanup`` (in cli.py) reads
@@ -610,6 +694,16 @@ class CLIAgentSetupMixin:
                 runtime.get("api_mode"),
                 runtime.get("command"),
                 tuple(runtime.get("args") or ()),
+                (
+                    (
+                        str(fallback_entry.get("provider") or ""),
+                        str(fallback_entry.get("model") or ""),
+                        str(fallback_entry.get("base_url") or ""),
+                        str(fallback_entry.get("reasoning_effort") or ""),
+                    )
+                    if fallback_entry
+                    else None
+                ),
             )
 
             # Force-create DB row on /title intent, then apply title.

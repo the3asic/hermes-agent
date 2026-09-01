@@ -35,6 +35,7 @@ def _make_agent(
     provider="custom",
     base_url="https://my-llm.example.com/v1",
     request_overrides=None,
+    reasoning_config=None,
 ):
     """Create a minimal AIAgent with optional fallback config."""
     with (
@@ -61,6 +62,7 @@ def _make_agent(
             skip_memory=True,
             fallback_model=fallback_model,
             request_overrides=dict(request_overrides or {}),
+            reasoning_config=reasoning_config,
         )
         agent.client = MagicMock()
         return agent
@@ -105,6 +107,20 @@ class TestPrimaryRuntimeSnapshot:
         assert rt["compressor_provider"] == cc.provider
         assert rt["compressor_context_length"] == cc.context_length
         assert rt["compressor_threshold_tokens"] == cc.threshold_tokens
+
+    def test_snapshot_includes_primary_reasoning_even_when_none(self):
+        explicit = _make_agent(
+            reasoning_config={"enabled": True, "effort": "max"}
+        )
+        assert explicit._primary_runtime["reasoning_config"] == {
+            "enabled": True,
+            "effort": "max",
+        }
+        assert explicit._primary_runtime["reasoning_policy_entry"] is None
+
+        provider_default = _make_agent(reasoning_config=None)
+        assert "reasoning_config" in provider_default._primary_runtime
+        assert provider_default._primary_runtime["reasoning_config"] is None
 
     def test_snapshot_includes_anthropic_state_when_applicable(self):
         """Anthropic-mode agents should snapshot Anthropic-specific state."""
@@ -169,6 +185,32 @@ class TestRestorePrimaryRuntime:
         assert agent.model == original_model
         assert agent.provider == original_provider
 
+    def test_restore_reinstates_none_primary_reasoning_and_clears_policy(self):
+        agent = _make_agent(
+            fallback_model={
+                "provider": "openrouter",
+                "model": "fallback-model",
+                "reasoning_effort": "low",
+            },
+            reasoning_config=None,
+        )
+        mock_client = _mock_resolve()
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(mock_client, "fallback-model"),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+        assert agent._runtime_reasoning_entry == {"provider": "openrouter", "model": "fallback-model", "reasoning_effort": "low"}
+
+        with patch("run_agent.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+
+        assert agent.reasoning_config is None
+        assert agent._runtime_reasoning_entry is None
+        assert agent._active_fallback_entry is None
+
     def test_emits_user_visible_primary_restore_notice(self):
         agent = _make_agent(
             fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
@@ -223,6 +265,21 @@ class TestRestorePrimaryRuntime:
 
         emitted = []
         agent._emit_status = emitted.append
+        fallback_state = {
+            "model": agent.model,
+            "provider": agent.provider,
+            "base_url": agent.base_url,
+            "client": agent.client,
+            "reasoning_config": (
+                dict(agent.reasoning_config)
+                if isinstance(agent.reasoning_config, dict)
+                else None
+            ),
+            "runtime_reasoning_entry": dict(agent._runtime_reasoning_entry),
+            "active_fallback_entry": dict(agent._active_fallback_entry),
+            "compressor_model": agent.context_compressor.model,
+            "compressor_provider": agent.context_compressor.provider,
+        }
         with (
             patch("run_agent.OpenAI", return_value=MagicMock()),
             patch.object(
@@ -232,6 +289,25 @@ class TestRestorePrimaryRuntime:
             ),
         ):
             assert agent._restore_primary_runtime() is False
+            assert agent.model == fallback_state["model"]
+            assert agent.provider == fallback_state["provider"]
+            assert agent.base_url == fallback_state["base_url"]
+            assert agent.client is fallback_state["client"]
+            assert agent.reasoning_config == fallback_state["reasoning_config"]
+            assert (
+                agent._runtime_reasoning_entry
+                == fallback_state["runtime_reasoning_entry"]
+            )
+            assert (
+                agent._active_fallback_entry
+                == fallback_state["active_fallback_entry"]
+            )
+            assert agent._fallback_activated is True
+            assert agent.context_compressor.model == fallback_state["compressor_model"]
+            assert (
+                agent.context_compressor.provider
+                == fallback_state["compressor_provider"]
+            )
             assert agent._restore_primary_runtime() is True
 
         assert emitted == [

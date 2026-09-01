@@ -51,6 +51,47 @@ class TestFallbackReasoningOverride:
         result = resolve_per_model_reasoning_effort("gpt-5", overrides)
         assert result is None  # caller falls back to global
 
+    def test_fallback_entry_effort_does_not_inherit_session_override(self):
+        """The target fallback pin wins; primary session effort is isolated."""
+        from agent.chat_completion_helpers import (
+            _resolve_reasoning_config_for_active_model,
+        )
+
+        agent = MagicMock()
+        agent._gateway_reasoning_config_resolver = MagicMock(
+            return_value={"enabled": True, "effort": "max"}
+        )
+
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"agent": {"reasoning_effort": "high"}},
+        ):
+            resolved = _resolve_reasoning_config_for_active_model(
+                agent,
+                "fallback-model",
+                {"reasoning_effort": "low"},
+            )
+
+        assert resolved == {"enabled": True, "effort": "low"}
+        agent._gateway_reasoning_config_resolver.assert_not_called()
+
+    def test_fallback_entry_pin_survives_config_load_failure(self):
+        from agent.chat_completion_helpers import (
+            _resolve_reasoning_config_for_active_model,
+        )
+
+        with patch(
+            "hermes_cli.config.load_config",
+            side_effect=OSError("config unavailable"),
+        ):
+            resolved = _resolve_reasoning_config_for_active_model(
+                MagicMock(),
+                "fallback-model",
+                {"reasoning_effort": "low"},
+            )
+
+        assert resolved == {"enabled": True, "effort": "low"}
+
 
     def test_fallback_recovery_restores_primary_reasoning(self):
         """After fallback + restore_primary_runtime, reasoning_config returns to primary's value.
@@ -86,6 +127,7 @@ class TestFallbackReasoningOverride:
             "compressor_threshold_tokens": 0,
         }
         agent._fallback_activated = True
+        agent._active_fallback_entry = {"reasoning_effort": "xhigh"}
         agent._fallback_index = 0
         agent._fallback_chain = []
         agent._fallback_model = None
@@ -108,6 +150,8 @@ class TestFallbackReasoningOverride:
         # reasoning_config should be restored to primary's value (medium)
         assert agent.reasoning_config == {"enabled": True, "effort": "medium"}
         assert agent.runtime_capabilities == {"native_compaction": True}
+        assert agent._active_fallback_entry is None
+        assert agent._runtime_reasoning_entry is None
 
     def test_fallback_global_fallback_with_yaml_false(self):
         """Fallback global fallback must not coerce YAML boolean False.

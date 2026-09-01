@@ -12,13 +12,31 @@ Config (``~/.hermes/config.yaml``)::
         fields: [model, context_pct, cwd]   # order shown; drop any to hide
 
 Available fields:
-    model        — bare model id, vendor prefix dropped (``gpt-5.4``)
-    context_pct  — last-call context occupancy as a percent (``5%``)
-    latency      — wall-clock duration of the turn (``22s``, ``1m05s``)
-    cwd          — home-relative working dir (``~``)
+    model             — bare model id, vendor prefix dropped (``gpt-5.4``)
+    model_last        — explicitly labelled final model (``model(last):gpt-5.4``)
+    context_pct       — last-call context occupancy as a percent (``5%``)
+    latency           — wall-clock duration of the turn (``22s``, ``1m05s``)
+    cwd               — home-relative working dir (``~``)
+    tokens_in         — this turn's summed provider prompt tokens (``15.9k in``)
+    tokens_out        — this turn's summed provider completion tokens (``1.2k out``)
+    tokens_turn       — labelled known provider usage (``tokens(reported):15.9k in/1.2k out``)
+    reasoning_effort  — final model's request intent (``effort(req,last):max``)
 
-``latency`` is opt-in: it is NOT in the default field set, so a footer whose
-``fields`` are unset renders exactly as before.
+``model_last``, ``latency``, ``tokens_in``, ``tokens_out``, ``tokens_turn``, and
+``reasoning_effort`` are opt-in: they are NOT in the default field set, so a
+footer whose ``fields`` are unset renders exactly as before.
+
+``model_last`` and ``reasoning_effort`` are deliberately labelled ``last``:
+fallback can change both during a turn. The effort is Hermes' request intent
+for that final model, not a provider claim about how much reasoning was
+ultimately performed. ``tokens_in`` and ``tokens_out`` are known
+provider-reported deltas and can include calls made before a fallback; they are
+not the final model's exclusive usage and are not the cached agent's cumulative
+session counters. ``tokens_turn`` never claims
+billing completeness: it is labelled ``reported`` and becomes
+``reported,partial`` when Hermes sees logical calls without usable usage.
+When no usable positive-prompt usage exists, it is skipped rather than shown
+as a synthetic zero.
 
 Per-platform overrides live under ``display.platforms.<platform>.runtime_footer``.
 Users can toggle the global setting with ``/footer on|off`` from both the CLI
@@ -28,8 +46,7 @@ The footer is appended to the final response text in ``gateway/run.py`` right
 before returning the response to the adapter send path — so it only lands on
 the final message a user sees, not on tool-progress updates or streaming
 partials.  When streaming is on and the final text has already been delivered
-piecemeal, the footer is sent as a separate trailing message via
-``send_trailing_footer()``.
+piecemeal, the delivery path sends the footer as a separate trailing message.
 """
 
 from __future__ import annotations
@@ -39,6 +56,49 @@ from typing import Any, Iterable, Optional
 
 _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
+
+
+def _format_token_count(value: int) -> str:
+    """Format a non-negative token count compactly without losing its unit."""
+    if value < 1_000:
+        return str(value)
+    if value < 1_000_000:
+        return f"{value / 1_000:.1f}k"
+    return f"{value / 1_000_000:.1f}M"
+
+
+def turn_counter_delta(current: Any, baseline: Any) -> Optional[int]:
+    """Return this turn's non-negative counter delta.
+
+    Cached agents keep cumulative token counters across turns. The counters are
+    initialized once and only increment in the current runtime. A decrease is
+    therefore an accounting anomaly, not a new generation we can safely infer;
+    report the value as unavailable instead of fabricating a delta.
+    """
+    try:
+        current_int = int(current)
+        baseline_int = int(baseline)
+    except (TypeError, ValueError):
+        return None
+    if current_int < 0 or baseline_int < 0:
+        return None
+    if current_int < baseline_int:
+        return None
+    return current_int - baseline_int
+
+
+def resolved_reasoning_effort(reasoning_config: Any) -> str:
+    """Return Hermes' resolved request effort for display.
+
+    ``default`` means Hermes did not send an explicit level. This is request
+    intent only; downstream routers/providers can still translate it.
+    """
+    if not isinstance(reasoning_config, dict):
+        return "default"
+    if reasoning_config.get("enabled") is False:
+        return "none"
+    effort = str(reasoning_config.get("effort") or "").strip().lower()
+    return effort or "default"
 
 
 def _home_relative_cwd(cwd: str) -> str:
@@ -115,6 +175,10 @@ def format_runtime_footer(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    tokens_in: Optional[int] = None,
+    tokens_out: Optional[int] = None,
+    token_usage_status: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
@@ -128,6 +192,10 @@ def format_runtime_footer(
             m = _model_short(model)
             if m:
                 parts.append(m)
+        elif field == "model_last":
+            m = _model_short(model)
+            if m:
+                parts.append(f"model(last):{m}")
         elif field == "context_pct":
             if context_length and context_length > 0 and context_tokens >= 0:
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
@@ -141,6 +209,49 @@ def format_runtime_footer(
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
                 parts.append(rel)
+        elif field == "tokens_in":
+            if (
+                token_usage_status == "reported"
+                and isinstance(tokens_in, int)
+                and not isinstance(tokens_in, bool)
+                and tokens_in >= 0
+            ):
+                parts.append(f"{_format_token_count(tokens_in)} in")
+        elif field == "tokens_out":
+            if (
+                token_usage_status == "reported"
+                and isinstance(tokens_out, int)
+                and not isinstance(tokens_out, bool)
+                and tokens_out >= 0
+            ):
+                parts.append(f"{_format_token_count(tokens_out)} out")
+        elif field == "tokens_turn":
+            reported: list[str] = []
+            if (
+                isinstance(tokens_in, int)
+                and not isinstance(tokens_in, bool)
+                and tokens_in >= 0
+            ):
+                reported.append(f"{_format_token_count(tokens_in)} in")
+            if (
+                isinstance(tokens_out, int)
+                and not isinstance(tokens_out, bool)
+                and tokens_out >= 0
+            ):
+                reported.append(f"{_format_token_count(tokens_out)} out")
+            if reported and token_usage_status in {
+                "reported",
+                "reported_partial",
+            }:
+                label = (
+                    "tokens(reported,partial)"
+                    if token_usage_status == "reported_partial"
+                    else "tokens(reported)"
+                )
+                parts.append(f"{label}:{'/'.join(reported)}")
+        elif field == "reasoning_effort":
+            if reasoning_effort:
+                parts.append(f"effort(req,last):{reasoning_effort}")
         # Unknown field names are silently ignored.
 
     if not parts:
@@ -157,6 +268,10 @@ def build_footer_line(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    tokens_in: Optional[int] = None,
+    tokens_out: Optional[int] = None,
+    token_usage_status: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -177,5 +292,9 @@ def build_footer_line(
         context_length=context_length,
         cwd=cwd,
         turn_seconds=turn_seconds,
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        token_usage_status=token_usage_status,
+        reasoning_effort=reasoning_effort,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )

@@ -199,6 +199,10 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+    if prompt_tokens > 0:
+        agent.session_usage_report_calls = (
+            getattr(agent, "session_usage_report_calls", 0) + 1
+        )
 
     cost_result = estimate_usage_cost(
         agent.model,
