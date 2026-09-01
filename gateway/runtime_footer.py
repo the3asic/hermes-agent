@@ -15,11 +15,16 @@ Available fields:
     model             — bare model id, vendor prefix dropped (``gpt-5.4``)
     model_last        — explicitly labelled final model (``model(last):gpt-5.4``)
     context_pct       — last-call context occupancy as a percent (``5%``)
+    context_window    — last-call context used/total plus percent
+                        (``ctx(last):123.0k/1.0M (12%)``)
     latency           — wall-clock duration of the turn (``22s``, ``1m05s``)
     cwd               — home-relative working dir (``~``)
-    tokens_in         — this turn's summed provider prompt tokens (``15.9k in``)
+    tokens_in         — this turn's summed non-cached provider input (``15.9k in``)
     tokens_out        — this turn's summed provider completion tokens (``1.2k out``)
-    tokens_turn       — labelled known provider usage (``tokens(reported):15.9k in/1.2k out``)
+    tokens_turn       — labelled non-cached turn usage
+                        (``tokens(turn,uncached):15.9k in/1.2k out``)
+    cache_hit         — this turn's provider-reported prompt cache hit ratio
+                        (``cache(turn):87%``)
     reasoning_effort  — final model's request intent (``effort(req,last):max``)
 
 ``model_last``, ``latency``, ``tokens_in``, ``tokens_out``, ``tokens_turn``, and
@@ -30,11 +35,15 @@ footer whose ``fields`` are unset renders exactly as before.
 fallback can change both during a turn. The effort is Hermes' request intent
 for that final model, not a provider claim about how much reasoning was
 ultimately performed. ``tokens_in`` and ``tokens_out`` are known
-provider-reported deltas and can include calls made before a fallback; they are
-not the final model's exclusive usage and are not the cached agent's cumulative
-session counters. ``tokens_turn`` never claims
-billing completeness: it is labelled ``reported`` and becomes
-``reported,partial`` when Hermes sees logical calls without usable usage.
+provider-reported non-cached deltas and can include calls made before a
+fallback; they are not the final model's exclusive usage and are not the
+cached agent's cumulative session counters. Cached input is excluded from
+``tokens_turn`` but remains part of ``context_window`` because cached tokens
+still occupy the model context. ``tokens_turn`` becomes
+``tokens(turn,uncached,partial)`` when Hermes sees logical calls without usable usage.
+``cache_hit`` uses cache-read tokens divided by all prompt-input buckets
+(``uncached + cache-read + cache-write``); cache writes are prompt tokens but
+are not cache hits. It becomes ``cache(turn,partial)`` under partial coverage.
 When no usable positive-prompt usage exists, it is skipped rather than shown
 as a synthetic zero.
 
@@ -177,6 +186,8 @@ def format_runtime_footer(
     turn_seconds: Optional[float] = None,
     tokens_in: Optional[int] = None,
     tokens_out: Optional[int] = None,
+    cache_read_tokens: Optional[int] = None,
+    cache_write_tokens: Optional[int] = None,
     token_usage_status: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
@@ -200,6 +211,14 @@ def format_runtime_footer(
             if context_length and context_length > 0 and context_tokens >= 0:
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
                 parts.append(f"{pct}%")
+        elif field == "context_window":
+            if context_length and context_length > 0 and context_tokens >= 0:
+                pct = max(0, min(100, round((context_tokens / context_length) * 100)))
+                parts.append(
+                    "ctx(last):"
+                    f"{_format_token_count(context_tokens)}/"
+                    f"{_format_token_count(context_length)} ({pct}%)"
+                )
         elif field == "latency":
             # Wall-clock turn duration. Skipped when the caller supplied no
             # timing (call sites that don't measure) or the value is negative.
@@ -244,11 +263,31 @@ def format_runtime_footer(
                 "reported_partial",
             }:
                 label = (
-                    "tokens(reported,partial)"
+                    "tokens(turn,uncached,partial)"
                     if token_usage_status == "reported_partial"
-                    else "tokens(reported)"
+                    else "tokens(turn,uncached)"
                 )
                 parts.append(f"{label}:{'/'.join(reported)}")
+        elif field == "cache_hit":
+            cache_buckets = (tokens_in, cache_read_tokens, cache_write_tokens)
+            if (
+                token_usage_status in {"reported", "reported_partial"}
+                and all(
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                    for value in cache_buckets
+                )
+            ):
+                prompt_tokens = sum(cache_buckets)
+                if prompt_tokens > 0:
+                    cache_pct = round((cache_read_tokens / prompt_tokens) * 100)
+                    label = (
+                        "cache(turn,partial)"
+                        if token_usage_status == "reported_partial"
+                        else "cache(turn)"
+                    )
+                    parts.append(f"{label}:{cache_pct}%")
         elif field == "reasoning_effort":
             if reasoning_effort:
                 parts.append(f"effort(req,last):{reasoning_effort}")
@@ -270,6 +309,8 @@ def build_footer_line(
     turn_seconds: Optional[float] = None,
     tokens_in: Optional[int] = None,
     tokens_out: Optional[int] = None,
+    cache_read_tokens: Optional[int] = None,
+    cache_write_tokens: Optional[int] = None,
     token_usage_status: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
 ) -> str:
@@ -294,6 +335,8 @@ def build_footer_line(
         turn_seconds=turn_seconds,
         tokens_in=tokens_in,
         tokens_out=tokens_out,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
         token_usage_status=token_usage_status,
         reasoning_effort=reasoning_effort,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,

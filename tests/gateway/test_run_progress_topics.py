@@ -966,7 +966,10 @@ class QueuedFooterAgent:
         self.model = "glm-5.3"
         self.reasoning_config = {"enabled": True, "effort": "max"}
         self.session_prompt_tokens = 10_000
+        self.session_input_tokens = 10_000
         self.session_completion_tokens = 500
+        self.session_cache_read_tokens = 0
+        self.session_cache_write_tokens = 0
         self.session_api_calls = 0
         self.session_usage_report_calls = 0
         self.context_compressor = SimpleNamespace(
@@ -976,8 +979,10 @@ class QueuedFooterAgent:
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
         type(self).calls += 1
-        self.session_prompt_tokens += 2_500
+        self.session_prompt_tokens += 50_000
+        self.session_input_tokens += 2_500
         self.session_completion_tokens += 400
+        self.session_cache_read_tokens += 47_500
         self.session_api_calls += 1
         self.session_usage_report_calls += 1
         self.context_compressor.last_prompt_tokens = 50_000
@@ -1004,7 +1009,10 @@ class MissingUsageFooterAgent:
         self.model = "glm-5.3"
         self.reasoning_config = {"enabled": True, "effort": "max"}
         self.session_prompt_tokens = 10_000
+        self.session_input_tokens = 10_000
         self.session_completion_tokens = 500
+        self.session_cache_read_tokens = 0
+        self.session_cache_write_tokens = 0
         self.session_api_calls = 2
         self.session_usage_report_calls = 2
         self.context_compressor = SimpleNamespace(
@@ -1024,8 +1032,10 @@ class MixedUsageFooterAgent(MissingUsageFooterAgent):
     """Two-call tool loop has usage for only one provider response."""
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
-        self.session_prompt_tokens += 2_500
+        self.session_prompt_tokens += 50_000
+        self.session_input_tokens += 2_500
         self.session_completion_tokens += 400
+        self.session_cache_read_tokens += 47_500
         self.session_api_calls += 1
         self.session_usage_report_calls += 1
         return {
@@ -1052,7 +1062,10 @@ class RouteReasoningCaptureAgent:
         self._runtime_reasoning_entry = None
         self._primary_runtime = {}
         self.session_prompt_tokens = 0
+        self.session_input_tokens = 0
         self.session_completion_tokens = 0
+        self.session_cache_read_tokens = 0
+        self.session_cache_write_tokens = 0
         self.session_usage_report_calls = 0
         self.context_compressor = SimpleNamespace(
             last_prompt_tokens=0,
@@ -1404,6 +1417,8 @@ async def test_run_agent_queued_message_adds_one_footer_per_visible_turn(
                         "model_last",
                         "reasoning_effort",
                         "tokens_turn",
+                        "cache_hit",
+                        "context_window",
                     ],
                 },
             }
@@ -1416,7 +1431,8 @@ async def test_run_agent_queued_message_adds_one_footer_per_visible_turn(
     assert first_turn_sends == [
         "first response\n\n"
         "model(last):glm-5.3 · effort(req,last):max · "
-        "tokens(reported):2.5k in/400 out"
+        "tokens(turn,uncached):2.5k in/400 out · cache(turn):95% · "
+        "ctx(last):50.0k/1.0M (5%)"
     ]
     assert first_turn_sends[0].count("model(last):") == 1
 
@@ -1451,6 +1467,8 @@ async def test_run_agent_streamed_queued_turn_sends_one_trailing_footer(
                         "model_last",
                         "reasoning_effort",
                         "tokens_turn",
+                        "cache_hit",
+                        "context_window",
                     ],
                 },
             },
@@ -1464,7 +1482,8 @@ async def test_run_agent_streamed_queued_turn_sends_one_trailing_footer(
 
     first_footer = (
         "model(last):glm-5.3 · effort(req,last):max · "
-        "tokens(reported):2.5k in/400 out"
+        "tokens(turn,uncached):2.5k in/400 out · cache(turn):95% · "
+        "ctx(last):50.0k/1.0M (5%)"
     )
     visible_text = [call["content"] for call in adapter.sent + adapter.edits]
     assert [text for text in visible_text if first_footer in text] == [first_footer]

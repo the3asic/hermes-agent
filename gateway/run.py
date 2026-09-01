@@ -4588,8 +4588,10 @@ def _preserve_queued_followup_history_offset(
 def _gateway_turn_runtime_metadata(
     agent: Any,
     *,
-    prompt_tokens_start: Any,
+    uncached_input_tokens_start: Any,
     completion_tokens_start: Any,
+    cache_read_tokens_start: Any,
+    cache_write_tokens_start: Any,
     usage_report_calls_start: Any,
     result_api_calls: Any,
 ) -> dict[str, Any]:
@@ -4610,7 +4612,10 @@ def _gateway_turn_runtime_metadata(
     last_prompt_tokens = getattr(compressor, "last_prompt_tokens", 0) or 0
     context_length = getattr(compressor, "context_length", 0) or 0
     input_tokens = getattr(agent, "session_prompt_tokens", 0) or 0
+    uncached_input_tokens = getattr(agent, "session_input_tokens", 0) or 0
     output_tokens = getattr(agent, "session_completion_tokens", 0) or 0
+    cache_read_tokens = getattr(agent, "session_cache_read_tokens", 0) or 0
+    cache_write_tokens = getattr(agent, "session_cache_write_tokens", 0) or 0
     usage_report_calls = (
         getattr(agent, "session_usage_report_calls", 0) or 0
     )
@@ -4620,12 +4625,23 @@ def _gateway_turn_runtime_metadata(
         turn_counter_delta,
     )
 
-    turn_input_tokens = turn_counter_delta(input_tokens, prompt_tokens_start)
+    turn_input_tokens = turn_counter_delta(
+        uncached_input_tokens,
+        uncached_input_tokens_start,
+    )
     turn_output_tokens = turn_counter_delta(
         output_tokens, completion_tokens_start
     )
+    turn_cache_read_tokens = turn_counter_delta(
+        cache_read_tokens, cache_read_tokens_start
+    )
+    turn_cache_write_tokens = turn_counter_delta(
+        cache_write_tokens, cache_write_tokens_start
+    )
     input_counter_valid = turn_input_tokens is not None
     output_counter_valid = turn_output_tokens is not None
+    cache_read_counter_valid = turn_cache_read_tokens is not None
+    cache_write_counter_valid = turn_cache_write_tokens is not None
     turn_usage_report_calls = turn_counter_delta(
         usage_report_calls, usage_report_calls_start
     )
@@ -4639,6 +4655,8 @@ def _gateway_turn_runtime_metadata(
         and turn_usage_report_calls > 0
         and turn_input_tokens is not None
         and turn_output_tokens is not None
+        and turn_cache_read_tokens is not None
+        and turn_cache_write_tokens is not None
     ):
         token_usage_status = "reported"
         if (
@@ -4656,12 +4674,14 @@ def _gateway_turn_runtime_metadata(
         )
         turn_input_tokens = None
         turn_output_tokens = None
+        turn_cache_read_tokens = None
+        turn_cache_write_tokens = None
     if not input_counter_valid:
         logger.warning(
-            "Gateway prompt-token counter moved backwards or became invalid "
+            "Gateway non-cached input-token counter moved backwards or became invalid "
             "during a turn (start=%r current=%r); footer usage unavailable",
-            prompt_tokens_start,
-            input_tokens,
+            uncached_input_tokens_start,
+            uncached_input_tokens,
         )
     if not output_counter_valid:
         logger.warning(
@@ -4670,15 +4690,34 @@ def _gateway_turn_runtime_metadata(
             completion_tokens_start,
             output_tokens,
         )
+    if not cache_read_counter_valid:
+        logger.warning(
+            "Gateway cache-read-token counter moved backwards or became invalid "
+            "during a turn (start=%r current=%r); footer cache ratio unavailable",
+            cache_read_tokens_start,
+            cache_read_tokens,
+        )
+    if not cache_write_counter_valid:
+        logger.warning(
+            "Gateway cache-write-token counter moved backwards or became invalid "
+            "during a turn (start=%r current=%r); footer cache ratio unavailable",
+            cache_write_tokens_start,
+            cache_write_tokens,
+        )
 
     model_last = getattr(agent, "model", None)
     return {
         "last_prompt_tokens": last_prompt_tokens,
         "input_tokens": input_tokens,
+        "uncached_input_tokens": uncached_input_tokens,
         "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
         "usage_report_calls": usage_report_calls,
         "turn_input_tokens": turn_input_tokens,
         "turn_output_tokens": turn_output_tokens,
+        "turn_cache_read_tokens": turn_cache_read_tokens,
+        "turn_cache_write_tokens": turn_cache_write_tokens,
         "token_usage_status": token_usage_status,
         "reasoning_effort": resolved_reasoning_effort(
             getattr(agent, "reasoning_config", None)
@@ -4839,6 +4878,8 @@ def _gateway_runtime_footer_line(
         turn_seconds=result_seconds,
         tokens_in=agent_result.get("turn_input_tokens"),
         tokens_out=agent_result.get("turn_output_tokens"),
+        cache_read_tokens=agent_result.get("turn_cache_read_tokens"),
+        cache_write_tokens=agent_result.get("turn_cache_write_tokens"),
         token_usage_status=agent_result.get("token_usage_status"),
         reasoning_effort=agent_result.get("reasoning_effort"),
     )
@@ -7187,9 +7228,17 @@ class TurnRunner:
         # Cached agents keep cumulative usage counters across turns. Snapshot
         # immediately before this turn's model loop so the runtime footer can
         # report honest per-turn deltas instead of session totals.
-        _turn_prompt_tokens_start = getattr(agent, "session_prompt_tokens", 0) or 0
+        _turn_uncached_input_tokens_start = (
+            getattr(agent, "session_input_tokens", 0) or 0
+        )
         _turn_completion_tokens_start = (
             getattr(agent, "session_completion_tokens", 0) or 0
+        )
+        _turn_cache_read_tokens_start = (
+            getattr(agent, "session_cache_read_tokens", 0) or 0
+        )
+        _turn_cache_write_tokens_start = (
+            getattr(agent, "session_cache_write_tokens", 0) or 0
         )
         _turn_usage_report_calls_start = (
             getattr(agent, "session_usage_report_calls", 0) or 0
@@ -7333,8 +7382,10 @@ class TurnRunner:
         _agent = ctx.agent_holder[0]
         _runtime_metadata = _gateway_turn_runtime_metadata(
             _agent,
-            prompt_tokens_start=_turn_prompt_tokens_start,
+            uncached_input_tokens_start=_turn_uncached_input_tokens_start,
             completion_tokens_start=_turn_completion_tokens_start,
+            cache_read_tokens_start=_turn_cache_read_tokens_start,
+            cache_write_tokens_start=_turn_cache_write_tokens_start,
             usage_report_calls_start=_turn_usage_report_calls_start,
             result_api_calls=(
                 result.get("api_calls") if isinstance(result, dict) else None
@@ -7346,6 +7397,8 @@ class TurnRunner:
         _context_length = _runtime_metadata.get("context_length", 0)
         _turn_input_toks = _runtime_metadata.get("turn_input_tokens")
         _turn_output_toks = _runtime_metadata.get("turn_output_tokens")
+        _turn_cache_read_toks = _runtime_metadata.get("turn_cache_read_tokens")
+        _turn_cache_write_toks = _runtime_metadata.get("turn_cache_write_tokens")
         _token_usage_status = _runtime_metadata.get("token_usage_status")
         _reasoning_effort = _runtime_metadata.get("reasoning_effort")
         _resolved_model = _runtime_metadata.get("model_last")
@@ -7485,6 +7538,8 @@ class TurnRunner:
                 "output_tokens": _output_toks,
                 "turn_input_tokens": _turn_input_toks,
                 "turn_output_tokens": _turn_output_toks,
+                "turn_cache_read_tokens": _turn_cache_read_toks,
+                "turn_cache_write_tokens": _turn_cache_write_toks,
                 "token_usage_status": _token_usage_status,
                 "reasoning_effort": _reasoning_effort,
                 "model": _resolved_model,
@@ -7571,6 +7626,8 @@ class TurnRunner:
             "output_tokens": _output_toks,
             "turn_input_tokens": _turn_input_toks,
             "turn_output_tokens": _turn_output_toks,
+            "turn_cache_read_tokens": _turn_cache_read_toks,
+            "turn_cache_write_tokens": _turn_cache_write_toks,
             "token_usage_status": _token_usage_status,
             "reasoning_effort": _reasoning_effort,
             "model": _resolved_model,

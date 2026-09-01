@@ -94,8 +94,10 @@ class TestRunConversationCodexPath:
 
         metadata = _gateway_turn_runtime_metadata(
             agent,
-            prompt_tokens_start=0,
+            uncached_input_tokens_start=0,
             completion_tokens_start=0,
+            cache_read_tokens_start=0,
+            cache_write_tokens_start=0,
             usage_report_calls_start=0,
             result_api_calls=result["api_calls"],
         )
