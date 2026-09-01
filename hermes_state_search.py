@@ -2101,8 +2101,11 @@ class SessionSearchMixin:
                         matches = [dict(row) for row in cursor.fetchall()]
                 else:
                     # Live search must remain bounded. The corruption handler
-                    # detached the derived indexes, so answer from canonical
-                    # message rows and leave the rebuild to `sessions repair`.
+                    # detaches the derived indexes here, then answers from
+                    # canonical rows and leaves rebuild to `sessions repair`.
+                    # A non-FTS DatabaseError must still fail closed.
+                    if not self._enter_fts_fail_open(exc) and self._fts_enabled:
+                        raise
                     matches = self._search_messages_like_fallback(
                         query,
                         source_filter=source_filter,

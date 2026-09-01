@@ -6130,7 +6130,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "explicit offline maintenance and keeping canonical writes "
                 "available."
             )
-            self._enter_fts_fail_open(exc)
             return False
 
         # The explicit override is intended for offline maintenance or small,
@@ -6144,7 +6143,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "FTS sync so canonical writes can continue.",
                 foreign_holders,
             )
-            self._enter_fts_fail_open(exc)
             return False
         logger.warning(
             "state.db write failed with an FTS-corruption error (%s) — "
