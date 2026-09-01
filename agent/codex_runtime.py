@@ -106,12 +106,12 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     """Translate Codex app-server token usage into Hermes accounting.
 
     Codex app-server reports usage via thread/tokenUsage/updated as:
-    inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens,
-    totalTokens.
+    inputTokens, cachedInputTokens, cacheWriteInputTokens, outputTokens,
+    reasoningOutputTokens, totalTokens.
 
-    Hermes' canonical prompt bucket includes uncached input + cached input.
-    The Codex app-server protocol does not currently expose cache-write tokens,
-    so that bucket remains zero on this runtime.
+    ``inputTokens`` is the total prompt input, including the cached/read and
+    cache-write subsets. Hermes stores disjoint canonical buckets, so those
+    subsets are subtracted before recording non-cached input.
 
     Even when Codex omits usage for a turn, Hermes should still count that turn
     as one API call for session/status accounting.
@@ -153,8 +153,10 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
 
     from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
 
-    input_tokens = _coerce_usage_int(usage.get("inputTokens"))
+    input_total = _coerce_usage_int(usage.get("inputTokens"))
     cache_read_tokens = _coerce_usage_int(usage.get("cachedInputTokens"))
+    cache_write_tokens = _coerce_usage_int(usage.get("cacheWriteInputTokens"))
+    input_tokens = max(0, input_total - cache_read_tokens - cache_write_tokens)
     output_tokens = _coerce_usage_int(usage.get("outputTokens"))
     reasoning_tokens = _coerce_usage_int(usage.get("reasoningOutputTokens"))
     reported_total = _coerce_usage_int(usage.get("totalTokens"))
@@ -163,7 +165,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
-        cache_write_tokens=0,
+        cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
         raw_usage=usage,
     )
@@ -203,6 +205,11 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         agent.session_usage_report_calls = (
             getattr(agent, "session_usage_report_calls", 0) + 1
         )
+        agent.session_last_prompt_tokens = prompt_tokens
+        if "cachedInputTokens" in usage:
+            agent.session_cache_usage_report_calls = (
+                getattr(agent, "session_cache_usage_report_calls", 0) + 1
+            )
 
     cost_result = estimate_usage_cost(
         agent.model,

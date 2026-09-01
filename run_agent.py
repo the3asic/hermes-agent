@@ -839,9 +839,11 @@ class AIAgent:
         self.session_reasoning_tokens = 0
         self.session_api_calls = 0
         self.session_usage_report_calls = 0
+        self.session_cache_usage_report_calls = 0
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
+        self.session_last_prompt_tokens = 0
 
         # Session boundary: the usage anchor describes the OLD session's
         # transcript — a fresh/branched/resumed session must fall back to

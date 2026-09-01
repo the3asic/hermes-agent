@@ -88,6 +88,17 @@ def test_format_footer_context_window_shows_absolute_last_call_state():
     assert out == "ctx(last):123.0k/1.0M (12%)"
 
 
+def test_format_footer_context_window_hides_stale_or_unverified_value():
+    out = format_runtime_footer(
+        model="glm-5.3",
+        context_tokens=122_971,
+        context_length=1_000_000,
+        context_usage_status=None,
+        fields=("context_window",),
+    )
+    assert out == ""
+
+
 @pytest.mark.parametrize(
     "value,expected",
     [
@@ -141,6 +152,8 @@ def test_gateway_turn_metadata_uses_final_model_and_reported_turn_delta():
         session_completion_tokens=900,
         session_cache_read_tokens=5_000,
         session_cache_write_tokens=0,
+        session_cache_usage_report_calls=3,
+        session_last_prompt_tokens=50_000,
         session_api_calls=3,
         session_usage_report_calls=3,
         context_compressor=SimpleNamespace(
@@ -155,6 +168,7 @@ def test_gateway_turn_metadata_uses_final_model_and_reported_turn_delta():
         cache_read_tokens_start=0,
         cache_write_tokens_start=0,
         usage_report_calls_start=2,
+        cache_usage_report_calls_start=2,
         result_api_calls=1,
     )
 
@@ -166,11 +180,14 @@ def test_gateway_turn_metadata_uses_final_model_and_reported_turn_delta():
         "cache_read_tokens": 5_000,
         "cache_write_tokens": 0,
         "usage_report_calls": 3,
+        "cache_usage_report_calls": 3,
         "turn_input_tokens": 2_500,
         "turn_output_tokens": 400,
         "turn_cache_read_tokens": 5_000,
         "turn_cache_write_tokens": 0,
         "token_usage_status": "reported",
+        "cache_usage_status": "reported",
+        "context_usage_status": "reported",
         "reasoning_effort": "high",
         "model": "fallback-model",
         "model_last": "fallback-model",
@@ -189,6 +206,8 @@ def test_cache_heavy_turn_does_not_report_reused_context_as_new_input():
         session_completion_tokens=3_446,
         session_cache_read_tokens=915_136,
         session_cache_write_tokens=0,
+        session_cache_usage_report_calls=8,
+        session_last_prompt_tokens=122_971,
         session_api_calls=8,
         session_usage_report_calls=8,
         context_compressor=SimpleNamespace(
@@ -204,6 +223,7 @@ def test_cache_heavy_turn_does_not_report_reused_context_as_new_input():
         cache_read_tokens_start=0,
         cache_write_tokens_start=0,
         usage_report_calls_start=0,
+        cache_usage_report_calls_start=0,
         result_api_calls=8,
     )
 
@@ -221,6 +241,8 @@ def test_cache_heavy_turn_does_not_report_reused_context_as_new_input():
         cache_read_tokens=metadata["turn_cache_read_tokens"],
         cache_write_tokens=metadata["turn_cache_write_tokens"],
         token_usage_status=metadata["token_usage_status"],
+        cache_usage_status=metadata["cache_usage_status"],
+        context_usage_status=metadata["context_usage_status"],
         fields=("tokens_turn", "cache_hit", "context_window"),
     )
     assert footer == (
@@ -256,6 +278,8 @@ def test_gateway_turn_metadata_labels_or_hides_incomplete_provider_usage(
         session_completion_tokens=completion_now,
         session_cache_read_tokens=0,
         session_cache_write_tokens=0,
+        session_cache_usage_report_calls=usage_calls_now,
+        session_last_prompt_tokens=50_000,
         session_api_calls=usage_calls_now,
         session_usage_report_calls=usage_calls_now,
         context_compressor=SimpleNamespace(
@@ -270,6 +294,7 @@ def test_gateway_turn_metadata_labels_or_hides_incomplete_provider_usage(
         cache_read_tokens_start=0,
         cache_write_tokens_start=0,
         usage_report_calls_start=2,
+        cache_usage_report_calls_start=2,
         result_api_calls=result_calls,
     )
 
@@ -278,6 +303,8 @@ def test_gateway_turn_metadata_labels_or_hides_incomplete_provider_usage(
         metadata["turn_output_tokens"],
     ) == expected_tokens
     assert metadata["token_usage_status"] == expected_status
+    assert metadata["context_usage_status"] is None
+    assert metadata["cache_usage_status"] == expected_status
     assert metadata["model_last"] == "glm-5.3"
     assert metadata["reasoning_effort"] == "max"
 
@@ -530,6 +557,7 @@ def test_format_footer_cache_hit_ratio_uses_all_prompt_buckets(status, expected)
         cache_read_tokens=95_000,
         cache_write_tokens=3_000,
         token_usage_status=status,
+        cache_usage_status=status,
         fields=("cache_hit",),
     )
     assert out == expected
@@ -544,9 +572,25 @@ def test_format_footer_cache_hit_renders_zero_for_complete_uncached_turn():
         cache_read_tokens=0,
         cache_write_tokens=0,
         token_usage_status="reported",
+        cache_usage_status="reported",
         fields=("cache_hit",),
     )
     assert out == "cache(turn):0%"
+
+
+def test_format_footer_cache_hit_hides_unknown_provider_telemetry():
+    out = format_runtime_footer(
+        model="glm-5.3",
+        context_tokens=0,
+        context_length=None,
+        tokens_in=10_000,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+        token_usage_status="reported",
+        cache_usage_status=None,
+        fields=("cache_hit",),
+    )
+    assert out == ""
 
 
 def test_raw_token_fields_skip_detected_partial_usage():

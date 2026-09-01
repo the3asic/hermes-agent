@@ -99,6 +99,7 @@ class TestRunConversationCodexPath:
             cache_read_tokens_start=0,
             cache_write_tokens_start=0,
             usage_report_calls_start=0,
+            cache_usage_report_calls_start=0,
             result_api_calls=result["api_calls"],
         )
         assert metadata["turn_input_tokens"] is None
@@ -115,6 +116,7 @@ class TestRunConversationCodexPath:
                     "totalTokens": 130,
                     "inputTokens": 80,
                     "cachedInputTokens": 20,
+                    "cacheWriteInputTokens": 10,
                     "outputTokens": 25,
                     "reasoningOutputTokens": 5,
                 },
@@ -130,27 +132,29 @@ class TestRunConversationCodexPath:
             result = agent.run_conversation("hello")
 
         assert result["api_calls"] == 1
-        assert result["prompt_tokens"] == 100
+        assert result["prompt_tokens"] == 80
         assert result["completion_tokens"] == 25
         assert result["total_tokens"] == 130
-        assert result["input_tokens"] == 80
+        assert result["input_tokens"] == 50
         assert result["output_tokens"] == 25
         assert result["cache_read_tokens"] == 20
-        assert result["cache_write_tokens"] == 0
+        assert result["cache_write_tokens"] == 10
         assert result["reasoning_tokens"] == 5
-        assert result["last_prompt_tokens"] == 100
+        assert result["last_prompt_tokens"] == 80
 
         assert agent.session_api_calls == 1
         assert agent.session_usage_report_calls == 1
-        assert agent.session_prompt_tokens == 100
+        assert agent.session_prompt_tokens == 80
         assert agent.session_completion_tokens == 25
         assert agent.session_total_tokens == 130
-        assert agent.session_input_tokens == 80
+        assert agent.session_input_tokens == 50
         assert agent.session_output_tokens == 25
         assert agent.session_cache_read_tokens == 20
-        assert agent.session_cache_write_tokens == 0
+        assert agent.session_cache_write_tokens == 10
+        assert agent.session_cache_usage_report_calls == 1
+        assert agent.session_last_prompt_tokens == 80
         assert agent.session_reasoning_tokens == 5
-        assert agent.context_compressor.last_prompt_tokens == 100
+        assert agent.context_compressor.last_prompt_tokens == 80
         assert agent.context_compressor.last_completion_tokens == 25
         assert agent.context_compressor.last_total_tokens == 130
         assert agent.context_compressor.context_length == 200000

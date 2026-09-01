@@ -2025,11 +2025,14 @@ only the provider-reported non-cached input bucket, and becomes
 `tokens(turn,uncached,partial)` when Hermes sees a logical model call without
 usable usage. `cache_hit` is `cache-read / (non-cached + cache-read + cache-write)`;
 cache writes occupy prompt input but are not hits. It likewise gains a `partial`
-label when coverage is incomplete. These are known deltas from the cached
-agent's counters, not a billing-complete claim about retries or advisor fan-out.
+label when only some calls expose trustworthy cache telemetry, and is omitted
+when the provider exposes none. These are known deltas from the cached agent's
+counters, not a billing-complete claim about retries or advisor fan-out.
 Cached tokens are excluded from `tokens_turn` but still appear in
 `context_window`, because caching changes reuse and price rather than the number
-of tokens occupying the model's active context.
+of tokens occupying the model's active context. `context_window` is shown only
+when every logical call in the turn supplied usable provider usage, so it never
+labels a previous turn or a preflight estimate as the current last-call state.
 If fallback occurs, reported tokens can include both primary and fallback
 calls; `model(last)` and `effort(req,last)` name only the final model state. The
 effort is the level Hermes requested after its precedence rules; downstream

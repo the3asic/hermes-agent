@@ -1074,6 +1074,58 @@ def _usage_count(value: Any) -> int:
     return max(0, _to_int(value))
 
 
+def _usage_field_reported(obj: Any, name: str) -> bool:
+    """Return whether a provider payload explicitly carried *name*.
+
+    Typed SDK usage objects often expose schema defaults as attributes even
+    when the wire omitted them. Prefer Pydantic's field-set metadata when it
+    exists so a default ``0`` is not mistaken for provider telemetry.
+    """
+    if isinstance(obj, dict):
+        return name in obj
+    fields_set = getattr(obj, "model_fields_set", None)
+    if isinstance(fields_set, (set, frozenset)):
+        return name in fields_set
+    return hasattr(obj, name) and getattr(obj, name, None) is not None
+
+
+def usage_reports_cache_metrics(
+    response_usage: Any,
+    *,
+    provider: Optional[str] = None,
+    api_mode: Optional[str] = None,
+) -> bool:
+    """Return whether cache-read telemetry is trustworthy for this response.
+
+    A normalized cache bucket of ``0`` is ambiguous: it can mean a real miss
+    or that the provider omitted cache details. Gateway cache percentages must
+    only render for the former. MiniMax-M3's Anthropic wire is excluded because
+    its documented-in-code ``+128`` cache-read floor is not a real hit signal.
+    """
+    if not response_usage:
+        return False
+    provider_name = (provider or "").strip().lower()
+    mode = (api_mode or "").strip().lower()
+    if provider_name == "moa":
+        return False
+    if provider_name in {"minimax", "minimax-cn"} and mode == "anthropic_messages":
+        return False
+
+    for details_name in ("input_tokens_details", "prompt_tokens_details"):
+        details = _usage_get(response_usage, details_name, None)
+        if details is not None and _usage_field_reported(details, "cached_tokens"):
+            return True
+
+    return any(
+        _usage_field_reported(response_usage, field)
+        for field in (
+            "cache_read_input_tokens",
+            "prompt_cache_hit_tokens",
+            "cached_tokens",
+        )
+    )
+
+
 
 def resolve_billing_route(
     model_name: str,

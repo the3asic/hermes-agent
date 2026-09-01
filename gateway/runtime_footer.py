@@ -44,6 +44,9 @@ still occupy the model context. ``tokens_turn`` becomes
 ``cache_hit`` uses cache-read tokens divided by all prompt-input buckets
 (``uncached + cache-read + cache-write``); cache writes are prompt tokens but
 are not cache hits. It becomes ``cache(turn,partial)`` under partial coverage.
+Providers without trustworthy cache-read telemetry omit it instead of showing
+a synthetic 0%. Context fields are likewise omitted unless the gateway proves
+the value came from this turn's fully usage-covered final call.
 When no usable positive-prompt usage exists, it is skipped rather than shown
 as a synthetic zero.
 
@@ -189,6 +192,8 @@ def format_runtime_footer(
     cache_read_tokens: Optional[int] = None,
     cache_write_tokens: Optional[int] = None,
     token_usage_status: Optional[str] = None,
+    cache_usage_status: Optional[str] = None,
+    context_usage_status: Optional[str] = "reported",
     reasoning_effort: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
@@ -208,11 +213,21 @@ def format_runtime_footer(
             if m:
                 parts.append(f"model(last):{m}")
         elif field == "context_pct":
-            if context_length and context_length > 0 and context_tokens >= 0:
+            if (
+                context_usage_status == "reported"
+                and context_length
+                and context_length > 0
+                and context_tokens >= 0
+            ):
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
                 parts.append(f"{pct}%")
         elif field == "context_window":
-            if context_length and context_length > 0 and context_tokens >= 0:
+            if (
+                context_usage_status == "reported"
+                and context_length
+                and context_length > 0
+                and context_tokens >= 0
+            ):
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
                 parts.append(
                     "ctx(last):"
@@ -271,7 +286,7 @@ def format_runtime_footer(
         elif field == "cache_hit":
             cache_buckets = (tokens_in, cache_read_tokens, cache_write_tokens)
             if (
-                token_usage_status in {"reported", "reported_partial"}
+                cache_usage_status in {"reported", "reported_partial"}
                 and all(
                     isinstance(value, int)
                     and not isinstance(value, bool)
@@ -284,7 +299,7 @@ def format_runtime_footer(
                     cache_pct = round((cache_read_tokens / prompt_tokens) * 100)
                     label = (
                         "cache(turn,partial)"
-                        if token_usage_status == "reported_partial"
+                        if cache_usage_status == "reported_partial"
                         else "cache(turn)"
                     )
                     parts.append(f"{label}:{cache_pct}%")
@@ -312,6 +327,8 @@ def build_footer_line(
     cache_read_tokens: Optional[int] = None,
     cache_write_tokens: Optional[int] = None,
     token_usage_status: Optional[str] = None,
+    cache_usage_status: Optional[str] = None,
+    context_usage_status: Optional[str] = "reported",
     reasoning_effort: Optional[str] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
@@ -338,6 +355,8 @@ def build_footer_line(
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens,
         token_usage_status=token_usage_status,
+        cache_usage_status=cache_usage_status,
+        context_usage_status=context_usage_status,
         reasoning_effort=reasoning_effort,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )

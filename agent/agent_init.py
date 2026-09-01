@@ -3049,11 +3049,17 @@ def init_agent(
     # session_api_calls, this deliberately does not increment for Codex
     # app-server turns whose usage event is absent.
     agent.session_usage_report_calls = 0
+    # Subset of usage-bearing calls whose provider explicitly reported a
+    # trustworthy cache-read bucket. Keeps a real 0% hit distinct from unknown.
+    agent.session_cache_usage_report_calls = 0
     agent.session_input_tokens = 0
     agent.session_output_tokens = 0
     agent.session_cache_read_tokens = 0
     agent.session_cache_write_tokens = 0
     agent.session_reasoning_tokens = 0
+    # Exact prompt size from the latest usable provider response. This is
+    # separate from compressor estimates, which may change during preflight.
+    agent.session_last_prompt_tokens = 0
     agent.session_estimated_cost_usd = 0.0
     agent.session_cost_status = "unknown"
     agent.session_cost_source = "none"
