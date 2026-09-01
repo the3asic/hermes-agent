@@ -7,7 +7,7 @@
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, Lock
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -72,6 +72,28 @@ def test_runtime_context_token_restores_previous_value_after_turn():
     aux.reset_runtime_main(token)
 
     assert aux._normalize_main_runtime(None) == {}
+
+
+def test_runtime_context_preserves_session_reasoning_as_a_copy():
+    reasoning = {"enabled": True, "effort": "max"}
+    token = aux.set_runtime_main(
+        **_runtime("glm-5.3"),
+        session_id="session-1",
+        cache_scope="conversation-root",
+        reasoning_config=reasoning,
+    )
+    try:
+        runtime = aux._normalize_main_runtime(None)
+        reasoning["effort"] = "low"
+
+        assert runtime["session_id"] == "session-1"
+        assert runtime["cache_scope"] == "conversation-root"
+        assert runtime["reasoning_config"] == {
+            "enabled": True,
+            "effort": "max",
+        }
+    finally:
+        aux.reset_runtime_main(token)
 
 
 
@@ -152,3 +174,104 @@ def test_string_api_keys_are_not_retained_in_cache_key_repr():
     assert second_secret not in rendered
 
 
+def test_repeated_auto_fallback_reuses_client_and_publishes_cached_ref(monkeypatch):
+    entry = {"provider": "custom", "model": "fallback", "reasoning_effort": "high"}
+    ref = aux._fallback_route_ref("auxiliary", 0, entry)
+    client = SimpleNamespace(close=MagicMock())
+    resolves = []
+    monkeypatch.setattr(aux, "_fallback_policy_cache_fingerprint", lambda task: b"p1")
+
+    def _resolve(*args, **kwargs):
+        resolves.append(1)
+        aux._SELECTED_FALLBACK_ROUTE_REF.set(ref)
+        return client, "fallback"
+
+    monkeypatch.setattr(aux, "resolve_provider_client", _resolve)
+    first, _ = aux._get_cached_client(
+        "auto", main_runtime=_runtime("main"), task="compression"
+    )
+    first_ref = aux._take_selected_fallback_route_ref()
+    second, _ = aux._get_cached_client(
+        "auto", main_runtime=_runtime("main"), task="compression"
+    )
+    second_ref = aux._take_selected_fallback_route_ref()
+
+    assert first is second is client
+    assert resolves == [1]
+    assert first_ref == second_ref == ref
+
+
+def test_fallback_policy_fingerprint_isolates_same_deployment_entries(monkeypatch):
+    entries = [
+        {"provider": "custom", "model": "same", "reasoning_effort": "low"},
+        {"provider": "custom", "model": "same", "reasoning_effort": "high"},
+    ]
+    clients = [SimpleNamespace(close=MagicMock()), SimpleNamespace(close=MagicMock())]
+    state = {"index": 0}
+    monkeypatch.setattr(
+        aux,
+        "_fallback_policy_cache_fingerprint",
+        lambda task: f"policy-{state['index']}".encode(),
+    )
+
+    def _resolve(*args, **kwargs):
+        index = state["index"]
+        aux._SELECTED_FALLBACK_ROUTE_REF.set(
+            aux._fallback_route_ref("auxiliary", index, entries[index])
+        )
+        return clients[index], "same"
+
+    monkeypatch.setattr(aux, "resolve_provider_client", _resolve)
+    first, _ = aux._get_cached_client(
+        "auto", main_runtime=_runtime("main"), task="compression"
+    )
+    first_ref = aux._take_selected_fallback_route_ref()
+    state["index"] = 1
+    second, _ = aux._get_cached_client(
+        "auto", main_runtime=_runtime("main"), task="compression"
+    )
+    second_ref = aux._take_selected_fallback_route_ref()
+
+    assert first is clients[0]
+    assert second is clients[1]
+    assert first_ref.entry["reasoning_effort"] == "low"
+    assert second_ref.entry["reasoning_effort"] == "high"
+
+
+def test_concurrent_cache_loser_uses_winner_route_ref(monkeypatch):
+    barrier = Barrier(2)
+    created = []
+    created_lock = Lock()
+    monkeypatch.setattr(aux, "_fallback_policy_cache_fingerprint", lambda task: b"p1")
+
+    def _resolve(*args, **kwargs):
+        with created_lock:
+            index = len(created)
+            client = SimpleNamespace(close=MagicMock())
+            ref = aux._fallback_route_ref(
+                "auxiliary",
+                index,
+                {"provider": "custom", "model": "same", "reasoning_effort": str(index)},
+            )
+            created.append((client, ref))
+        aux._SELECTED_FALLBACK_ROUTE_REF.set(ref)
+        barrier.wait(timeout=5)
+        return client, "same"
+
+    monkeypatch.setattr(aux, "resolve_provider_client", _resolve)
+
+    def _worker():
+        client, _ = aux._get_cached_client(
+            "auto", main_runtime=_runtime("main"), task="compression"
+        )
+        return client, aux._take_selected_fallback_route_ref()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: _worker(), range(2)))
+
+    assert results[0][0] is results[1][0]
+    assert results[0][1] == results[1][1]
+    winner = results[0][0]
+    winner_ref = results[0][1]
+    assert any(client is winner and ref == winner_ref for client, ref in created)
+    assert sum(client.close.call_count for client, _ in created) == 1

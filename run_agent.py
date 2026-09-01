@@ -1433,15 +1433,18 @@ class AIAgent:
             detail = detail[:217].rstrip() + "..."
         self._emit_warning(f"⚠ Auxiliary {task} failed: {detail}")
 
-    def _current_main_runtime(self) -> Dict[str, str]:
+    def _current_main_runtime(self) -> Dict[str, Any]:
         """Return the live main runtime for session-scoped auxiliary routing."""
         return {
             "model": getattr(self, "model", "") or "",
             "provider": getattr(self, "provider", "") or "",
+            "requested_provider": getattr(self, "requested_provider", "") or "",
             "base_url": getattr(self, "base_url", "") or "",
             "api_key": getattr(self, "api_key", "") or "",
             "api_mode": getattr(self, "api_mode", "") or "",
             "auth_mode": getattr(self, "auth_mode", "") or "",
+            "session_id": getattr(self, "session_id", "") or "",
+            "reasoning_config": getattr(self, "reasoning_config", None),
         }
 
     def _check_compression_model_feasibility(self) -> None:
@@ -8124,6 +8127,8 @@ class AIAgent:
             reset_conversation_context,
             set_conversation_context,
         )
+        from agent.auxiliary_client import scoped_runtime_main
+        from agent.prompt_cache_scope import resolve_prompt_cache_scope_safe
         # Out-of-turn compaction entry points — ``/compact`` (cli.py), the
         # gateway ``/compress`` command and its hygiene sweep (both of which
         # build a throwaway agent), and partial head compression — call this
@@ -8143,6 +8148,10 @@ class AIAgent:
             root = self._conversation_root_id()
             if root:
                 token = set_conversation_context(root)
+        compression_runtime = self._current_main_runtime()
+        compression_runtime["cache_scope"] = (
+            resolve_prompt_cache_scope_safe(self) or ""
+        )
         # Every AIAgent compression has a fence, including ordinary in-turn and
         # manual paths. hard_interrupt() uses this exact instance to serialize
         # cancel admission against begin_commit().
@@ -8161,18 +8170,19 @@ class AIAgent:
             self._active_compression_commit_fence = active_fence
         try:
             def _run(fence=None, target_messages=None):
-                return compress_context(
-                    self,
-                    target_messages if target_messages is not None else messages,
-                    system_message,
-                    approx_tokens=approx_tokens, task_id=task_id,
-                    focus_topic=focus_topic,
-                    force=force,
-                    defer_context_engine_notification=(
-                        defer_context_engine_notification
-                    ),
-                    commit_fence=fence,
-                )
+                with scoped_runtime_main(compression_runtime):
+                    return compress_context(
+                        self,
+                        target_messages if target_messages is not None else messages,
+                        system_message,
+                        approx_tokens=approx_tokens, task_id=task_id,
+                        focus_topic=focus_topic,
+                        force=force,
+                        defer_context_engine_notification=(
+                            defer_context_engine_notification
+                        ),
+                        commit_fence=fence,
+                    )
 
             # Callers that already own a progress-aware wait (gateway session
             # hygiene) pass commit_fence and must not be double-wrapped.

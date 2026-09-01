@@ -73,11 +73,11 @@ def _safe_int(value: Any) -> int | None:
 # the pin reaches the retry's whole synchronous call chain and cannot leak
 # into the stalled attempt or any unrelated auxiliary call.
 #
-# Coverage is the single ``_generate_summary`` LLM call only. That is one call
-# per compression run (its only non-recursive call site is the compress path;
-# the two recursive calls are the deliberate main-model retry that must NOT
-# re-issue the pin). The summary call is the ONLY auxiliary LLM call a lean
-# compaction attempt makes (#96603) — there are no sibling digest calls.
+# The built-in compressor consumes the pin on its one ``_generate_summary``
+# call so its recursive main-model retry cannot re-issue the failed route.
+# Plugin engines may issue several ``call_llm(task="compression")`` requests
+# in one attempt (for example one per LCM leaf); the auxiliary client peeks at
+# the same ContextVar so every such request stays pinned until this scope exits.
 _SUMMARY_ROUTE_PIN: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
     contextvars.ContextVar("hermes_summary_route_pin", default=None)
 )
@@ -92,12 +92,13 @@ _PINNED_ROUTE_FIELDS: tuple[str, ...] = (
     "api_key",
     "api_mode",
     "timeout",
+    "reasoning_config",
 )
 
 
 @contextlib.contextmanager
 def pin_summary_route(route: Optional[Dict[str, Any]]):
-    """Pin the next summary LLM call in this context to an explicit route.
+    """Pin summary LLM calls in this compression attempt to an explicit route.
 
     ``route`` is a mapping of :data:`_PINNED_ROUTE_FIELDS`; ``None`` is a
     no-op passthrough so callers can wire it unconditionally. Re-entrant-safe:
@@ -124,16 +125,35 @@ def take_pinned_summary_route() -> Optional[Dict[str, Any]]:
     return route
 
 
+def peek_pinned_summary_route() -> Optional[Dict[str, Any]]:
+    """Read the pinned route without consuming it.
+
+    The built-in compressor consumes its pin for one summary call so its own
+    retry can return to normal routing. Plugin engines may make several
+    auxiliary summary calls during one compression attempt; the shared
+    auxiliary client uses this non-consuming view so every call in the pinned
+    fallback attempt sees the same route until :func:`pin_summary_route` exits.
+    """
+    route = _SUMMARY_ROUTE_PIN.get()
+    return dict(route) if isinstance(route, dict) else None
+
+
 def _pinned_summary_call_kwargs() -> Dict[str, Any]:
     """Consume the pinned route as explicit ``call_llm`` keyword arguments."""
     route = take_pinned_summary_route()
     if not route:
         return {}
-    return {
+    kwargs = {
         field: route[field]
         for field in _PINNED_ROUTE_FIELDS
-        if route.get(field) not in (None, "")
+        if field in route
+        and (field == "reasoning_config" or route.get(field) not in (None, ""))
     }
+    # ``take_pinned_summary_route`` has consumed the ContextVar before
+    # call_llm starts. Preserve the exact route snapshot so the shared client
+    # can still distinguish explicit reasoning_config=None from no pin.
+    kwargs["_pinned_compression_route"] = dict(route)
+    return kwargs
 
 
 _SUMMARY_PERMANENT_QUOTA_MARKERS: tuple[str, ...] = (

@@ -41,6 +41,7 @@ CHAIN_ENTRY = {
     "base_url": "https://fallback.invalid/v1",
     "api_key": "sk-fallback",
     "timeout": 45,
+    "reasoning_effort": "medium",
 }
 
 
@@ -247,6 +248,10 @@ def test_resolved_route_carries_entry_credentials_and_timeout():
     # Per-entry timeouts already govern aux-client fallback candidates
     # (#62452); the stall retry honours the same declaration.
     assert route["timeout"] == 45.0
+    assert route["reasoning_config"] == {
+        "enabled": True,
+        "effort": "medium",
+    }
 
 
 def test_incomplete_chain_entries_are_skipped():

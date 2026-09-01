@@ -1244,7 +1244,9 @@ def resolve_compression_fallback_route() -> Optional[dict]:
     try:
         from agent.auxiliary_client import (
             _fallback_entry_api_key,
+            _fallback_route_ref,
             _get_auxiliary_task_config,
+            _resolve_auxiliary_fallback_reasoning,
         )
 
         chain = _get_auxiliary_task_config("compression").get("fallback_chain")
@@ -1275,16 +1277,26 @@ def resolve_compression_fallback_route() -> Optional[dict]:
         from agent.auxiliary_client import _coerce_positive_timeout
 
         timeout = _coerce_positive_timeout(entry.get("timeout"))
+        label = f"fallback_chain[{index}]({provider})"
+        base_url = str(entry.get("base_url") or "").strip() or None
+        route_ref = _fallback_route_ref("auxiliary", index, entry)
         return {
-            "label": f"fallback_chain[{index}]({provider})",
+            "label": label,
             "provider": provider,
             "model": model,
-            "base_url": str(entry.get("base_url") or "").strip() or None,
+            "base_url": base_url,
             "api_key": api_key or None,
             "api_mode": str(
                 entry.get("api_mode") or entry.get("transport") or ""
             ).strip() or None,
             "timeout": timeout,
+            "fallback_route_ref": route_ref,
+            "reasoning_config": _resolve_auxiliary_fallback_reasoning(
+                "compression",
+                label,
+                model=model,
+                fallback_route_ref=route_ref,
+            ),
         }
     return None
 

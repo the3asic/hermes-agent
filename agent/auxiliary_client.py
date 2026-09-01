@@ -58,8 +58,8 @@ import threading
 import time
 import uuid
 from pathlib import Path  # noqa: F401 — used by test mocks
-from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
+from types import MappingProxyType, SimpleNamespace
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
 from agent.codex_headers import (
@@ -3690,6 +3690,7 @@ def set_runtime_main(
     auth_mode: str = "",
     session_id: str = "",
     cache_scope: str = "",
+    reasoning_config: Optional[Dict[str, Any]] = None,
 ) -> contextvars.Token:
     """Record the current context's live main runtime for auxiliary routing.
 
@@ -3718,6 +3719,11 @@ def set_runtime_main(
         "auth_mode": (auth_mode or "").strip().lower(),
         "session_id": (session_id or "").strip(),
         "cache_scope": (cache_scope or "").strip(),
+        "reasoning_config": (
+            copy.deepcopy(reasoning_config)
+            if isinstance(reasoning_config, dict)
+            else None
+        ),
     }
     # Publish authoritative context before updating locked compatibility
     # mirrors; concurrent sessions never read those mirrors at runtime.
@@ -4191,7 +4197,12 @@ _AUTO_PROVIDER_LABELS = {
 }
 
 _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "auth_mode")
-_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + ("requested_provider",)
+_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + (
+    "requested_provider",
+    "session_id",
+    "cache_scope",
+    "reasoning_config",
+)
 
 
 def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -4216,6 +4227,9 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
     normalized: Dict[str, Any] = {}
     for field in _MAIN_RUNTIME_CONTEXT_FIELDS:
         value = main_runtime.get(field)
+        if field == "reasoning_config" and isinstance(value, dict):
+            normalized[field] = copy.deepcopy(value)
+            continue
         # Preserve a callable api_key (Entra ID bearer provider) unchanged.
         if field == "api_key" and callable(value) and not isinstance(value, str):
             normalized[field] = value
@@ -5251,6 +5265,86 @@ def _fallback_chain_entry(task: Optional[str], fb_label: str) -> Optional[Dict[s
     return entry if isinstance(entry, dict) else None
 
 
+class _FallbackRouteRef(NamedTuple):
+    """Immutable identity and snapshot of one configured fallback entry."""
+
+    chain_kind: str
+    index: int
+    entry: Mapping[str, Any]
+
+
+def _fallback_route_ref(
+    chain_kind: str,
+    index: int,
+    entry: Dict[str, Any],
+) -> _FallbackRouteRef:
+    return _FallbackRouteRef(
+        str(chain_kind),
+        int(index),
+        MappingProxyType(copy.deepcopy(entry)),
+    )
+
+
+_SELECTED_FALLBACK_ROUTE_REF: contextvars.ContextVar[Optional[_FallbackRouteRef]] = (
+    contextvars.ContextVar("hermes_aux_selected_fallback_route_ref", default=None)
+)
+
+
+def _take_selected_fallback_route_ref() -> Optional[_FallbackRouteRef]:
+    ref = _SELECTED_FALLBACK_ROUTE_REF.get()
+    _SELECTED_FALLBACK_ROUTE_REF.set(None)
+    return ref
+
+
+def _resolve_auxiliary_fallback_reasoning(
+    task: Optional[str],
+    fb_label: str,
+    *,
+    model: Optional[str],
+    fallback_route_ref: Optional[_FallbackRouteRef] = None,
+) -> Optional[Dict[str, Any]]:
+    """Resolve target-owned reasoning for an auxiliary fallback route."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.fallback_config import get_fallback_chain
+        from hermes_constants import resolve_fallback_reasoning_config
+
+        config = load_config_readonly()
+    except Exception:
+        config = {}
+    entry = (
+        dict(fallback_route_ref.entry)
+        if isinstance(fallback_route_ref, _FallbackRouteRef)
+        else _fallback_chain_entry(task, fb_label)
+    )
+    if entry is None:
+        match = re.match(r"fallback_providers\[(\d+)\]", fb_label or "")
+        try:
+            main_chain = get_fallback_chain(config)
+        except Exception:
+            main_chain = []
+        if match and isinstance(main_chain, list):
+            try:
+                candidate = main_chain[int(match.group(1))]
+                entry = candidate if isinstance(candidate, dict) else None
+            except (IndexError, ValueError):
+                entry = None
+    try:
+        return resolve_fallback_reasoning_config(
+            config,
+            str(model or ""),
+            entry,
+        )
+    except Exception:
+        logger.debug(
+            "Auxiliary %s fallback reasoning resolution failed for %s",
+            task or "call",
+            model or "default",
+            exc_info=True,
+        )
+        return None
+
+
 def _coerce_positive_timeout(raw: Any) -> Optional[float]:
     """Coerce a config ``timeout`` value to a positive float, or None.
 
@@ -5363,6 +5457,54 @@ def _fallback_destination(
     return _complete_fallback_destination(provider, base_url, api_mode, model)
 
 
+def _fallback_request_controls(
+    task: Optional[str],
+    destination: _FallbackDestination,
+    fb_label: str,
+    *,
+    max_tokens: Optional[int],
+    effective_extra_body: Dict[str, Any],
+    reasoning_config: Optional[Dict[str, Any]],
+    fallback_route_ref: Optional[_FallbackRouteRef] = None,
+    apply_fast_lane: bool = True,
+) -> tuple[Optional[int], Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Resolve route-owned compression controls for one fallback request."""
+    task_config = _get_auxiliary_task_config(task) if task == "compression" else {}
+    fallback_entry = (
+        dict(fallback_route_ref.entry)
+        if isinstance(fallback_route_ref, _FallbackRouteRef)
+        else (_fallback_chain_entry(task, fb_label) or {})
+    )
+    fallback_reasoning = reasoning_config
+    fallback_input_body = effective_extra_body
+    if task == "compression":
+        if fallback_route_ref is not None or fb_label:
+            fallback_reasoning = _resolve_auxiliary_fallback_reasoning(
+                task,
+                fb_label,
+                model=destination.model,
+                fallback_route_ref=fallback_route_ref,
+            )
+        # The failed route's task/session policy is not fallback policy. Strip
+        # it before fast-lane controls add any target-owned declaration.
+        fallback_input_body = dict(effective_extra_body)
+        fallback_input_body.pop("reasoning", None)
+    if not apply_fast_lane:
+        return max_tokens, fallback_input_body, fallback_reasoning
+    fallback_max_tokens, fallback_extra_body = _compression_fast_lane_controls(
+        task,
+        actual_provider=destination.provider,
+        actual_model=destination.model,
+        requested_provider=fallback_entry.get("provider"),
+        requested_model=fallback_entry.get("model"),
+        route_config=fallback_entry,
+        leak_guard_config=task_config,
+        max_tokens=max_tokens,
+        extra_body=fallback_input_body,
+    )
+    return fallback_max_tokens, fallback_extra_body, fallback_reasoning
+
+
 def _replan_synchronous_cache_sections(
     messages: list,
     tools: Optional[list],
@@ -5404,6 +5546,7 @@ def _call_fallback_candidate_sync(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    fallback_route_ref: Optional[_FallbackRouteRef] = None,
 ) -> Optional[Any]:
     """Call one fallback candidate with stale-credential recovery.
 
@@ -5434,18 +5577,16 @@ def _call_fallback_candidate_sync(
         )
         effective_timeout = fb_timeout
     destination = _fallback_destination(task, fb_client, fb_model, fb_label)
-    task_config = _get_auxiliary_task_config(task) if task == "compression" else {}
-    fallback_entry = _fallback_chain_entry(task, fb_label) or {}
-    fallback_max_tokens, fallback_extra_body = _compression_fast_lane_controls(
-        task,
-        actual_provider=destination.provider,
-        actual_model=destination.model,
-        requested_provider=fallback_entry.get("provider"),
-        requested_model=fallback_entry.get("model"),
-        route_config=fallback_entry,
-        leak_guard_config=task_config,
-        max_tokens=max_tokens,
-        extra_body=effective_extra_body,
+    fallback_max_tokens, fallback_extra_body, fallback_reasoning = (
+        _fallback_request_controls(
+            task,
+            destination,
+            fb_label,
+            max_tokens=max_tokens,
+            effective_extra_body=effective_extra_body,
+            reasoning_config=reasoning_config,
+            fallback_route_ref=fallback_route_ref,
+        )
     )
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(
         messages,
@@ -5456,7 +5597,7 @@ def _call_fallback_candidate_sync(
         destination.provider, destination.model, fallback_messages,
         temperature=temperature, max_tokens=fallback_max_tokens,
         tools=fallback_tools, timeout=effective_timeout,
-        extra_body=fallback_extra_body, reasoning_config=reasoning_config,
+        extra_body=fallback_extra_body, reasoning_config=fallback_reasoning,
         base_url=destination.base_url, task=task)
     if fallback_max_tokens is not None and max_tokens is None:
         fb_kwargs.update(
@@ -5506,16 +5647,16 @@ def _call_fallback_candidate_sync(
                     tools,
                     destination=retry_destination,
                 )
-                retry_max_tokens, retry_extra_body = _compression_fast_lane_controls(
-                    task,
-                    actual_provider=retry_destination.provider,
-                    actual_model=retry_destination.model,
-                    requested_provider=fallback_entry.get("provider"),
-                    requested_model=fallback_entry.get("model"),
-                    route_config=fallback_entry,
-                    leak_guard_config=task_config,
-                    max_tokens=max_tokens,
-                    extra_body=effective_extra_body,
+                retry_max_tokens, retry_extra_body, retry_reasoning = (
+                    _fallback_request_controls(
+                        task,
+                        retry_destination,
+                        fb_label,
+                        max_tokens=max_tokens,
+                        effective_extra_body=effective_extra_body,
+                        reasoning_config=reasoning_config,
+                        fallback_route_ref=fallback_route_ref,
+                    )
                 )
                 retry_kwargs = _build_call_kwargs(
                     retry_destination.provider,
@@ -5524,7 +5665,7 @@ def _call_fallback_candidate_sync(
                     temperature=temperature, max_tokens=retry_max_tokens,
                     tools=retry_tools, timeout=effective_timeout,
                     extra_body=retry_extra_body,
-                    reasoning_config=reasoning_config,
+                    reasoning_config=retry_reasoning,
                     base_url=retry_destination.base_url, task=task)
                 if retry_max_tokens is not None and max_tokens is None:
                     retry_kwargs.update(
@@ -5580,6 +5721,7 @@ async def _call_fallback_candidate_async(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    fallback_route_ref: Optional[_FallbackRouteRef] = None,
 ) -> Optional[Any]:
     """Async mirror of :func:`_call_fallback_candidate_sync`."""
     fb_timeout = _fallback_entry_timeout(task, fb_label)
@@ -5591,6 +5733,18 @@ async def _call_fallback_candidate_async(
         )
         effective_timeout = fb_timeout
     destination = _fallback_destination(task, fb_client, fb_model, fb_label)
+    fallback_max_tokens, fallback_extra_body, fallback_reasoning = (
+        _fallback_request_controls(
+            task,
+            destination,
+            fb_label,
+            max_tokens=max_tokens,
+            effective_extra_body=effective_extra_body,
+            reasoning_config=reasoning_config,
+            fallback_route_ref=fallback_route_ref,
+            apply_fast_lane=False,
+        )
+    )
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(
         messages,
         tools,
@@ -5598,9 +5752,9 @@ async def _call_fallback_candidate_async(
     )
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,
-        temperature=temperature, max_tokens=max_tokens,
+        temperature=temperature, max_tokens=fallback_max_tokens,
         tools=fallback_tools, timeout=effective_timeout,
-        extra_body=effective_extra_body, reasoning_config=reasoning_config,
+        extra_body=fallback_extra_body, reasoning_config=fallback_reasoning,
         base_url=destination.base_url, task=task)
     try:
         return _validate_llm_response(
@@ -5639,14 +5793,26 @@ async def _call_fallback_candidate_async(
                     tools,
                     destination=retry_destination,
                 )
+                retry_max_tokens, retry_extra_body, retry_reasoning = (
+                    _fallback_request_controls(
+                        task,
+                        retry_destination,
+                        fb_label,
+                        max_tokens=max_tokens,
+                        effective_extra_body=effective_extra_body,
+                        reasoning_config=reasoning_config,
+                        fallback_route_ref=fallback_route_ref,
+                        apply_fast_lane=False,
+                    )
+                )
                 retry_kwargs = _build_call_kwargs(
                     retry_destination.provider,
                     retry_destination.model,
                     retry_messages,
-                    temperature=temperature, max_tokens=max_tokens,
+                    temperature=temperature, max_tokens=retry_max_tokens,
                     tools=retry_tools, timeout=effective_timeout,
-                    extra_body=effective_extra_body,
-                    reasoning_config=reasoning_config,
+                    extra_body=retry_extra_body,
+                    reasoning_config=retry_reasoning,
                     base_url=retry_destination.base_url, task=task)
                 try:
                     return _validate_llm_response(
@@ -5683,6 +5849,7 @@ def _try_payment_fallback(
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
     """
+    _SELECTED_FALLBACK_ROUTE_REF.set(None)
     # Normalise the failed provider label for matching.
     skip = failed_provider.lower().strip()
     # Also skip Step-1 main-provider path if it maps to the same backend.
@@ -5925,6 +6092,7 @@ def _try_configured_fallback_chain(
     """
     if not task:
         return None, None, ""
+    _SELECTED_FALLBACK_ROUTE_REF.set(None)
 
     task_config = _get_auxiliary_task_config(task)
     chain = task_config.get("fallback_chain")
@@ -5993,6 +6161,9 @@ def _try_configured_fallback_chain(
                     )
                     tried.append(f"{label} (context too small: {fb_ctx}<{min_ctx})")
                     continue
+            _SELECTED_FALLBACK_ROUTE_REF.set(
+                _fallback_route_ref("auxiliary", i, entry)
+            )
             logger.info(
                 "Auxiliary %s: %s on %s — configured fallback to %s (%s)",
                 task, reason, failed_provider, label, resolved_model or fb_model or "default",
@@ -6042,7 +6213,9 @@ def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
     return resolve_entry_api_key(entry)
 
 
-def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optional[str]]:
+def _resolve_fallback_entry(
+    entry: Dict[str, Any],
+) -> Tuple[Optional[Any], Optional[str]]:
     """Resolve one fallback entry through the central provider router."""
     provider = str(entry.get("provider") or "").strip()
     model = str(entry.get("model") or "").strip() or None
@@ -6082,6 +6255,7 @@ def _try_main_fallback_chain(
     participate in the same order as the main agent.
     """
     try:
+        _SELECTED_FALLBACK_ROUTE_REF.set(None)
         from hermes_cli.config import load_config_readonly
         from hermes_cli.fallback_config import get_fallback_chain
 
@@ -6135,12 +6309,13 @@ def _try_main_fallback_chain(
                     )
                     tried.append(f"{label} (context too small: {fb_ctx}<{min_ctx})")
                     continue
+            _SELECTED_FALLBACK_ROUTE_REF.set(_fallback_route_ref("main", i, entry))
             logger.info(
                 "Auxiliary %s: %s on %s — main fallback chain to %s (%s)",
                 task or "call", reason, failed_provider or "auto", label,
                 resolved_model or fb_model,
             )
-            return fb_client, resolved_model or fb_model, fb_provider
+            return fb_client, resolved_model or fb_model, label
         tried.append(label)
 
     if tried:
@@ -6340,7 +6515,7 @@ def _resolve_auto_route(
     fb_client, fb_model, fb_label = _try_main_fallback_chain(
         task, main_provider or "auto", reason="main provider unavailable")
     if fb_client is not None:
-        return fb_client, fb_model, fb_label
+        return fb_client, fb_model, _fallback_provider_from_label(fb_label)
 
     # ── Step 3: aggregator / fallback chain ──────────────────────────────
     tried = []
@@ -6393,6 +6568,101 @@ def _effective_provider_for_client(client: Any, fallback: str) -> str:
     if isinstance(effective_provider, str) and effective_provider:
         return effective_provider
     return str(fallback or "")
+
+
+def _route_inherits_main_runtime(
+    resolved_provider: Optional[str],
+    resolved_model: Optional[str],
+) -> bool:
+    """Whether task routing left provider/model ownership to the live main."""
+    return (
+        str(resolved_provider or "auto").strip().lower() in {"", "auto", "main"}
+        and not str(resolved_model or "").strip()
+    )
+
+
+def _route_matches_main_runtime(
+    *,
+    provider: str,
+    model: Optional[str],
+    base_url: str,
+    main_runtime: Dict[str, Any],
+) -> bool:
+    """Compare a concrete auxiliary route with the session runtime identity."""
+    from agent.backend_identity import BackendIdentity, same_deployment
+
+    return same_deployment(
+        BackendIdentity.build(
+            provider=_fallback_provider_from_label(provider),
+            model=model,
+            base_url=base_url,
+        ),
+        BackendIdentity.build(
+            provider=str(main_runtime.get("provider") or ""),
+            model=str(main_runtime.get("model") or ""),
+            base_url=str(main_runtime.get("base_url") or ""),
+        ),
+    )
+
+
+def _compression_route_reasoning(
+    *,
+    task: Optional[str],
+    resolved_provider: Optional[str],
+    resolved_model: Optional[str],
+    request_provider: str,
+    final_model: Optional[str],
+    base_url: str,
+    main_runtime: Dict[str, Any],
+    reasoning_config: Optional[Dict[str, Any]],
+    effective_extra_body: Dict[str, Any],
+    fallback_route_ref: Optional[_FallbackRouteRef] = None,
+) -> tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """Apply session inheritance or target-owned fallback reasoning."""
+    if task != "compression":
+        return reasoning_config, effective_extra_body
+    if isinstance(fallback_route_ref, _FallbackRouteRef):
+        effective_extra_body = dict(effective_extra_body)
+        effective_extra_body.pop("reasoning", None)
+        return (
+            _resolve_auxiliary_fallback_reasoning(
+                task,
+                "",
+                model=final_model,
+                fallback_route_ref=fallback_route_ref,
+            ),
+            effective_extra_body,
+        )
+    if not _route_inherits_main_runtime(
+        resolved_provider, resolved_model
+    ):
+        return reasoning_config, effective_extra_body
+    using_main_runtime = _route_matches_main_runtime(
+        provider=request_provider,
+        model=final_model,
+        base_url=base_url,
+        main_runtime=main_runtime,
+    )
+    if (
+        using_main_runtime
+        and reasoning_config is None
+        and "reasoning" not in effective_extra_body
+    ):
+        inherited = main_runtime.get("reasoning_config")
+        if isinstance(inherited, dict):
+            reasoning_config = copy.deepcopy(inherited)
+    elif not using_main_runtime:
+        # Auto can reach a configured fallback before the first request when
+        # the active route is unavailable. That target owns its effort just
+        # like a request-time fallback does.
+        effective_extra_body = dict(effective_extra_body)
+        effective_extra_body.pop("reasoning", None)
+        reasoning_config = _resolve_auxiliary_fallback_reasoning(
+            task,
+            "",
+            model=final_model,
+        )
+    return reasoning_config, effective_extra_body
 
 
 # ── Centralized Provider Router ─────────────────────────────────────────────
@@ -7843,7 +8113,8 @@ def auxiliary_max_tokens_param(value: int, *, model: Optional[str] = None) -> di
 # Every auxiliary LLM consumer should use these instead of manually
 # constructing clients and calling .chat.completions.create().
 
-# Client cache: (provider, async_mode, base_url, api_key, api_mode, runtime_key) -> (client, default_model, loop)
+# Client cache: (provider, async_mode, base_url, api_key, api_mode, runtime_key)
+# -> (client, default_model, loop, fallback_route_ref)
 # NOTE: loop identity is NOT part of the key.  On async cache hits we check
 # whether the cached loop is the *current* loop; if not, the stale entry is
 # replaced in-place.  This bounds cache growth to one entry per unique
@@ -7886,6 +8157,28 @@ def _runtime_cache_discriminator(field: str, value: Any) -> Any:
     return value
 
 
+def _fallback_policy_cache_fingerprint(task: Optional[str]) -> bytes:
+    """Secret-safe cache discriminator for configured fallback identity."""
+    if not task:
+        return b""
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.fallback_config import get_fallback_chain
+
+        payload = json.dumps(
+            {
+                "task": _get_auxiliary_task_config(task).get("fallback_chain") or [],
+                "main": get_fallback_chain(load_config_readonly()) or [],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.blake2b(payload, digest_size=16).digest()
+    except Exception:
+        return b""
+
+
 def _client_cache_key(
     provider: str,
     *,
@@ -7907,7 +8200,11 @@ def _client_cache_key(
     # so the task participates in the cache key. Non-auto providers keep the
     # old cache shape because the explicit provider/model tuple is sufficient.
     task_key = (
-        (task or "", _task_prefers_fast_model(task))
+        (
+            task or "",
+            _task_prefers_fast_model(task),
+            _fallback_policy_cache_fingerprint(task),
+        )
         if provider == "auto"
         else ""
     )
@@ -7926,7 +8223,14 @@ def _client_cache_key(
     return (provider, async_mode, base_url or "", api_key_key, api_mode or "", runtime_key, is_vision, task_key, pool_hint, model_key)
 
 
-def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[str], *, bound_loop: Any = None) -> None:
+def _store_cached_client(
+    cache_key: tuple,
+    client: Any,
+    default_model: Optional[str],
+    *,
+    bound_loop: Any = None,
+    fallback_route_ref: Optional[_FallbackRouteRef] = None,
+) -> None:
     if isinstance(client, _AuxProbeClientStub):
         # Probe stubs must never enter the cache — a runtime caller would
         # receive a non-functional client on the next cache hit.
@@ -7935,7 +8239,12 @@ def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[
         old_entry = _client_cache.get(cache_key)
         if old_entry is not None and old_entry[0] is not client:
             _close_cached_client(old_entry[0])
-        _client_cache[cache_key] = (client, default_model, bound_loop)
+        _client_cache[cache_key] = (
+            client,
+            default_model,
+            bound_loop,
+            fallback_route_ref,
+        )
 
 
 def _refresh_nous_auxiliary_client(
@@ -8150,7 +8459,7 @@ def cleanup_stale_async_clients() -> None:
     with _client_cache_lock:
         stale_keys = []
         for key, entry in _client_cache.items():
-            client, _default, cached_loop = entry
+            client, _default, cached_loop = entry[:3]
             if cached_loop is not None and cached_loop.is_closed():
                 stale_keys.append(key)
                 stale_clients.append(client)
@@ -8209,6 +8518,7 @@ def _get_cached_client(
     preventing the fd-exhaustion that previously occurred in long-running
     gateways where recycled worker threads created unbounded entries (#10200).
     """
+    _SELECTED_FALLBACK_ROUTE_REF.set(None)
     # Resolve the current event loop for async clients so we can validate
     # cached entries.  Loop identity is NOT in the cache key — instead we
     # check at hit time whether the cached loop is still current and open.
@@ -8236,7 +8546,14 @@ def _get_cached_client(
     )
     with _client_cache_lock:
         if cache_key in _client_cache:
-            cached_client, cached_default, cached_loop = _client_cache[cache_key]
+            cached_entry = _client_cache[cache_key]
+            cached_client, cached_default, cached_loop = cached_entry[:3]
+            cached_fallback_ref = (
+                cached_entry[3]
+                if len(cached_entry) > 3
+                and isinstance(cached_entry[3], _FallbackRouteRef)
+                else None
+            )
             if async_mode:
                 # Validate: the cached client must be bound to the CURRENT,
                 # OPEN loop.  If the loop changed or was closed, the httpx
@@ -8247,6 +8564,7 @@ def _get_cached_client(
                     and not cached_loop.is_closed()
                 )
                 if loop_ok:
+                    _SELECTED_FALLBACK_ROUTE_REF.set(cached_fallback_ref)
                     effective = _compat_model(cached_client, model, cached_default)
                     return cached_client, effective
                 # Stale — evict and fall through to create a new client.
@@ -8258,6 +8576,7 @@ def _get_cached_client(
                 _close_cached_client(cached_client, close_async=owner_loop_closed)
                 del _client_cache[cache_key]
             else:
+                _SELECTED_FALLBACK_ROUTE_REF.set(cached_fallback_ref)
                 effective = _compat_model(cached_client, model, cached_default)
                 return cached_client, effective
     # Build outside the lock.
@@ -8284,6 +8603,7 @@ def _get_cached_client(
         is_vision=is_vision,
         task=task,
     )
+    selected_fallback_ref = _SELECTED_FALLBACK_ROUTE_REF.get()
     if client is not None:
         # For async clients, remember which loop they were created on so we
         # can detect stale entries later.
@@ -8299,10 +8619,23 @@ def _get_cached_client(
                 while len(_client_cache) >= _CLIENT_CACHE_MAX_SIZE:
                     evict_key = next(iter(_client_cache))
                     del _client_cache[evict_key]
-                _client_cache[cache_key] = (client, default_model, bound_loop)
+                _client_cache[cache_key] = (
+                    client,
+                    default_model,
+                    bound_loop,
+                    selected_fallback_ref,
+                )
             else:
                 built_client = client
-                client, default_model, _ = _client_cache[cache_key]
+                winner = _client_cache[cache_key]
+                client, default_model, _ = winner[:3]
+                winner_ref = (
+                    winner[3]
+                    if len(winner) > 3
+                    and isinstance(winner[3], _FallbackRouteRef)
+                    else None
+                )
+                _SELECTED_FALLBACK_ROUTE_REF.set(winner_ref)
                 # This concurrently built loser was never exposed to a caller,
                 # so it is safe to close immediately.
                 _close_cached_client(built_client, close_async=async_mode)
@@ -9747,6 +10080,7 @@ def call_llm(
     stream_options: dict = None,
     route_info: Optional[Dict[str, str]] = None,
     latency_info: Optional[Dict[str, int]] = None,
+    _pinned_compression_route: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
     queue_started_at = time.monotonic()
@@ -9801,6 +10135,7 @@ def call_llm(
                 stream=stream,
                 stream_options=stream_options,
                 route_info=route_info,
+                _pinned_compression_route=_pinned_compression_route,
             )
         if stream and semaphore is not None:
             stream_semaphore = semaphore
@@ -9851,6 +10186,7 @@ def _call_llm_impl(
     stream: bool = False,
     stream_options: dict = None,
     route_info: Optional[Dict[str, str]] = None,
+    _pinned_compression_route: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -9890,6 +10226,30 @@ def _call_llm_impl(
     Raises:
         RuntimeError: If no provider is configured.
     """
+    pinned_compression_route = (
+        dict(_pinned_compression_route)
+        if task == "compression" and isinstance(_pinned_compression_route, dict)
+        else None
+    )
+    if task == "compression" and pinned_compression_route is None:
+        try:
+            from agent.context_compressor import peek_pinned_summary_route
+
+            pinned_compression_route = peek_pinned_summary_route()
+        except Exception:
+            pinned_compression_route = None
+    if pinned_compression_route:
+        provider = pinned_compression_route.get("provider") or provider
+        model = pinned_compression_route.get("model") or model
+        base_url = pinned_compression_route.get("base_url") or base_url
+        api_key = pinned_compression_route.get("api_key") or api_key
+        api_mode = pinned_compression_route.get("api_mode") or api_mode
+        if pinned_compression_route.get("timeout") is not None:
+            timeout = pinned_compression_route["timeout"]
+        if "reasoning_config" in pinned_compression_route:
+            value = pinned_compression_route.get("reasoning_config")
+            reasoning_config = copy.deepcopy(value) if isinstance(value, dict) else None
+
     # Capture one immutable runtime snapshot for keying, resolution, retries,
     # and fallbacks. Reading ambient state independently in each phase lets a
     # concurrent /model switch produce a key for one runtime and a client for
@@ -9897,10 +10257,16 @@ def _call_llm_impl(
     main_runtime = _normalize_main_runtime(main_runtime)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    if pinned_compression_route and pinned_compression_route.get("api_mode"):
+        resolved_api_mode = pinned_compression_route["api_mode"]
     if api_mode:
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    if pinned_compression_route:
+        # A pinned fallback owns its reasoning policy. Do not let the failed
+        # primary task's nested reasoning body cross the route boundary.
+        effective_extra_body.pop("reasoning", None)
     effective_provider = resolved_provider
 
     if task == "vision":
@@ -9982,22 +10348,45 @@ def _call_llm_impl(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
+    selected_fallback_ref = _take_selected_fallback_route_ref()
     effective_timeout = _effective_aux_timeout(task, timeout)
     request_provider = effective_provider or resolved_provider
-    compression_config = (
-        _get_auxiliary_task_config("compression") if task == "compression" else {}
-    )
-    fast_compression_cap, effective_extra_body = _compression_fast_lane_controls(
-        task,
-        actual_provider=request_provider,
-        actual_model=final_model,
-        requested_provider=provider,
-        requested_model=model,
-        route_config=compression_config,
-        leak_guard_config=compression_config,
-        max_tokens=max_tokens,
-        extra_body=effective_extra_body,
-    )
+    _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
+    if pinned_compression_route:
+        pinned_ref = pinned_compression_route.get("fallback_route_ref")
+        fast_compression_cap, effective_extra_body, reasoning_config = (
+            _fallback_request_controls(
+                task,
+                _FallbackDestination(
+                    request_provider,
+                    _base_info or resolved_base_url or "",
+                    resolved_api_mode,
+                    final_model,
+                ),
+                str(pinned_compression_route.get("label") or ""),
+                max_tokens=max_tokens,
+                effective_extra_body=effective_extra_body,
+                reasoning_config=reasoning_config,
+                fallback_route_ref=(
+                    pinned_ref if isinstance(pinned_ref, _FallbackRouteRef) else None
+                ),
+            )
+        )
+    else:
+        compression_config = (
+            _get_auxiliary_task_config("compression") if task == "compression" else {}
+        )
+        fast_compression_cap, effective_extra_body = _compression_fast_lane_controls(
+            task,
+            actual_provider=request_provider,
+            actual_model=final_model,
+            requested_provider=provider,
+            requested_model=model,
+            route_config=compression_config,
+            leak_guard_config=compression_config,
+            max_tokens=max_tokens,
+            extra_body=effective_extra_body,
+        )
     _set_relay_auxiliary_route(
         request_provider,
         final_model,
@@ -10008,7 +10397,19 @@ def _call_llm_impl(
     )
 
     # Log what we're about to do — makes auxiliary operations visible
-    _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
+    if not pinned_compression_route:
+        reasoning_config, effective_extra_body = _compression_route_reasoning(
+            task=task,
+            resolved_provider=resolved_provider,
+            resolved_model=resolved_model,
+            request_provider=request_provider,
+            final_model=final_model,
+            base_url=_base_info or resolved_base_url or "",
+            main_runtime=main_runtime,
+            reasoning_config=reasoning_config,
+            effective_extra_body=effective_extra_body,
+            fallback_route_ref=selected_fallback_ref,
+        )
     if task:
         logger.info("Auxiliary %s: using %s (%s)%s",
                      task, request_provider or "auto", final_model or "default",
@@ -10585,7 +10986,8 @@ def _call_llm_impl(
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
-                    reasoning_config=reasoning_config)
+                    reasoning_config=reasoning_config,
+                    fallback_route_ref=_take_selected_fallback_route_ref())
                 if fb_resp is not None:
                     return fb_resp
                 # The candidate had a stale/unrefreshable credential and was
@@ -10603,7 +11005,8 @@ def _call_llm_impl(
                         temperature=temperature, max_tokens=max_tokens,
                         tools=tools, effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
-                        reasoning_config=reasoning_config)
+                        reasoning_config=reasoning_config,
+                        fallback_route_ref=_take_selected_fallback_route_ref())
                     if fb_resp is not None:
                         return fb_resp
             # All fallback layers exhausted — emit a single user-visible
@@ -10701,6 +11104,7 @@ async def async_call_llm(
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
     route_info: Optional[Dict[str, str]] = None,
+    _pinned_compression_route: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
     semaphore = _acquire_async_aux_semaphore(task)
@@ -10722,6 +11126,7 @@ async def async_call_llm(
             extra_body=extra_body,
             reasoning_config=reasoning_config,
             route_info=route_info,
+            _pinned_compression_route=_pinned_compression_route,
         )
     finally:
         if semaphore is not None:
@@ -10744,18 +11149,46 @@ async def _async_call_llm_impl(
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
     route_info: Optional[Dict[str, str]] = None,
+    _pinned_compression_route: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Centralized asynchronous LLM call.
 
     Same as call_llm() but async. See call_llm() for full documentation.
     """
+    pinned_compression_route = (
+        dict(_pinned_compression_route)
+        if task == "compression" and isinstance(_pinned_compression_route, dict)
+        else None
+    )
+    if task == "compression" and pinned_compression_route is None:
+        try:
+            from agent.context_compressor import peek_pinned_summary_route
+
+            pinned_compression_route = peek_pinned_summary_route()
+        except Exception:
+            pinned_compression_route = None
+    if pinned_compression_route:
+        provider = pinned_compression_route.get("provider") or provider
+        model = pinned_compression_route.get("model") or model
+        base_url = pinned_compression_route.get("base_url") or base_url
+        api_key = pinned_compression_route.get("api_key") or api_key
+        if pinned_compression_route.get("timeout") is not None:
+            timeout = pinned_compression_route["timeout"]
+        if "reasoning_config" in pinned_compression_route:
+            value = pinned_compression_route.get("reasoning_config")
+            reasoning_config = copy.deepcopy(value) if isinstance(value, dict) else None
+
     # Keep every async phase on the same runtime identity, even if another
     # session switches models while this task is awaiting network I/O.
     main_runtime = _normalize_main_runtime(main_runtime)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    if pinned_compression_route and pinned_compression_route.get("api_mode"):
+        resolved_api_mode = pinned_compression_route["api_mode"]
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    if pinned_compression_route:
+        effective_extra_body.pop("reasoning", None)
     effective_provider = resolved_provider
 
     if task == "vision":
@@ -10833,6 +11266,7 @@ async def _async_call_llm_impl(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
+    selected_fallback_ref = _take_selected_fallback_route_ref()
     effective_timeout = _effective_aux_timeout(task, timeout)
     request_provider = effective_provider or resolved_provider
     _set_relay_auxiliary_route(
@@ -10848,12 +11282,50 @@ async def _async_call_llm_impl(
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
     _client_base = str(getattr(client, "base_url", "") or "")
+    effective_call_max_tokens = max_tokens
+    if pinned_compression_route:
+        pinned_ref = pinned_compression_route.get("fallback_route_ref")
+        effective_call_max_tokens, effective_extra_body, reasoning_config = (
+            _fallback_request_controls(
+                task,
+                _FallbackDestination(
+                    request_provider,
+                    _client_base or resolved_base_url or "",
+                    resolved_api_mode,
+                    final_model,
+                ),
+                str(pinned_compression_route.get("label") or ""),
+                max_tokens=max_tokens,
+                effective_extra_body=effective_extra_body,
+                reasoning_config=reasoning_config,
+                fallback_route_ref=(
+                    pinned_ref if isinstance(pinned_ref, _FallbackRouteRef) else None
+                ),
+            )
+        )
+    else:
+        reasoning_config, effective_extra_body = _compression_route_reasoning(
+            task=task,
+            resolved_provider=resolved_provider,
+            resolved_model=resolved_model,
+            request_provider=request_provider,
+            final_model=final_model,
+            base_url=_client_base or resolved_base_url or "",
+            main_runtime=main_runtime,
+            reasoning_config=reasoning_config,
+            effective_extra_body=effective_extra_body,
+            fallback_route_ref=selected_fallback_ref,
+        )
     kwargs = _build_call_kwargs(
         request_provider, final_model, messages,
-        temperature=temperature, max_tokens=max_tokens,
+        temperature=temperature, max_tokens=effective_call_max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
         base_url=_client_base or resolved_base_url, task=task)
+    if effective_call_max_tokens is not None and max_tokens is None:
+        kwargs.update(
+            auxiliary_max_tokens_param(effective_call_max_tokens, model=final_model)
+        )
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     if _is_anthropic_compat_endpoint(request_provider, _client_base):
@@ -11289,7 +11761,8 @@ async def _async_call_llm_impl(
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
-                    reasoning_config=reasoning_config)
+                    reasoning_config=reasoning_config,
+                    fallback_route_ref=_take_selected_fallback_route_ref())
                 if fb_resp is not None:
                     return fb_resp
                 # Stale/unrefreshable candidate credential — quarantined; walk
@@ -11311,7 +11784,8 @@ async def _async_call_llm_impl(
                         temperature=temperature, max_tokens=max_tokens,
                         tools=tools, effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
-                        reasoning_config=reasoning_config)
+                        reasoning_config=reasoning_config,
+                        fallback_route_ref=_take_selected_fallback_route_ref())
                     if fb_resp is not None:
                         return fb_resp
             # All fallback layers exhausted — warn before re-raising. (#26882)
