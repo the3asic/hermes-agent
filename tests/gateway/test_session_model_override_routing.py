@@ -83,12 +83,11 @@ def _explode_runtime_resolution():
 
 
 def test_gateway_auth_fallback_uses_fallback_model_from_config(tmp_path, monkeypatch):
-    """Regression: fallback provider must not inherit the primary model.
+    """Fallback resolution must use the fallback model's runtime shape.
 
-    If primary openai-codex auth fails and fallback_providers selects
-    OpenRouter/minimax, the gateway must instantiate AIAgent with the fallback
-    model, not the primary config model (e.g. gpt-5.5). Otherwise OpenRouter
-    receives an unintended GPT request.
+    A model-sensitive provider can select its URL and wire mode from the target
+    model. If primary auth fails, both those fields and the eventual AIAgent
+    model must come from the fallback entry rather than the persisted primary.
     """
     config = tmp_path / "config.yaml"
     config.write_text(
@@ -96,44 +95,60 @@ def test_gateway_auth_fallback_uses_fallback_model_from_config(tmp_path, monkeyp
 model:
   default: gpt-5.5
   provider: openai-codex
+providers:
+  opencode-go-bridge:
+    base_url: https://opencode.ai/zen/go/v1
+    key_env: OPENCODE_GO_BRIDGE_API_KEY
 fallback_providers:
-  - provider: openrouter
-    model: minimax/minimax-m2.7
+  - provider: opencode-go-bridge
+    model: minimax-m2.7
 """.lstrip(),
         encoding="utf-8",
     )
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENCODE_GO_BRIDGE_API_KEY", "fallback-key")
 
-    def fake_resolve_runtime_provider(*, requested=None, explicit_base_url=None, explicit_api_key=None):
-        if requested in {None, "", "openai-codex"}:
-            from hermes_cli.auth import AuthError
-            raise AuthError("No Codex credentials stored. Run `hermes auth` to authenticate.")
-        assert requested == "openrouter"
-        return {
-            "api_key": "sk-openrouter",
-            "base_url": "https://openrouter.ai/api/v1",
-            "provider": "openrouter",
-            "api_mode": "chat_completions",
-            "command": None,
-            "args": [],
-            "credential_pool": None,
-        }
-
+    resolver_calls = []
     import hermes_cli.runtime_provider as runtime_provider
 
-    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", fake_resolve_runtime_provider)
+    real_resolve_runtime_provider = runtime_provider.resolve_runtime_provider
+
+    def tracking_resolve_runtime_provider(**kwargs):
+        resolver_calls.append(
+            (kwargs.get("requested"), kwargs.get("target_model"))
+        )
+        if kwargs.get("requested") in {None, "", "openai-codex"}:
+            from hermes_cli.auth import AuthError
+            raise AuthError("No Codex credentials stored. Run `hermes auth` to authenticate.")
+        return real_resolve_runtime_provider(**kwargs)
+
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        tracking_resolve_runtime_provider,
+    )
 
     runner = _make_runner()
     model, runtime_kwargs = runner._resolve_session_agent_runtime(
         session_key="agent:main:telegram:group:-1003715515980:63",
         user_config={
             "model": {"default": "gpt-5.5", "provider": "openai-codex"},
-            "fallback_providers": [{"provider": "openrouter", "model": "minimax/minimax-m2.7"}],
+            "fallback_providers": [
+                {
+                    "provider": "opencode-go-bridge",
+                    "model": "minimax-m2.7",
+                }
+            ],
         },
     )
 
-    assert model == "minimax/minimax-m2.7"
-    assert runtime_kwargs["provider"] == "openrouter"
-    assert runtime_kwargs["api_key"] == "sk-openrouter"
-
-
+    assert resolver_calls[-1] == (
+        "opencode-go-bridge",
+        "minimax-m2.7",
+    )
+    assert model == "minimax-m2.7"
+    assert runtime_kwargs["provider"] == "custom"
+    assert runtime_kwargs["api_key"] == "fallback-key"
+    assert runtime_kwargs["api_mode"] == "anthropic_messages"
+    assert runtime_kwargs["base_url"] == "https://opencode.ai/zen/go"

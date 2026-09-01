@@ -470,16 +470,25 @@ def test_cli_auth_fallback_reasoning_is_target_owned_across_agent_init(
         "reasoning_effort": "max",
     }
     shell._fallback_model = [fallback_entry]
+    resolver_calls = []
 
     def _resolve_runtime(**kwargs):
+        resolver_calls.append(dict(kwargs))
         if kwargs.get("requested") == "openai-codex":
             raise AuthError("primary unavailable")
+        uses_fallback_shape = kwargs.get("target_model") == "glm-5.3"
         return {
             "provider": "custom",
             "requested_provider": "custom:glm",
             "api_key": "fallback-key",
-            "base_url": "https://glm.example/v1",
-            "api_mode": "anthropic_messages",
+            "base_url": (
+                "https://glm.example/v1/messages"
+                if uses_fallback_shape
+                else "https://glm.example/v1/chat/completions"
+            ),
+            "api_mode": (
+                "anthropic_messages" if uses_fallback_shape else "chat_completions"
+            ),
             "command": None,
             "args": [],
             "credential_pool": None,
@@ -509,6 +518,16 @@ def test_cli_auth_fallback_reasoning_is_target_owned_across_agent_init(
     # Exercise the CLI's second refresh: it now resolves the fallback provider
     # directly, but the original entry must remain the route owner.
     assert shell._ensure_runtime_credentials() is True
+    fallback_calls = [
+        call for call in resolver_calls
+        if call.get("requested") == "custom:glm"
+    ]
+    assert [call.get("target_model") for call in fallback_calls] == [
+        "glm-5.3",
+        "glm-5.3",
+    ]
+    assert shell.api_mode == "anthropic_messages"
+    assert shell.base_url == "https://glm.example/v1/messages"
     route = shell._resolve_turn_agent_config("hello")
     assert route["reasoning_config"] == {"enabled": True, "effort": "max"}
     assert route["fallback_entry"] == fallback_entry
@@ -837,4 +856,3 @@ def test_custom_endpoint_key_env_is_a_valid_posix_name_for_ip_endpoints():
 
     for identity in ("127.0.0.1_8080", "0.0.0.0", "10.0.0.7:11434", "", "-–-"):
         assert _ENV_VAR_NAME_RE.match(custom_endpoint_key_env(identity)), identity
-

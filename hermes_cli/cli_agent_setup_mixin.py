@@ -69,11 +69,18 @@ class CLIAgentSetupMixin:
         resolved_fallback_entry = self._matching_runtime_fallback_entry()
         runtime = None
         try:
-            runtime = resolve_runtime_provider(
-                requested=self.requested_provider,
-                explicit_api_key=self._explicit_api_key,
-                explicit_base_url=self._explicit_base_url,
-            )
+            _runtime_kwargs = {
+                "requested": self.requested_provider,
+                "explicit_api_key": self._explicit_api_key,
+                "explicit_base_url": self._explicit_base_url,
+            }
+            # A previous auth fallback remains the active route across the
+            # second credential refresh before agent construction. Keep its
+            # model-sensitive provider shape (URL/api_mode/auth) tied to the
+            # fallback model rather than the persisted primary default.
+            if isinstance(resolved_fallback_entry, dict):
+                _runtime_kwargs["target_model"] = self.model
+            runtime = resolve_runtime_provider(**_runtime_kwargs)
         except Exception as exc:
             _primary_exc = exc
 
@@ -90,7 +97,10 @@ class CLIAgentSetupMixin:
                     try:
                         from hermes_cli.fallback_config import resolve_entry_api_key
 
-                        _fb_kwargs = {"requested": _fb_provider}
+                        _fb_kwargs = {
+                            "requested": _fb_provider,
+                            "target_model": _fb_model,
+                        }
                         if _fb.get("base_url"):
                             _fb_kwargs["explicit_base_url"] = _fb["base_url"]
                         _fb_api_key = resolve_entry_api_key(_fb)
