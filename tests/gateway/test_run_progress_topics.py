@@ -971,6 +971,7 @@ class QueuedFooterAgent:
         self.session_cache_read_tokens = 0
         self.session_cache_write_tokens = 0
         self.session_cache_usage_report_calls = 0
+        self.session_context_usage_report_calls = 0
         self.session_last_prompt_tokens = 0
         self.session_api_calls = 0
         self.session_usage_report_calls = 0
@@ -986,6 +987,7 @@ class QueuedFooterAgent:
         self.session_completion_tokens += 400
         self.session_cache_read_tokens += 47_500
         self.session_cache_usage_report_calls += 1
+        self.session_context_usage_report_calls += 1
         self.session_last_prompt_tokens = 50_000
         self.session_api_calls += 1
         self.session_usage_report_calls += 1
@@ -1018,6 +1020,7 @@ class MissingUsageFooterAgent:
         self.session_cache_read_tokens = 0
         self.session_cache_write_tokens = 0
         self.session_cache_usage_report_calls = 2
+        self.session_context_usage_report_calls = 2
         self.session_last_prompt_tokens = 50_000
         self.session_api_calls = 2
         self.session_usage_report_calls = 2
@@ -1043,6 +1046,7 @@ class MixedUsageFooterAgent(MissingUsageFooterAgent):
         self.session_completion_tokens += 400
         self.session_cache_read_tokens += 47_500
         self.session_cache_usage_report_calls += 1
+        self.session_context_usage_report_calls += 1
         self.session_last_prompt_tokens = 50_000
         self.session_api_calls += 1
         self.session_usage_report_calls += 1
@@ -1075,6 +1079,7 @@ class RouteReasoningCaptureAgent:
         self.session_cache_read_tokens = 0
         self.session_cache_write_tokens = 0
         self.session_cache_usage_report_calls = 0
+        self.session_context_usage_report_calls = 0
         self.session_last_prompt_tokens = 0
         self.session_usage_report_calls = 0
         self.context_compressor = SimpleNamespace(

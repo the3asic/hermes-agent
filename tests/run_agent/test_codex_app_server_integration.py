@@ -100,6 +100,7 @@ class TestRunConversationCodexPath:
             cache_write_tokens_start=0,
             usage_report_calls_start=0,
             cache_usage_report_calls_start=0,
+            context_usage_report_calls_start=0,
             result_api_calls=result["api_calls"],
         )
         assert metadata["turn_input_tokens"] is None
@@ -152,6 +153,7 @@ class TestRunConversationCodexPath:
         assert agent.session_cache_read_tokens == 20
         assert agent.session_cache_write_tokens == 10
         assert agent.session_cache_usage_report_calls == 1
+        assert agent.session_context_usage_report_calls == 1
         assert agent.session_last_prompt_tokens == 80
         assert agent.session_reasoning_tokens == 5
         assert agent.context_compressor.last_prompt_tokens == 80

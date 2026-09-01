@@ -3052,6 +3052,7 @@ def init_agent(
     # Subset of usage-bearing calls whose provider explicitly reported a
     # trustworthy cache-read bucket. Keeps a real 0% hit distinct from unknown.
     agent.session_cache_usage_report_calls = 0
+    agent.session_context_usage_report_calls = 0
     agent.session_input_tokens = 0
     agent.session_output_tokens = 0
     agent.session_cache_read_tokens = 0

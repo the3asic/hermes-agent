@@ -8,6 +8,7 @@ from agent.usage_pricing import (
     normalize_usage,
     resolve_billing_route,
     usage_reports_cache_metrics,
+    usage_reports_full_prompt_metrics,
 )
 from decimal import Decimal
 
@@ -18,9 +19,14 @@ def test_cache_metrics_distinguish_reported_zero_from_missing():
         "prompt_tokens_details": {"cached_tokens": 0},
     }
     missing = {"prompt_tokens": 1_000}
+    null_detail = {
+        "prompt_tokens": 1_000,
+        "prompt_tokens_details": {"cached_tokens": None},
+    }
 
     assert usage_reports_cache_metrics(reported_zero) is True
     assert usage_reports_cache_metrics(missing) is False
+    assert usage_reports_cache_metrics(null_detail) is False
 
 
 def test_minimax_anthropic_cache_floor_is_not_treated_as_hit_telemetry():
@@ -33,7 +39,61 @@ def test_minimax_anthropic_cache_floor_is_not_treated_as_hit_telemetry():
         usage,
         provider="minimax-cn",
         api_mode="anthropic_messages",
+        model="MiniMax-M3",
     ) is False
+
+
+def test_minimax_m3_cache_floor_is_blocked_for_oauth_and_custom_host_routes():
+    usage = {"input_tokens": 1_000, "cache_read_input_tokens": 128}
+
+    assert usage_reports_cache_metrics(
+        usage,
+        provider="minimax-oauth",
+        api_mode="anthropic_messages",
+        model="MiniMax-M3",
+    ) is False
+    assert usage_reports_cache_metrics(
+        usage,
+        provider="custom",
+        api_mode="anthropic_messages",
+        model="MiniMax-M3",
+        base_url="https://api.minimax.io/anthropic",
+    ) is False
+
+
+def test_minimax_non_m3_cache_telemetry_remains_available():
+    usage = {"input_tokens": 1_000, "cache_read_input_tokens": 500}
+
+    assert usage_reports_cache_metrics(
+        usage,
+        provider="minimax-cn",
+        api_mode="anthropic_messages",
+        model="MiniMax-M2.7",
+    ) is True
+
+
+def test_minimax_m3_cannot_claim_exact_full_prompt_context():
+    usage = {"input_tokens": 1_000, "cache_read_input_tokens": 128}
+
+    assert usage_reports_full_prompt_metrics(
+        usage,
+        provider="minimax-oauth",
+        api_mode="anthropic_messages",
+        model="MiniMax-M3",
+    ) is False
+    assert usage_reports_full_prompt_metrics(
+        usage,
+        provider="custom",
+        api_mode="anthropic_messages",
+        model="MiniMax-M3",
+        base_url="https://api.minimaxi.com/anthropic",
+    ) is False
+    assert usage_reports_full_prompt_metrics(
+        usage,
+        provider="minimax-cn",
+        api_mode="anthropic_messages",
+        model="MiniMax-M2.7",
+    ) is True
 
 
 

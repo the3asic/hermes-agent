@@ -206,6 +206,9 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
             getattr(agent, "session_usage_report_calls", 0) + 1
         )
         agent.session_last_prompt_tokens = prompt_tokens
+        agent.session_context_usage_report_calls = (
+            getattr(agent, "session_context_usage_report_calls", 0) + 1
+        )
         if "cachedInputTokens" in usage:
             agent.session_cache_usage_report_calls = (
                 getattr(agent, "session_cache_usage_report_calls", 0) + 1

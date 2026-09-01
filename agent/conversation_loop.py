@@ -105,6 +105,7 @@ from agent.usage_pricing import (
     estimate_usage_cost,
     normalize_usage,
     usage_reports_cache_metrics,
+    usage_reports_full_prompt_metrics,
 )
 from agent import empty_response_guard as _empty_guard
 from hermes_constants import PARTIAL_STREAM_STUB_ID
@@ -4398,15 +4399,33 @@ def run_conversation(
                     # when upstream omitted usage. A real non-empty model
                     # request cannot have zero prompt tokens, so only count a
                     # positive canonical prompt as a usable provider report.
-                    if prompt_tokens > 0:
+                    latest_prompt_tokens = aggregator_usage.prompt_tokens
+                    if latest_prompt_tokens > 0:
                         agent.session_usage_report_calls = (
                             getattr(agent, "session_usage_report_calls", 0) + 1
                         )
-                        agent.session_last_prompt_tokens = prompt_tokens
+                        agent.session_last_prompt_tokens = latest_prompt_tokens
+                        if usage_reports_full_prompt_metrics(
+                            response.usage,
+                            provider=agent.provider,
+                            api_mode=agent.api_mode,
+                            model=agent.model,
+                            base_url=agent.base_url,
+                        ):
+                            agent.session_context_usage_report_calls = (
+                                getattr(
+                                    agent,
+                                    "session_context_usage_report_calls",
+                                    0,
+                                )
+                                + 1
+                            )
                         if usage_reports_cache_metrics(
                             response.usage,
                             provider=agent.provider,
                             api_mode=agent.api_mode,
+                            model=agent.model,
+                            base_url=agent.base_url,
                         ):
                             agent.session_cache_usage_report_calls = (
                                 getattr(

@@ -153,6 +153,7 @@ def test_gateway_turn_metadata_uses_final_model_and_reported_turn_delta():
         session_cache_read_tokens=5_000,
         session_cache_write_tokens=0,
         session_cache_usage_report_calls=3,
+        session_context_usage_report_calls=3,
         session_last_prompt_tokens=50_000,
         session_api_calls=3,
         session_usage_report_calls=3,
@@ -169,6 +170,7 @@ def test_gateway_turn_metadata_uses_final_model_and_reported_turn_delta():
         cache_write_tokens_start=0,
         usage_report_calls_start=2,
         cache_usage_report_calls_start=2,
+        context_usage_report_calls_start=2,
         result_api_calls=1,
     )
 
@@ -181,6 +183,7 @@ def test_gateway_turn_metadata_uses_final_model_and_reported_turn_delta():
         "cache_write_tokens": 0,
         "usage_report_calls": 3,
         "cache_usage_report_calls": 3,
+        "context_usage_report_calls": 3,
         "turn_input_tokens": 2_500,
         "turn_output_tokens": 400,
         "turn_cache_read_tokens": 5_000,
@@ -207,6 +210,7 @@ def test_cache_heavy_turn_does_not_report_reused_context_as_new_input():
         session_cache_read_tokens=915_136,
         session_cache_write_tokens=0,
         session_cache_usage_report_calls=8,
+        session_context_usage_report_calls=8,
         session_last_prompt_tokens=122_971,
         session_api_calls=8,
         session_usage_report_calls=8,
@@ -224,6 +228,7 @@ def test_cache_heavy_turn_does_not_report_reused_context_as_new_input():
         cache_write_tokens_start=0,
         usage_report_calls_start=0,
         cache_usage_report_calls_start=0,
+        context_usage_report_calls_start=0,
         result_api_calls=8,
     )
 
@@ -249,6 +254,41 @@ def test_cache_heavy_turn_does_not_report_reused_context_as_new_input():
         "tokens(turn,uncached):38.7k in/3.4k out · cache(turn):96% · "
         "ctx(last):123.0k/1.0M (12%)"
     )
+
+
+def test_reported_tokens_do_not_imply_exact_context_coverage():
+    from gateway.run import _gateway_turn_runtime_metadata
+
+    agent = SimpleNamespace(
+        model="MiniMax-M3",
+        reasoning_config={"enabled": True, "effort": "high"},
+        session_prompt_tokens=1_128,
+        session_input_tokens=1_000,
+        session_completion_tokens=50,
+        session_cache_read_tokens=128,
+        session_cache_write_tokens=0,
+        session_usage_report_calls=1,
+        session_cache_usage_report_calls=0,
+        session_context_usage_report_calls=0,
+        session_last_prompt_tokens=1_128,
+        context_compressor=SimpleNamespace(context_length=1_000_000),
+    )
+
+    metadata = _gateway_turn_runtime_metadata(
+        agent,
+        uncached_input_tokens_start=0,
+        completion_tokens_start=0,
+        cache_read_tokens_start=0,
+        cache_write_tokens_start=0,
+        usage_report_calls_start=0,
+        cache_usage_report_calls_start=0,
+        context_usage_report_calls_start=0,
+        result_api_calls=1,
+    )
+
+    assert metadata["token_usage_status"] == "reported"
+    assert metadata["cache_usage_status"] is None
+    assert metadata["context_usage_status"] is None
 
 
 @pytest.mark.parametrize(
@@ -279,6 +319,7 @@ def test_gateway_turn_metadata_labels_or_hides_incomplete_provider_usage(
         session_cache_read_tokens=0,
         session_cache_write_tokens=0,
         session_cache_usage_report_calls=usage_calls_now,
+        session_context_usage_report_calls=usage_calls_now,
         session_last_prompt_tokens=50_000,
         session_api_calls=usage_calls_now,
         session_usage_report_calls=usage_calls_now,
@@ -295,6 +336,7 @@ def test_gateway_turn_metadata_labels_or_hides_incomplete_provider_usage(
         cache_write_tokens_start=0,
         usage_report_calls_start=2,
         cache_usage_report_calls_start=2,
+        context_usage_report_calls_start=2,
         result_api_calls=result_calls,
     )
 

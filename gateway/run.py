@@ -4594,6 +4594,7 @@ def _gateway_turn_runtime_metadata(
     cache_write_tokens_start: Any,
     usage_report_calls_start: Any,
     cache_usage_report_calls_start: Any,
+    context_usage_report_calls_start: Any,
     result_api_calls: Any,
 ) -> dict[str, Any]:
     """Snapshot honest per-turn runtime metadata from a gateway agent.
@@ -4622,6 +4623,9 @@ def _gateway_turn_runtime_metadata(
     )
     cache_usage_report_calls = (
         getattr(agent, "session_cache_usage_report_calls", 0) or 0
+    )
+    context_usage_report_calls = (
+        getattr(agent, "session_context_usage_report_calls", 0) or 0
     )
 
     from gateway.runtime_footer import (
@@ -4652,6 +4656,10 @@ def _gateway_turn_runtime_metadata(
     turn_cache_usage_report_calls = turn_counter_delta(
         cache_usage_report_calls,
         cache_usage_report_calls_start,
+    )
+    turn_context_usage_report_calls = turn_counter_delta(
+        context_usage_report_calls,
+        context_usage_report_calls_start,
     )
     try:
         expected_api_calls = int(result_api_calls)
@@ -4697,11 +4705,16 @@ def _gateway_turn_runtime_metadata(
     else:
         turn_cache_read_tokens = None
         turn_cache_write_tokens = None
-    context_usage_status = (
-        "reported"
-        if token_usage_status == "reported" and last_prompt_tokens > 0
-        else None
-    )
+    context_usage_status = None
+    if (
+        isinstance(turn_context_usage_report_calls, int)
+        and turn_context_usage_report_calls > 0
+        and expected_api_calls is not None
+        and expected_api_calls >= 0
+        and turn_context_usage_report_calls == expected_api_calls
+        and last_prompt_tokens > 0
+    ):
+        context_usage_status = "reported"
     if not input_counter_valid:
         logger.warning(
             "Gateway non-cached input-token counter moved backwards or became invalid "
@@ -4741,6 +4754,7 @@ def _gateway_turn_runtime_metadata(
         "cache_write_tokens": cache_write_tokens,
         "usage_report_calls": usage_report_calls,
         "cache_usage_report_calls": cache_usage_report_calls,
+        "context_usage_report_calls": context_usage_report_calls,
         "turn_input_tokens": turn_input_tokens,
         "turn_output_tokens": turn_output_tokens,
         "turn_cache_read_tokens": turn_cache_read_tokens,
@@ -7277,6 +7291,9 @@ class TurnRunner:
         _turn_cache_usage_report_calls_start = (
             getattr(agent, "session_cache_usage_report_calls", 0) or 0
         )
+        _turn_context_usage_report_calls_start = (
+            getattr(agent, "session_context_usage_report_calls", 0) or 0
+        )
 
         _approval_session_key = ctx.session_key or ""
         _approval_session_token = set_current_session_key(_approval_session_key)
@@ -7422,6 +7439,9 @@ class TurnRunner:
             cache_write_tokens_start=_turn_cache_write_tokens_start,
             usage_report_calls_start=_turn_usage_report_calls_start,
             cache_usage_report_calls_start=_turn_cache_usage_report_calls_start,
+            context_usage_report_calls_start=(
+                _turn_context_usage_report_calls_start
+            ),
             result_api_calls=(
                 result.get("api_calls") if isinstance(result, dict) else None
             ),

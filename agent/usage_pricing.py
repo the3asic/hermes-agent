@@ -7,7 +7,11 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Literal, Optional
 
-from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
+from agent.model_metadata import (
+    _model_name_suggests_minimax_m3,
+    fetch_endpoint_model_metadata,
+    fetch_model_metadata,
+)
 from utils import base_url_host_matches, base_url_hostname
 
 logger = logging.getLogger(__name__)
@@ -1082,7 +1086,7 @@ def _usage_field_reported(obj: Any, name: str) -> bool:
     exists so a default ``0`` is not mistaken for provider telemetry.
     """
     if isinstance(obj, dict):
-        return name in obj
+        return name in obj and obj.get(name) is not None
     fields_set = getattr(obj, "model_fields_set", None)
     if isinstance(fields_set, (set, frozenset)):
         return name in fields_set
@@ -1094,6 +1098,8 @@ def usage_reports_cache_metrics(
     *,
     provider: Optional[str] = None,
     api_mode: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
 ) -> bool:
     """Return whether cache-read telemetry is trustworthy for this response.
 
@@ -1108,7 +1114,15 @@ def usage_reports_cache_metrics(
     mode = (api_mode or "").strip().lower()
     if provider_name == "moa":
         return False
-    if provider_name in {"minimax", "minimax-cn"} and mode == "anthropic_messages":
+    minimax_route = provider_name in {"minimax", "minimax-cn", "minimax-oauth"} or any(
+        base_url_host_matches(base_url or "", host)
+        for host in ("api.minimax.io", "api.minimaxi.com")
+    )
+    if (
+        mode == "anthropic_messages"
+        and minimax_route
+        and _model_name_suggests_minimax_m3(model or "")
+    ):
         return False
 
     for details_name in ("input_tokens_details", "prompt_tokens_details"):
@@ -1123,6 +1137,33 @@ def usage_reports_cache_metrics(
             "prompt_cache_hit_tokens",
             "cached_tokens",
         )
+    )
+
+
+def usage_reports_full_prompt_metrics(
+    response_usage: Any,
+    *,
+    provider: Optional[str] = None,
+    api_mode: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> bool:
+    """Return whether canonical prompt tokens represent full context occupancy."""
+    if not response_usage:
+        return False
+    provider_name = (provider or "").strip().lower()
+    mode = (api_mode or "").strip().lower()
+    minimax_route = provider_name in {"minimax", "minimax-cn", "minimax-oauth"} or any(
+        base_url_host_matches(base_url or "", host)
+        for host in ("api.minimax.io", "api.minimaxi.com")
+    )
+    # MiniMax-M3's Anthropic wire reports a fixed +128 cache-read bucket while
+    # input_tokens drops on a hit. Neither bucket reconstructs the full cached
+    # prefix, so it cannot support an exact context-window label.
+    return not (
+        mode == "anthropic_messages"
+        and minimax_route
+        and _model_name_suggests_minimax_m3(model or "")
     )
 
 
