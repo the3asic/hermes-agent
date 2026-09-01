@@ -5870,8 +5870,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # derived indexes and retry against the canonical tables.
                 if self._try_runtime_fts_rebuild(exc):
                     continue
-                if self._fts_stale or not self._fts_enabled:
-                    continue
                 if self._enter_fts_fail_open(exc):
                     continue
                 raise

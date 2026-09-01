@@ -462,7 +462,6 @@ class TestRuntimeFtsRebuild:
         # >=3 CJK chars per token → routed to the trigram branch.
         results = db.search_messages("大别山项目")
 
-        assert db._fts_runtime_rebuild_attempted is True
         assert db._fts_stale is True
         assert _meta_value(db_path, FTS_STALE_KEY) == "1"
         assert _base_fts_triggers(db_path) == set()

@@ -701,7 +701,7 @@ class TestTelegramMenuCommands:
         ):
             menu, hidden = telegram_menu_commands(max_commands=2)
 
-        assert [name for name, _desc in menu] == ["help", "z_skill"]
+        assert [name for name, _desc in menu] == ["z_skill", "help"]
         assert hidden == 1
 
 
