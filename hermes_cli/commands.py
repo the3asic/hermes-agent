@@ -1041,9 +1041,6 @@ def _collect_gateway_skill_entries(
         sanitize_name: Optional name transform applied before clamping, e.g.
             :func:`_sanitize_telegram_name` for Telegram.  May return an
             empty string to signal "skip this entry".
-        priority_names: Sanitized command names that should sort before other
-            skills.  Empty preserves the historical alphabetical order.
-
     Returns:
         ``(entries, hidden_count)`` where *entries* contains
         ``(name, description, cmd_key, raw_name)`` tuples. ``cmd_key`` is the
@@ -1145,28 +1142,6 @@ def _collect_gateway_skill_entries(
     if max_slots is None:
         return all_entries + skill_entries, 0
 
-    # Sort before applying the slot cap. Otherwise a configured priority skill
-    # can still disappear merely because its name falls outside the available
-    # alphabetical window.
-    if priority_names:
-        priority = {name: index for index, name in enumerate(priority_names)}
-        skill_triples = [
-            entry
-            for _index, entry in sorted(
-                enumerate(skill_triples),
-                key=lambda item: (
-                    0,
-                    priority[item[1][0]],
-                    item[0],
-                )
-                if item[1][0] in priority
-                else (
-                    1,
-                    item[0],
-                ),
-            )
-        ]
-
     # Skills fill remaining slots — only tier that gets trimmed
     remaining = max(0, max_slots - len(all_entries))
     hidden_count = max(0, len(skill_entries) - remaining)
@@ -1210,7 +1185,6 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
         reserved_names=reserved_names,
         desc_limit=40,
         sanitize_name=_sanitize_telegram_name,
-        priority_names=_telegram_effective_priority(),
     )
     candidates = [(name, desc, "core", name) for name, desc in core_commands]
     for name, desc, cmd_key, raw_name in entries:

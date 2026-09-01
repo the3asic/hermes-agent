@@ -742,6 +742,7 @@ def test_terminal_cleanup_waits_for_inflight_subprocess_command(monkeypatch):
             return self.returncode
 
     monkeypatch.setattr(bt, "_find_agent_browser", lambda **_kwargs: "/tmp/fake-agent-browser")
+    monkeypatch.setattr(bt, "_chromium_installed", lambda: True)
     monkeypatch.setattr(bt.subprocess, "Popen", _Popen)
     command_result: list[dict] = []
     cleanup_result: list[bool] = []
@@ -810,6 +811,7 @@ def test_terminal_cleanup_waits_for_inflight_supervisor_eval(monkeypatch):
             return self.returncode
 
     monkeypatch.setattr(bt, "_find_agent_browser", lambda **_kwargs: "/tmp/fake-agent-browser")
+    monkeypatch.setattr(bt, "_chromium_installed", lambda: True)
     monkeypatch.setattr(bt.subprocess, "Popen", _Popen)
     eval_result: list[dict] = []
     cleanup_result: list[bool] = []

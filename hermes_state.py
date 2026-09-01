@@ -4948,6 +4948,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._read_open_failed_at = 0.0
         self._wal_active = False
         self._write_count = 0
+        # Full FTS rebuild is opt-in and bounded to explicit offline repair.
+        # Live write/search paths set this guard before failing open so one
+        # corrupted index cannot trigger repeated admission work.
+        self._fts_runtime_rebuild_attempted = False
         # One-shot guard for the usermerge-floor config write on the
         # incremental FTS merge cadence (see _merge_fts_incrementally).
         self._fts_usermerge_floor_applied = False

@@ -147,13 +147,17 @@ class TestReapOrphanedBrowserSessions:
         )
         terminated = []
         with patch("gateway.status._pid_exists", side_effect=[False, True]), \
+             patch("gateway.status.get_process_start_time", return_value=1.0), \
              patch("tools.browser_tool._verify_reapable_browser_daemon", return_value=True), \
              patch("tools.browser_tool._close_orphaned_pinned_target", return_value=True) as close_target, \
-             patch("tools.process_registry.ProcessRegistry._terminate_host_pid", side_effect=terminated.append):
+             patch(
+                 "tools.process_registry.ProcessRegistry._terminate_host_pid",
+                 side_effect=lambda pid, started_at: terminated.append((pid, started_at)),
+             ):
             _reap_orphaned_browser_sessions()
 
         close_target.assert_called_once_with(str(d), "cdp_owned1234")
-        assert terminated == [12345]
+        assert terminated == [(12345, 1.0)]
         assert not d.exists()
 
     def test_transient_pinned_close_failure_retains_daemon_and_ownership(
