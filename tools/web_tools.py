@@ -815,15 +815,186 @@ def _ensure_web_plugins_loaded() -> None:
         logger.warning("Web plugin discovery failed (non-fatal): %s", exc)
 
 
+_CORE_SEARCH_PROVENANCE_FIELDS = frozenset(
+    {
+        "requested_backend",
+        "served_by",
+        "fallback_used",
+        "retrieved_at",
+        "served_at",
+        "cache",
+        "evidence_scope",
+        "page_fetched",
+        "result_scope",
+        "requested_limit",
+        "fetched_result_count",
+        "returned_count",
+        "result_set_truncated",
+        "upstream_cache_timestamp",
+        "upstream_cache_timestamp_status",
+        "limitations",
+        "transformations",
+    }
+)
+
+
+def _provenance_string_list(value: Any) -> list[str]:
+    """Return only non-empty strings from a provider-owned list field."""
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+
+def _merge_provenance_lists(*values: Any) -> list[str]:
+    """Stable, duplicate-free merge for limitations and transformations."""
+    merged = []
+    seen = set()
+    for value in values:
+        for item in _provenance_string_list(value):
+            if item not in seen:
+                seen.add(item)
+                merged.append(item)
+    return merged
+
+
+def _search_web_count(response: dict) -> int:
+    data = response.get("data") if isinstance(response, dict) else None
+    web = data.get("web") if isinstance(data, dict) else None
+    return len(web) if isinstance(web, list) else 0
+
+
+def _inject_search_provenance(
+    response: dict,
+    *,
+    requested_backend: str,
+    requested_limit: int,
+    fetched_result_count: int,
+    retrieved_at: str,
+    cache_status: str,
+    cache_age_seconds: Optional[float] = None,
+    cache_ttl_seconds: Optional[float] = None,
+    fallback_used: bool = False,
+) -> dict:
+    """Add the core-owned truth contract to a successful search response.
+
+    Providers may contribute stable fields (for example ``engine``, source
+    date semantics, upstream cache reporting, limitations, and
+    transformations). Hermes owns request-time routing, cache, timestamps,
+    scope, and counts, and overwrites those fields on every call. Providers
+    must not present ``confidence``, ``current``, ``fresh``, or ``verified`` as
+    facts merely because a search result contained a snippet.
+    """
+    if not isinstance(response, dict) or not response.get("success"):
+        return response
+
+    data = response.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    provider_provenance = data.get("provenance")
+    if not isinstance(provider_provenance, dict):
+        provider_provenance = {}
+
+    legacy_served_by = data.get("served_by")
+    served_by = (
+        legacy_served_by.strip()
+        if isinstance(legacy_served_by, str) and legacy_served_by.strip()
+        else requested_backend
+    )
+    raw_upstream_cache_timestamp = provider_provenance.get(
+        "upstream_cache_timestamp"
+    )
+    upstream_cache_timestamp = (
+        raw_upstream_cache_timestamp.strip()
+        if isinstance(raw_upstream_cache_timestamp, str)
+        and raw_upstream_cache_timestamp.strip()
+        else None
+    )
+    upstream_cache_timestamp_status = (
+        "reported_in_response"
+        if upstream_cache_timestamp is not None
+        else "not_reported_in_response"
+    )
+
+    returned_count = _search_web_count(response)
+    result_set_truncated = fetched_result_count > returned_count
+    limitations = _merge_provenance_lists(
+        provider_provenance.get("limitations"),
+        ["page_not_fetched", "not_exhaustive"],
+        ["upstream_cache_time_not_reported"]
+        if upstream_cache_timestamp is None
+        else [],
+    )
+    transformations = _merge_provenance_lists(
+        provider_provenance.get("transformations"),
+        ["limit_slice"] if result_set_truncated else [],
+    )
+
+    cache_age = (
+        float(cache_age_seconds)
+        if cache_status == "hit" and cache_age_seconds is not None
+        else None
+    )
+    cache_ttl = (
+        float(cache_ttl_seconds)
+        if cache_status in {"hit", "miss"} and cache_ttl_seconds is not None
+        else None
+    )
+    provenance = {
+        "requested_backend": requested_backend,
+        "served_by": served_by,
+        "fallback_used": bool(fallback_used or served_by != requested_backend),
+        "retrieved_at": retrieved_at,
+        "served_at": _search_provenance_now(),
+        "cache": {
+            "layer": "hermes_process_memory",
+            "status": cache_status,
+            "age_seconds": cache_age,
+            "ttl_seconds": cache_ttl,
+        },
+        "evidence_scope": "search_result_metadata_only",
+        "page_fetched": False,
+        "result_scope": "top_n",
+        "requested_limit": requested_limit,
+        "fetched_result_count": fetched_result_count,
+        "returned_count": returned_count,
+        "result_set_truncated": result_set_truncated,
+        "upstream_cache_timestamp": upstream_cache_timestamp,
+        "upstream_cache_timestamp_status": upstream_cache_timestamp_status,
+        "limitations": limitations,
+        "transformations": transformations,
+    }
+    for key, value in provider_provenance.items():
+        if key not in _CORE_SEARCH_PROVENANCE_FIELDS:
+            provenance[key] = value
+
+    # Rebuild ``data`` so provenance stays ahead of potentially large result
+    # lists when downstream context storage has to keep only a prefix.
+    response["data"] = {
+        "provenance": provenance,
+        **{key: value for key, value in data.items() if key != "provenance"},
+    }
+    return response
+
+
+def _search_provenance_now() -> str:
+    """Late import avoids coupling web provider discovery to cache config."""
+    from tools.web_result_cache import utc_now_iso
+
+    return utc_now_iso()
+
+
 def web_search_tool(query: str, limit: int = 5) -> str:
     """
-    Search the web for information using available search API backend.
+    Search through the configured backend and return result metadata.
 
-    This function provides a generic interface for web search that can work
-    with multiple backends (Parallel or Firecrawl).
-
-    Note: This function returns search result metadata only (URLs, titles, descriptions).
-    Use web_extract_tool to get full content from specific URLs.
+    Search descriptions are upstream snippets, not page content. This function
+    does not fetch result pages or prove that a statement is current, accurate,
+    or authoritative. Use :func:`web_extract_tool` and inspect the primary
+    source when those distinctions matter. The success envelope always carries
+    ``data.provenance`` before ``data.web`` so routing, cache layer, timestamps,
+    evidence scope, counts, transformations, and limitations survive bounded
+    output previews. It deliberately makes no ``confidence``, ``current``,
+    ``fresh``, ``verified``, or similar truth claim.
     
     Args:
         query (str): The search query to look up
@@ -834,6 +1005,30 @@ def web_search_tool(query: str, limit: int = 5) -> str:
              {
                  "success": bool,
                  "data": {
+                     "provenance": {
+                         "requested_backend": str,
+                         "served_by": str,
+                         "fallback_used": bool,
+                         "retrieved_at": str,
+                         "served_at": str,
+                         "cache": {
+                             "layer": "hermes_process_memory",
+                             "status": "hit" | "miss" | "bypass",
+                             "age_seconds": float | null,
+                             "ttl_seconds": float | null
+                         },
+                         "evidence_scope": "search_result_metadata_only",
+                         "page_fetched": false,
+                         "result_scope": "top_n",
+                         "requested_limit": int,
+                         "fetched_result_count": int,
+                         "returned_count": int,
+                         "result_set_truncated": bool,
+                         "upstream_cache_timestamp": str | null,
+                         "upstream_cache_timestamp_status": str,
+                         "limitations": list[str],
+                         "transformations": list[str]
+                     },
                      "web": [
                          {
                              "title": str,
@@ -955,11 +1150,13 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             # count is sliced out below. Only successful responses cache.
             from tools.web_result_cache import (
                 bucket_limit as _bucket_limit,
+                cache_enabled as _search_cache_enabled,
                 search_memo as _search_memo,
                 slice_search_response as _slice_search_response,
+                utc_now_iso as _utc_now_iso,
             )
 
-            def _paid_search() -> tuple[dict, bool]:
+            def _paid_search() -> tuple[dict, bool, str]:
                 _fetch_limit = _bucket_limit(limit)
                 _rescued = False
                 try:
@@ -984,28 +1181,85 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                             query,
                             _fetch_limit,
                         )
-                return _resp, _rescued
+                return _resp, _rescued, _utc_now_iso()
 
-            response_data = _search_memo.lookup(provider.name, query, limit)
-            if response_data is None:
-                with _search_memo.flight_lock(provider.name, query, limit):
-                    # Re-check inside the lock: a concurrent identical call
-                    # may have stored while this one waited.
-                    response_data = _search_memo.lookup(
+            response_data = None
+            _cache_metadata = None
+            _cache_status = "bypass"
+            _was_rescued = False
+            _retrieved_at = ""
+            if _search_cache_enabled():
+                response_data, _cache_metadata = (
+                    _search_memo.lookup_with_metadata(
                         provider.name, query, limit
                     )
-                    if response_data is None:
-                        response_data, _was_rescued = _paid_search()
-                        # Never cache a rescue-served response: it came from
-                        # a ring vendor, not the chosen backend (wrong key),
-                        # and caching it would make the one-shot rescue
-                        # sticky for this query for a whole TTL — the next
-                        # call must attempt the chosen backend again.
-                        if not _was_rescued:
-                            _search_memo.store(
-                                provider.name, query, limit, response_data
+                )
+                if response_data is not None:
+                    _cache_status = "hit"
+                else:
+                    with _search_memo.flight_lock(provider.name, query, limit):
+                        # Re-check inside the lock: a concurrent identical call
+                        # may have stored while this one waited. That waiter is
+                        # truthfully a cache hit even though its first lookup
+                        # missed before the single-flight lock.
+                        response_data, _cache_metadata = (
+                            _search_memo.lookup_with_metadata(
+                                provider.name, query, limit
                             )
+                        )
+                        if response_data is not None:
+                            _cache_status = "hit"
+                        else:
+                            response_data, _was_rescued, _retrieved_at = (
+                                _paid_search()
+                            )
+                            # Never cache a rescue-served response: it came
+                            # from a ring vendor, not the chosen backend (wrong
+                            # key), and caching it would make the one-shot
+                            # rescue sticky for a whole TTL.
+                            if not _was_rescued:
+                                _cache_metadata = (
+                                    _search_memo.store_with_metadata(
+                                        provider.name,
+                                        query,
+                                        limit,
+                                        response_data,
+                                        retrieved_at=_retrieved_at,
+                                    )
+                                )
+                                _cache_status = (
+                                    "miss" if _cache_metadata else "bypass"
+                                )
+            else:
+                response_data, _was_rescued, _retrieved_at = _paid_search()
+
+            if _cache_status == "hit" and _cache_metadata:
+                _retrieved_at = str(_cache_metadata["retrieved_at"])
+            elif not _retrieved_at:
+                _retrieved_at = _utc_now_iso()
+
+            _fetched_result_count = _search_web_count(response_data)
             response_data = _slice_search_response(response_data, limit)
+            if response_data.get("success"):
+                response_data = _inject_search_provenance(
+                    response_data,
+                    requested_backend=provider.name,
+                    requested_limit=limit,
+                    fetched_result_count=_fetched_result_count,
+                    retrieved_at=_retrieved_at,
+                    cache_status=_cache_status,
+                    cache_age_seconds=(
+                        _cache_metadata.get("age_seconds")
+                        if _cache_metadata
+                        else None
+                    ),
+                    cache_ttl_seconds=(
+                        _cache_metadata.get("ttl_seconds")
+                        if _cache_metadata
+                        else None
+                    ),
+                    fallback_used=_was_rescued,
+                )
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
@@ -1629,7 +1883,19 @@ from tools.registry import registry, tool_error
 
 WEB_SEARCH_SCHEMA = {
     "name": "web_search",
-    "description": "Search the web for information. Returns up to 5 results by default with titles, URLs, and descriptions. The query is passed through to the configured backend, so operators such as site:domain, filetype:pdf, intitle:word, -term, and \"exact phrase\" may work when the backend supports them.",
+    "description": (
+        "Search through the configured backend and return result metadata: "
+        "titles, URLs, and upstream description snippets. This does not fetch "
+        "result pages. Every successful response adds data.provenance with the "
+        "requested and serving backends, fallback use, Hermes process-memory "
+        "cache status and age, retrieval/serve times, evidence scope, result "
+        "counts, transformations, and limitations. Do not treat snippets as "
+        "confidence, freshness, "
+        "currentness, verification, or primary-source evidence; use web_extract "
+        "on relevant URLs and inspect the source. Returns up to 5 results by "
+        "default. Backend-supported operators such as site:domain, filetype:pdf, "
+        "intitle:word, -term, and \"exact phrase\" may work."
+    ),
     "parameters": {
         "type": "object",
         "properties": {

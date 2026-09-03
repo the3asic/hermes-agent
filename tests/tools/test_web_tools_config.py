@@ -436,12 +436,55 @@ class TestWebSearchSchema:
 
         with patch("tools.web_tools._get_search_backend", return_value="parallel"), \
              patch("agent.web_search_registry.get_provider", return_value=fake_provider), \
+             patch("tools.web_result_cache.cache_enabled", return_value=False), \
+             patch(
+                 "tools.web_result_cache.utc_now_iso",
+                 side_effect=[
+                     "2026-09-03T15:04:09Z",
+                     "2026-09-03T15:04:10Z",
+                 ],
+             ), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch.object(tools.web_tools._debug, "log_call"), \
              patch.object(tools.web_tools._debug, "save"):
             result = json.loads(tools.web_tools.web_search_tool("docs", limit=500))
 
-        assert result == {"success": True, "data": {"web": []}}
+        assert result == {
+            "success": True,
+            "data": {
+                "provenance": {
+                    "requested_backend": "parallel",
+                    "served_by": "parallel",
+                    "fallback_used": False,
+                    "retrieved_at": "2026-09-03T15:04:09Z",
+                    "served_at": "2026-09-03T15:04:10Z",
+                    "cache": {
+                        "layer": "hermes_process_memory",
+                        "status": "bypass",
+                        "age_seconds": None,
+                        "ttl_seconds": None,
+                    },
+                    "evidence_scope": "search_result_metadata_only",
+                    "page_fetched": False,
+                    "result_scope": "top_n",
+                    "requested_limit": 100,
+                    "fetched_result_count": 0,
+                    "returned_count": 0,
+                    "result_set_truncated": False,
+                    "upstream_cache_timestamp": None,
+                    "upstream_cache_timestamp_status": (
+                        "not_reported_in_response"
+                    ),
+                    "limitations": [
+                        "page_not_fetched",
+                        "not_exhaustive",
+                        "upstream_cache_time_not_reported",
+                    ],
+                    "transformations": [],
+                },
+                "web": [],
+            },
+        }
         fake_search.assert_called_once_with("docs", 100)
 
 

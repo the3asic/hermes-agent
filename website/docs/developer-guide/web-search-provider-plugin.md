@@ -96,10 +96,18 @@ class MyBackendWebSearchProvider(WebSearchProvider):
         except httpx.HTTPError as exc:
             return {"success": False, "error": str(exc)}
 
-        # Response shape is fixed — see "Response shape" below.
+        # The provider envelope stays compact. Hermes adds request-time
+        # provenance after this method returns; see "Response shape" below.
         return {
             "success": True,
             "data": {
+                # Optional: only upstream/provider facts you can prove.
+                "provenance": {
+                    "engine": "my-backend",
+                    "upstream_cache_timestamp": data.get("cacheTimestamp"),
+                    "limitations": ["provider_snippets_only"],
+                    "transformations": [],
+                },
                 "web": [
                     {
                         "title": item.get("title", ""),
@@ -161,14 +169,19 @@ Providers can advertise multiple capabilities from a single class — Firecrawl,
 
 ## Response shape
 
-The tool wrapper expects a fixed envelope so it doesn't have to translate between backends.
+Providers return a compact, fixed envelope so the tool wrapper does not have to translate between backends. The wrapper adds a mandatory `data.provenance` block to every successful `web_search` response. A provider does not need to construct the wrapper-owned fields itself.
 
-**Search success:**
+**Provider search success:**
 
 ```python
 {
     "success": True,
     "data": {
+        "provenance": {                 # optional at the provider boundary
+            "engine": str,
+            "limitations": list[str],
+            "transformations": list[str],
+        },
         "web": [
             {"title": str, "url": str, "description": str, "position": int},
             ...
@@ -176,6 +189,59 @@ The tool wrapper expects a fixed envelope so it doesn't have to translate betwee
     },
 }
 ```
+
+**Final `web_search` success returned by Hermes:**
+
+```python
+{
+    "success": True,
+    "data": {
+        "provenance": {
+            "requested_backend": str,
+            "served_by": str,
+            "fallback_used": bool,
+            "retrieved_at": str,        # UTC ISO-8601; original retrieval time
+            "served_at": str,           # UTC ISO-8601; this response time
+            "cache": {
+                "layer": "hermes_process_memory",
+                "status": "hit" | "miss" | "bypass",
+                "age_seconds": float | None,
+                "ttl_seconds": float | None,
+            },
+            "evidence_scope": "search_result_metadata_only",
+            "page_fetched": False,
+            "result_scope": "top_n",
+            "requested_limit": int,
+            "fetched_result_count": int,
+            "returned_count": int,
+            "result_set_truncated": bool,
+            "upstream_cache_timestamp": str | None,
+            "upstream_cache_timestamp_status": (
+                "reported_in_response" | "not_reported_in_response"
+            ),
+            "limitations": list[str],
+            "transformations": list[str],
+            # Provider-owned, non-core facts such as `engine` may follow.
+        },
+        "web": [...],
+    },
+}
+```
+
+The wrapper owns routing, timing, Hermes' process-memory cache state, evidence scope, and result counts. It overwrites those fields even if a provider supplies values for them. On a cache hit, `retrieved_at` remains the time of the original provider response while `served_at` records the current tool response; `cache.age_seconds` is calculated with a monotonic clock. `fetched_result_count` is the number returned for Hermes' bucketed provider request, while `returned_count` is the caller-visible count after the requested limit is applied. `result_set_truncated` reports that Hermes slice only; it does not claim the upstream result set was exhaustive.
+
+Providers may add stable facts that come directly from their own configuration, documented API semantics, or the upstream response:
+
+- Engine identity, such as `engine`.
+- Explicit source-date semantics, such as `source_date_kind` and `source_date_kind_status`. Document the provider-specific values you use.
+- An exact `upstream_cache_timestamp`, but only if the upstream response reports one. Providers must not set `upstream_cache_timestamp_status`; Hermes derives it from the normalized timestamp. A non-empty string produces `"reported_in_response"`; a missing, empty, or non-string timestamp becomes `None` with `"not_reported_in_response"`.
+- `limitations` and `transformations`. Hermes merges these lists with its own values in stable order and removes duplicates.
+
+Other provider-owned, non-core provenance keys are preserved. Provider values never override the core fields shown above.
+
+:::warning
+Do not infer freshness or authority. Providers must not emit bare `confidence`, `fresh`, `current`, `verified`, or `authoritative` claims. Hermes deliberately does not rely on an incomplete blacklist to sanitize arbitrary plugin claims, so this is a provider contract, not a post-processing promise. If the upstream explicitly reports a related metric, keep the exact fact under a provider-namespaced key (for example, `my_backend_relevance_score`) and document its semantics instead of normalizing it into one of those labels. Do not turn a relative result date into a guessed publication timestamp, invent an upstream crawl/cache time, or describe a top-N response as complete. `description` remains search-result metadata, not fetched page text; use `web_extract` when page content is required.
+:::
 
 **Extract success:**
 
@@ -202,7 +268,9 @@ The tool wrapper expects a fixed envelope so it doesn't have to translate betwee
 {"success": False, "error": "human-readable message"}
 ```
 
-Both `search()` and `extract()` may be `async def` — the dispatcher detects coroutine functions via `inspect.iscoroutinefunction` and awaits accordingly. Sync implementations that do blocking I/O (HTTP, SDK calls) are fine for small backends; the dispatcher handles threading.
+Failed `web_search` responses intentionally retain this existing envelope and do not receive `data.provenance`.
+
+Both `search()` and `extract()` may be `async def` — the dispatcher detects coroutine functions via `inspect.iscoroutinefunction` and awaits accordingly. Sync implementations that do blocking I/O (HTTP, SDK calls) are fine for small backends; the dispatcher handles threading. The mandatory provenance contract applies to every successful `web_search` response; `web_extract` keeps the extract envelope above.
 
 ## Capability flags
 
@@ -227,7 +295,8 @@ The `web_search` and `web_extract` tools live in `tools/web_tools.py`. At call t
 2. Ask the registry for the provider with that `name`
 3. Check `is_available()` and the matching `supports_*()` flag
 4. Dispatch to `search()` / `extract()` (deep crawl runs as a mode inside `extract()`), awaiting if the method is a coroutine
-5. JSON-serialize the response envelope and hand it back to the LLM
+5. Add the mandatory provenance contract to every successful `web_search` response
+6. JSON-serialize the response envelope and hand it back to the LLM
 
 Errors surface as the tool result; the LLM decides how to explain them. If no provider is registered (or every available one fails the capability gate), the tool returns a helpful error pointing at `hermes tools`.
 

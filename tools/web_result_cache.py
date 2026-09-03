@@ -33,8 +33,10 @@ import os
 import re
 import threading
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +98,74 @@ def normalize_query(query: str) -> str:
 # Search memo (in-memory, single-flight)
 # ---------------------------------------------------------------------------
 
+
+_RUNTIME_PROVENANCE_FIELDS = frozenset(
+    {
+        "requested_backend",
+        "served_by",
+        "fallback_used",
+        "retrieved_at",
+        "served_at",
+        "cache",
+        "evidence_scope",
+        "page_fetched",
+        "result_scope",
+        "requested_limit",
+        "fetched_result_count",
+        "returned_count",
+        "result_set_truncated",
+        "upstream_cache_timestamp_status",
+    }
+)
+
+
+def utc_now_iso() -> str:
+    """Return the current wall time as an explicit UTC ISO-8601 string."""
+    return (
+        datetime.fromtimestamp(time.time(), timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _cacheable_search_response(response: dict) -> dict:
+    """Copy a successful provider response without request-time provenance.
+
+    Search providers may contribute stable provenance such as engine identity,
+    source-date semantics, upstream cache reporting, limitations, and
+    transformations.  Hermes-owned request facts are recomputed for every
+    caller.  In particular, a cached ``served_at`` or ``cache.status=miss``
+    would lie to the next caller, so those fields never enter the memo.
+    """
+    copied = json.loads(json.dumps(response))
+    data = copied.get("data")
+    if not isinstance(data, dict):
+        return copied
+    provenance = data.get("provenance")
+    if not isinstance(provenance, dict):
+        return copied
+    cleaned = {
+        key: value
+        for key, value in provenance.items()
+        if key not in _RUNTIME_PROVENANCE_FIELDS
+    }
+    if cleaned:
+        data["provenance"] = cleaned
+    else:
+        data.pop("provenance", None)
+    return copied
+
+
+@dataclass(frozen=True)
+class _SearchMemoEntry:
+    response: dict
+    retrieved_at: str
+    stored_wall_time: float
+    stored_monotonic: float
+    effective_ttl_seconds: float
+    expires_monotonic: float
+
+
 class SearchMemo:
     """TTL memo + single-flight coalescer for search responses.
 
@@ -106,7 +176,7 @@ class SearchMemo:
     """
 
     def __init__(self) -> None:
-        self._store: Dict[tuple, Tuple[float, dict]] = {}
+        self._store: Dict[tuple, _SearchMemoEntry] = {}
         self._store_lock = threading.Lock()
         self._key_locks: Dict[tuple, threading.Lock] = {}
 
@@ -114,33 +184,94 @@ class SearchMemo:
         return (provider, normalize_query(query), bucket_limit(limit))
 
     def lookup(self, provider: str, query: str, limit: int) -> Optional[dict]:
+        """Return a defensive response copy, preserving the legacy API."""
+        response, _metadata = self.lookup_with_metadata(provider, query, limit)
+        return response
+
+    def lookup_with_metadata(
+        self, provider: str, query: str, limit: int
+    ) -> tuple[Optional[dict], Optional[dict]]:
+        """Return a response plus truthful, dynamically calculated hit data.
+
+        ``age_seconds`` uses the monotonic clock, so wall-clock adjustments
+        cannot make a hit younger or older. ``retrieved_at`` remains the wall
+        time of the original provider response, not the time of this lookup.
+        """
         if not cache_enabled():
-            return None
+            return None, None
         key = self._key(provider, query, limit)
+        now = time.monotonic()
         with self._store_lock:
-            hit = self._store.get(key)
-            if hit is None:
-                return None
-            expires, response = hit
-            if time.monotonic() >= expires:
+            entry = self._store.get(key)
+            if entry is None:
+                return None, None
+            if now >= entry.expires_monotonic:
                 del self._store[key]
-                return None
+                return None, None
+            response = json.loads(json.dumps(entry.response))
+            metadata = {
+                "retrieved_at": entry.retrieved_at,
+                "stored_wall_time": entry.stored_wall_time,
+                "age_seconds": round(
+                    max(0.0, now - entry.stored_monotonic), 3
+                ),
+                "ttl_seconds": entry.effective_ttl_seconds,
+            }
         logger.info("web_search cache hit: %r via %s", query, provider)
-        return json.loads(json.dumps(response))  # defensive copy
+        return response, metadata
 
     def store(self, provider: str, query: str, limit: int, response: dict) -> None:
-        """Cache a SUCCESSFUL response for the bucketed key."""
+        """Cache a SUCCESSFUL response, preserving the legacy ``None`` return."""
+        self.store_with_metadata(provider, query, limit, response)
+
+    def store_with_metadata(
+        self,
+        provider: str,
+        query: str,
+        limit: int,
+        response: dict,
+        *,
+        retrieved_at: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Cache a successful response and return its immutable timing facts."""
         if not cache_enabled():
-            return
+            return None
         if not isinstance(response, dict) or not response.get("success"):
-            return
+            return None
         key = self._key(provider, query, limit)
+        stored_monotonic = time.monotonic()
+        stored_wall_time = time.time()
+        effective_ttl = ttl_seconds()
+        effective_retrieved_at = (
+            retrieved_at
+            if isinstance(retrieved_at, str) and retrieved_at.strip()
+            else datetime.fromtimestamp(stored_wall_time, timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+        entry = _SearchMemoEntry(
+            response=_cacheable_search_response(response),
+            retrieved_at=effective_retrieved_at,
+            stored_wall_time=stored_wall_time,
+            stored_monotonic=stored_monotonic,
+            effective_ttl_seconds=effective_ttl,
+            expires_monotonic=stored_monotonic + effective_ttl,
+        )
         with self._store_lock:
             # Opportunistic expiry sweep to bound memory.
-            now = time.monotonic()
-            for k in [k for k, (exp, _) in self._store.items() if now >= exp]:
+            for k in [
+                k
+                for k, existing in self._store.items()
+                if stored_monotonic >= existing.expires_monotonic
+            ]:
                 del self._store[k]
-            self._store[key] = (now + ttl_seconds(), json.loads(json.dumps(response)))
+            self._store[key] = entry
+        return {
+            "retrieved_at": entry.retrieved_at,
+            "stored_wall_time": entry.stored_wall_time,
+            "age_seconds": 0.0,
+            "ttl_seconds": entry.effective_ttl_seconds,
+        }
 
     def flight_lock(self, provider: str, query: str, limit: int) -> threading.Lock:
         """Per-key lock for single-flight coalescing.
