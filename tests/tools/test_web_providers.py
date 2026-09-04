@@ -502,6 +502,14 @@ class TestDisabledPluginDiagnostic:
         # Unknown name is not a match
         assert _disabled_web_plugin_for("nope") is None
 
+    def test_disabled_web_plugin_for_maps_managed_alias(self, monkeypatch):
+        from agent.web_search_registry import _disabled_web_plugin_for
+
+        self._patch_manager(monkeypatch, {
+            "web/firecrawl": self._FakeLoaded(False, "disabled via config"),
+        })
+        assert _disabled_web_plugin_for("nous") == "web/firecrawl"
+
 
     def test_search_tool_reports_disabled_plugin(self, monkeypatch):
         from tools import web_tools
