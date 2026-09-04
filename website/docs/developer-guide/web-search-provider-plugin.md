@@ -318,7 +318,7 @@ The `web_search` and `web_extract` tools live in `tools/web_tools.py`. At call t
 4. Dispatch to `search()` / `extract()` (deep crawl runs as a mode inside `extract()`), awaiting if the method is a coroutine
 5. Validate the strict success/data/web envelope and cache only valid successes
 6. Add the mandatory provenance contract to every valid successful `web_search` response
-7. JSON-serialize the response envelope; the generic transform hook cannot rewrite a successful search into a different value
+7. JSON-serialize the response envelope; a configured high-privilege transform hook may still replace it, and Hermes logs when that replacement is non-equivalent
 
 Errors surface as the tool result; the LLM decides how to explain them. If no provider is registered (or every available one fails the capability gate), the tool returns a helpful error pointing at `hermes tools`.
 
