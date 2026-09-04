@@ -82,6 +82,29 @@ class TestEligibility:
         )
         assert web_tools._rescue_eligible(KeenableWebSearchProvider()) is False
 
+    def test_self_hosted_firecrawl_without_key_is_eligible(self, monkeypatch):
+        class _SelfHostedFirecrawl(_KeyedBoomProvider):
+            name = "firecrawl"
+
+        monkeypatch.setattr(
+            "agent.web_search_provider.get_provider_env",
+            lambda name: (
+                "http://127.0.0.1:3002"
+                if name == "FIRECRAWL_API_URL"
+                else ""
+            ),
+        )
+        assert web_tools._rescue_eligible(_SelfHostedFirecrawl()) is True
+
+    def test_keyless_firecrawl_without_url_or_key_is_not_eligible(self, monkeypatch):
+        class _KeylessFirecrawl(_KeyedBoomProvider):
+            name = "firecrawl"
+
+        monkeypatch.setattr(
+            "agent.web_search_provider.get_provider_env", lambda name: ""
+        )
+        assert web_tools._rescue_eligible(_KeylessFirecrawl()) is False
+
     def test_non_ring_backend_is_eligible(self):
         class _SearxProvider(_KeyedBoomProvider):
             name = "searxng"

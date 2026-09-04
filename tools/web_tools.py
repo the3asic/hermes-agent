@@ -617,6 +617,11 @@ def _rescue_eligible(provider) -> bool:
             }.get(name, "")
             from agent.web_search_provider import get_provider_env
 
+            if name == "firecrawl" and get_provider_env("FIRECRAWL_API_URL"):
+                # A self-hosted endpoint is an explicitly configured direct
+                # provider even when it deliberately has no API key. Its
+                # failure has not walked the keyless ring yet.
+                return True
             api_key = get_provider_env(key_var) if key_var else ""
             # Keyless-mode ring vendors already walked the ring on failure.
             return not use_keyless(name, api_key)
