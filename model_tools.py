@@ -99,31 +99,51 @@ def _load_strict_json(value: str) -> Any:
 
 def _web_search_transform_changes_success_result(
     original: Any,
-    candidate: str,
+    candidate: Any,
 ) -> bool:
-    """Detect a high-privilege rewrite of successful ``web_search`` JSON.
+    """Detect a high-privilege crossing of the successful-search boundary.
 
     ``transform_tool_result`` is a documented replacement hook and may be used
     for mandatory redaction, so Hermes must not silently disable it.  A
-    non-equivalent rewrite does, however, move the output beyond the wrapper's
-    truth-contract boundary; warn operators without changing the hook result.
+    Changing wrapper success, or making non-success claim success, moves the
+    output beyond the wrapper's truth-contract boundary. Warn operators without
+    changing the middleware/hook result.
     """
     try:
         original_json = (
             _load_strict_json(original) if isinstance(original, str) else original
         )
-    except (TypeError, ValueError):
-        return False
-    if (
-        not isinstance(original_json, dict)
-        or original_json.get("success") is not True
-    ):
-        return False
+    except (TypeError, ValueError, RecursionError):
+        original_json = None
+    original_success = (
+        isinstance(original_json, dict)
+        and original_json.get("success") is True
+    )
     try:
-        candidate_json = _load_strict_json(candidate)
-    except (TypeError, ValueError):
+        candidate_json = (
+            _load_strict_json(candidate) if isinstance(candidate, str) else candidate
+        )
+    except (TypeError, ValueError, RecursionError):
+        return original_success
+    candidate_success = (
+        isinstance(candidate_json, dict)
+        and candidate_json.get("success") is True
+    )
+    if not original_success:
+        return candidate_success
+    try:
+        return not _same_json_value(candidate_json, original_json)
+    except RecursionError:
         return True
-    return not _same_json_value(candidate_json, original_json)
+
+
+def _is_successful_web_search_result(value: Any) -> bool:
+    """Return whether a value claims to be a successful web-search envelope."""
+    try:
+        parsed = _load_strict_json(value) if isinstance(value, str) else value
+    except (TypeError, ValueError, RecursionError):
+        return False
+    return isinstance(parsed, dict) and parsed.get("success") is True
 
 
 def _is_delegated_child_context() -> bool:
@@ -1603,25 +1623,30 @@ def handle_function_call(
         except Exception:
             reset_current_observability_context = None
         try:
+            _raw_dispatch_results = []
             if function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
+                    dispatched = registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
                     )
+                    _raw_dispatch_results.append(dispatched)
+                    return dispatched
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
+                    dispatched = registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
                     )
+                    _raw_dispatch_results.append(dispatched)
+                    return dispatched
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)
             else:
@@ -1638,6 +1663,23 @@ def handle_function_call(
                     turn_id=turn_id or "",
                     api_request_id=api_request_id or "",
                 )
+                if function_name == "web_search":
+                    if not _raw_dispatch_results:
+                        if _is_successful_web_search_result(result):
+                            logger.warning(
+                                "tool_execution middleware short-circuited "
+                                "web_search with a successful result; the "
+                                "wrapper truth contract did not generate the "
+                                "model-bound output"
+                            )
+                    elif _web_search_transform_changes_success_result(
+                        _raw_dispatch_results[-1], result
+                    ):
+                        logger.warning(
+                            "tool_execution middleware crossed the successful "
+                            "web_search wrapper truth boundary; wrapper "
+                            "provenance may not describe the model-bound output"
+                        )
         finally:
             if _approval_tokens is not None and reset_current_observability_context is not None:
                 try:
@@ -1697,9 +1739,10 @@ def handle_function_call(
                             )
                         ):
                             logger.warning(
-                                "transform_tool_result rewrote a successful "
-                                "web_search result; the wrapper truth contract "
-                                "no longer describes the model-bound output"
+                                "transform_tool_result crossed the successful "
+                                "web_search wrapper truth boundary; wrapper "
+                                "provenance may not describe the model-bound "
+                                "output"
                             )
                         result = hook_result
                         break

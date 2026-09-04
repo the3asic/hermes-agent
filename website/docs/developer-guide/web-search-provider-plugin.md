@@ -262,7 +262,7 @@ Other provider-owned, non-core provenance keys are preserved. Provider values ne
 Do not infer freshness or authority. Hermes recursively removes case-insensitive bare `confidence`, `fresh`, `current`, `verified`, and `authoritative` keys throughout the provider-owned successful payload and records that omission in `transformations`. If the upstream explicitly reports a related metric, keep the exact fact under a provider-namespaced key (for example, `my_backend_relevance_score`) and document its semantics instead of normalizing it into one of those labels. This fixed guard matches exact keys only; it is not a general semantic judge for arbitrary extension names. Do not turn a relative result date into a guessed publication timestamp, invent an upstream crawl/cache time, or describe a top-N response as complete. `description` remains search-result metadata, not fetched page text; use `web_extract` when page content is required.
 :::
 
-The generic `transform_tool_result` hook remains trusted, high-privilege middleware for every tool. If it returns a non-equivalent replacement for a successful structured `web_search`, Hermes accepts the replacement to preserve redaction and plugin compatibility, and logs that the wrapper truth contract no longer describes the model-bound output. A transforming plugin must preserve or recompute provenance for the result it emits.
+The generic `transform_tool_result` hook remains trusted, high-privilege middleware for every tool. Hermes accepts its replacement to preserve redaction and plugin compatibility. It logs whenever the replacement crosses the successful-wrapper boundary: changing an existing successful structured `web_search`, or making a wrapper failure claim success. A transforming plugin must preserve or recompute provenance for the result it emits.
 
 **Extract success:**
 
@@ -291,7 +291,7 @@ The generic `transform_tool_result` hook remains trusted, high-privilege middlew
 
 Failed `web_search` responses intentionally retain this existing envelope and do not receive `data.provenance`.
 
-Both `search()` and `extract()` may be `async def` — the dispatcher detects coroutine functions via `inspect.iscoroutinefunction` and awaits accordingly. Sync implementations that do blocking I/O (HTTP, SDK calls) are fine for small backends; the dispatcher handles threading. The mandatory provenance contract applies to every well-formed success emitted by Hermes' client-function wrapper; `web_extract` keeps the extract envelope above.
+`search()` must be synchronous: the current `web_search` tool calls it directly. `extract()` may be synchronous or `async def`; the extract dispatcher detects coroutine functions and awaits them. The mandatory provenance contract applies to every well-formed success emitted by Hermes' client-function wrapper; `web_extract` keeps the extract envelope above.
 
 ## Capability flags
 
@@ -313,12 +313,12 @@ If your provider only supports one capability, leave the other flags at their de
 The `web_search` and `web_extract` tools live in `tools/web_tools.py`. At call time they:
 
 1. Read the relevant config key (`web.search_backend` for `web_search`, `web.extract_backend` for `web_extract`)
-2. Ask the registry for the provider with that `name`
-3. Check `is_available()` and the matching `supports_*()` flag
-4. Dispatch to `search()` / `extract()` (deep crawl runs as a mode inside `extract()`), awaiting if the method is a coroutine
+2. Resolve an explicitly configured provider by `name`; only the no-selection fallback path walks providers with `is_available()`
+3. Check the matching `supports_*()` flag. An explicit provider remains selected and reports its own credential/network failure instead of being silently skipped
+4. Call synchronous `search()` directly, or dispatch `extract()` (deep crawl is an extract mode) and await it when it is a coroutine
 5. Validate the strict success/data/web envelope and cache only valid successes
 6. Add the mandatory provenance contract to every valid successful `web_search` response
-7. JSON-serialize the response envelope; a configured high-privilege transform hook may still replace it, and Hermes logs when that replacement is non-equivalent
+7. JSON-serialize the response envelope; configured high-privilege `tool_execution` middleware or a `transform_tool_result` hook may still replace it, and Hermes logs whenever either path changes a wrapper success or makes a non-success/short-circuit claim success
 
 Errors surface as the tool result; the LLM decides how to explain them. If no provider is registered (or every available one fails the capability gate), the tool returns a helpful error pointing at `hermes tools`.
 

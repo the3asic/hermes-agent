@@ -380,7 +380,7 @@ def register(ctx):
 |---|---|---|---|---|
 | `pre_tool_call` | 指令/控制 | 执行前一次；第一个有效 `block` 或 `approve` 指令生效。 | `tool_name`, `args`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `middleware_trace` | 原始参数可能含用户内容、路径、命令或 secret。 |
 | `post_tool_call` | 观察者 | 阻断、错误或成功结果产生后；忽略返回值。 | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message`, `middleware_trace` | 结果/错误文本可能含任意工具或用户内容及 secret。 |
-| `transform_tool_result` | Transform | `post_tool_call` 后、写入会话前；第一个获准字符串替换结果。 | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message` | 暴露完整的 model-bound 结果和参数。成功 `web_search` 被不等价改写时仍会替换，但 Hermes 会告警，因为 wrapper provenance 可能已不再描述它。 |
+| `transform_tool_result` | Transform | `post_tool_call` 后、写入会话前；第一个获准字符串替换结果。 | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message` | 暴露完整的 model-bound 结果和参数。跨过成功 `web_search` wrapper 边界时仍会替换，但 Hermes 会告警，因为 wrapper provenance 可能已不再描述它。 |
 | `transform_terminal_output` | Transform | 前台进程输出完成有界捕获后、最终 output limit 前；第一个字符串替换输出。 | `command`, `output`, `returncode`, `task_id`, `env_type` | 命令/输出可能含凭据。 |
 | `pre_llm_call` | 指令/控制 | 每轮 loop 前一次；所有有效字符串或 `{"context": ...}` 会拼接并注入用户消息。 | `session_id`, `task_id`, `turn_id`, `user_message`, `conversation_history`, `is_first_turn`, `model`, `platform`, `parent_session_id`, `sender_id` | 完整用户消息和会话历史。 |
 | `post_llm_call` | 观察者 | 成功且未中断的轮次 finalize 时；忽略返回值。 | `session_id`, `task_id`, `turn_id`, `user_message`, `assistant_response`, `conversation_history`, `model`, `platform` | 完整 prompt、response 和 history。 |
@@ -1040,7 +1040,7 @@ def my_callback(tool_name: str, args: dict, result: str, task_id: str, **kwargs)
 
 **返回值：** 第一个获准的 `str`（包括空字符串）替换结果，`None` 保持不变。
 
-对于成功的结构化 `web_search`，如果替换值不是语义等价的 JSON，Hermes 会记录告警，但替换仍然生效：这个 hook 是受信任的高权限 middleware，可能承担 secret 或 PII 脱敏。此后，plugin 必须自己保证转换后结果与 provenance 的关系；原 wrapper contract 不再自动描述 model-bound 字符串。
+对于 `web_search`，如果替换跨过成功 wrapper 边界——改写原成功值，或让原 failure 声称成功——Hermes 会记录告警，但替换仍然生效：这个 hook 是受信任的高权限 middleware，可能承担 secret 或 PII 脱敏。此后，plugin 必须自己保证转换后结果与 provenance 的关系；原 wrapper contract 不再自动描述 model-bound 字符串。
 
 **使用场景：** 从 `web_extract` 输出中脱敏组织特定的 PII、为长 JSON 工具响应添加摘要头、向 `read_file` 结果注入检索增强提示、将 `delegate_task` 子 agent 报告重写为项目特定 schema。
 

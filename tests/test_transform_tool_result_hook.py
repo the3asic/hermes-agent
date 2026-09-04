@@ -94,7 +94,7 @@ def test_web_search_success_accepts_truth_contract_rewrite_with_warning(
     )
 
     assert json.loads(out) == {"success": True, "data": {"web": []}}
-    assert "truth contract no longer describes" in caplog.text
+    assert "crossed the successful web_search wrapper truth boundary" in caplog.text
 
 
 def test_web_search_success_accepts_semantically_identical_json_without_warning(
@@ -115,7 +115,7 @@ def test_web_search_success_accepts_semantically_identical_json_without_warning(
     )
 
     assert out == reformatted
-    assert "truth contract no longer describes" not in caplog.text
+    assert "crossed the successful web_search wrapper truth boundary" not in caplog.text
 
 
 def test_web_search_success_accepts_json_number_type_change_with_warning(
@@ -136,7 +136,7 @@ def test_web_search_success_accepts_json_number_type_change_with_warning(
     )
 
     assert out == candidate
-    assert "truth contract no longer describes" in caplog.text
+    assert "crossed the successful web_search wrapper truth boundary" in caplog.text
 
 
 def test_web_search_duplicate_json_keys_are_treated_as_changed(
@@ -154,10 +154,10 @@ def test_web_search_duplicate_json_keys_are_treated_as_changed(
     )
 
     assert out == candidate
-    assert "truth contract no longer describes" in caplog.text
+    assert "crossed the successful web_search wrapper truth boundary" in caplog.text
 
 
-def test_web_search_failure_remains_transformable(monkeypatch):
+def test_web_search_failure_remains_transformable(monkeypatch, caplog):
     out = _run_handle_function_call(
         monkeypatch,
         tool_name="web_search",
@@ -168,6 +168,93 @@ def test_web_search_failure_remains_transformable(monkeypatch):
     )
 
     assert out == "redacted failure"
+    assert "crossed the successful web_search wrapper truth boundary" not in caplog.text
+
+
+def test_web_search_failure_to_success_transform_is_warned(monkeypatch, caplog):
+    candidate = '{"success":true,"data":{"web":[]}}'
+    out = _run_handle_function_call(
+        monkeypatch,
+        tool_name="web_search",
+        dispatch_result='{"success":false,"error":"down"}',
+        invoke_hook=lambda hook_name, **kw: [candidate]
+        if hook_name == "transform_tool_result"
+        else [],
+    )
+
+    assert out == candidate
+    assert "crossed the successful web_search wrapper truth boundary" in caplog.text
+
+
+def test_web_search_execution_middleware_rewrite_is_accepted_and_warned(
+    monkeypatch, caplog
+):
+    original = json.dumps(
+        {
+            "success": True,
+            "data": {"provenance": {"served_by": "serper"}, "web": []},
+        }
+    )
+    candidate = '{"success":true,"data":{"web":[]}}'
+
+    def rewrite(_name, args, next_call, **_kwargs):
+        next_call(args)
+        return candidate
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.run_tool_execution_middleware", rewrite
+    )
+    out = _run_handle_function_call(
+        monkeypatch,
+        tool_name="web_search",
+        dispatch_result=original,
+    )
+
+    assert out == candidate
+    assert "crossed the successful web_search wrapper truth boundary" in caplog.text
+
+
+def test_web_search_execution_middleware_failure_to_success_is_warned(
+    monkeypatch, caplog
+):
+    candidate = {"success": True, "data": {"web": []}}
+
+    def rewrite(_name, args, next_call, **_kwargs):
+        next_call(args)
+        return candidate
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.run_tool_execution_middleware", rewrite
+    )
+    out = _run_handle_function_call(
+        monkeypatch,
+        tool_name="web_search",
+        dispatch_result='{"success":false,"error":"down"}',
+    )
+
+    assert out == candidate
+    assert "crossed the successful web_search wrapper truth boundary" in caplog.text
+
+
+def test_web_search_execution_middleware_short_circuit_success_is_warned(
+    monkeypatch, caplog
+):
+    candidate = '{"success":true,"data":{"web":[]}}'
+
+    def short_circuit(_name, _args, _next_call, **_kwargs):
+        return candidate
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.run_tool_execution_middleware", short_circuit
+    )
+    out = _run_handle_function_call(
+        monkeypatch,
+        tool_name="web_search",
+        dispatch_result="must-not-run",
+    )
+
+    assert out == candidate
+    assert "tool_execution middleware short-circuited" in caplog.text
 
 
 def test_hook_receives_expected_kwargs(monkeypatch):

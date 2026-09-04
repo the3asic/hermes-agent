@@ -53,7 +53,7 @@ This is metadata about a top-N search response, not proof that a snippet is curr
 
 `result_set_truncated` reports only whether Hermes sliced its bucketed provider response to the caller's limit. It does not say whether the upstream index has more results. Malformed provider successes fail closed, are not cached, and receive no provenance. Existing failure envelopes remain unchanged and do not receive the success-only block.
 
-The wrapper-generated `web_search` object is self-consistent at this boundary. A configured `transform_tool_result` plugin remains trusted, high-privilege middleware and can intentionally replace it—for example, to redact secrets or PII. Hermes logs a warning for a non-equivalent successful-search rewrite, but preserves the documented hook behavior; after that point the plugin owns the relationship between transformed results and provenance. Use `web_extract` and inspect the primary source when the factual claim itself matters.
+The wrapper-generated `web_search` object is self-consistent at this boundary. Configured `tool_execution` middleware can short-circuit or rewrite the tool, and a `transform_tool_result` hook can replace its result—for example, to redact secrets or PII. Both are trusted, high-privilege plugin surfaces. Hermes logs whenever either path crosses the successful-wrapper boundary—changing an existing wrapper success, or making a non-success/short-circuit claim success—but preserves the plugin behavior. After that point the plugin owns the relationship between transformed results and provenance. Use `web_extract` and inspect the primary source when the factual claim itself matters.
 
 ---
 

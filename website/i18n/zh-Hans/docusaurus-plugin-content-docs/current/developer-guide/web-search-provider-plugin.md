@@ -202,7 +202,7 @@ requires_env:
 {"success": False, "error": "human-readable message"}
 ```
 
-`search()` 和 `extract()` 均可定义为 `async def`——调度器通过 `inspect.iscoroutinefunction` 检测协程函数并相应地进行 await。对于小型后端，执行阻塞 I/O（HTTP、SDK 调用）的同步实现也完全可行；调度器会处理线程调度。
+`search()` 必须是同步方法：当前 `web_search` 工具会直接调用它。`extract()` 可以同步，也可以定义为 `async def`；extract dispatcher 会检测协程并 await。Hermes client-function wrapper 生成的每个格式正确的搜索 success 都带强制 provenance；`web_extract` 仍使用上面的 extract envelope。
 
 ## 能力标志
 
@@ -224,10 +224,12 @@ web:
 `web_search` 和 `web_extract` 工具位于 `tools/web_tools.py`。调用时执行以下步骤：
 
 1. 读取相关配置键（`web_search` 对应 `web.search_backend`，`web_extract` 对应 `web.extract_backend`）
-2. 向注册表查询具有该 `name` 的提供商
-3. 检查 `is_available()` 及对应的 `supports_*()` 标志
-4. 调度至 `search()` / `extract()` / `crawl()`，若方法为协程则进行 await
-5. 将响应信封 JSON 序列化后返回给 LLM
+2. 按 `name` 解析显式配置的 provider；只有没有适用 selection 的 fallback 路径才会用 `is_available()` 遍历可用 provider
+3. 检查对应的 `supports_*()` 标志。显式 provider 会保持选中并返回自身 credential/network failure，不会被静默跳过
+4. 直接调用同步 `search()`；或调用 `extract()`（deep crawl 是 extract mode），若它是协程则 await
+5. 严格验证 success/data/web envelope，只缓存格式正确的 success
+6. 为每个格式正确的 `web_search` success 加入强制 provenance contract
+7. 将 envelope 序列化；已配置的高权限 `tool_execution` middleware 或 `transform_tool_result` hook 仍可替换它；任一路径改写 wrapper success，或让 non-success/short-circuit 结果声称 success 时，Hermes 都会记录告警
 
 错误以工具结果的形式呈现；LLM 决定如何解释。若没有提供商被注册（或所有可用提供商均未通过能力检查），工具将返回一条指向 `hermes tools` 的友好错误信息。
 

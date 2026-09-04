@@ -47,7 +47,7 @@ Brave Search、DDGS 和 xAI 均为**仅搜索**——如果同时需要 `web_ext
 
 `result_set_truncated` 只表示 Hermes 是否把 bucket 响应切到调用者要求的 limit，不表示上游索引没有更多结果。格式错误的 provider success 会 fail closed、不进缓存、也不会注入 provenance。既有 failure envelope 保持兼容，不获得只属于成功响应的 provenance。
 
-wrapper 生成的 `web_search` 对象在这个边界上自洽。已配置的 `transform_tool_result` plugin 仍是受信任的高权限 middleware，可以为了 secret 或 PII 脱敏而主动替换它。成功搜索被不等价改写时 Hermes 会告警，但仍保留既有 hook 行为；此后由 plugin 自己保证转换结果与 provenance 的关系。事实结论重要时，继续用 `web_extract` 并检查原始来源。
+wrapper 生成的 `web_search` 对象在这个边界上自洽。已配置的 `tool_execution` middleware 可以 short-circuit 或改写工具，`transform_tool_result` hook 也可以为了 secret 或 PII 脱敏而替换结果；两者都是受信任的高权限 plugin 表面。任一路径跨过“成功 wrapper”边界时 Hermes 都会告警——包括改写原成功结果，或让原 failure/short-circuit 结果声称成功——但仍保留既有 plugin 行为；此后由 plugin 自己保证转换结果与 provenance 的关系。事实结论重要时，继续用 `web_extract` 并检查原始来源。
 
 ---
 
