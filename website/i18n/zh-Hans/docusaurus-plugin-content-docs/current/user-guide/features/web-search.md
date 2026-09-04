@@ -43,7 +43,7 @@ Brave Search、DDGS 和 xAI 均为**仅搜索**——如果同时需要 `web_ext
 
 范围边界：xAI Responses 推理会话选择 xAI 搜索时，Hermes 使用由 xAI provider 在服务端执行的原生 search，而不是 client function。这个独立表面没有 Hermes tool-result envelope，因此也没有 `data.provenance`。
 
-这些只是 top-N 搜索结果的元数据，不证明摘要当前或正确，也不代表 Hermes 抓取了链接页面。provider 成功 payload 全树中裸露的 `confidence`、`fresh`、`current`、`verified`、`authoritative` 自证字段都会被移除。上游缓存时间只有在它是 Hermes 支持的带时区 RFC 3339 date-time 时才会透传；格式错误的值会变成 `null` 并明确标为 invalid。RFC 3339 的 leap-second 写法本身有效，但 Hermes parser 不支持，因此也会变成 `null`，并单独标为 unsupported，而不是误称 invalid。
+这些只是 top-N 搜索结果的元数据，不证明摘要当前或正确，也不代表 Hermes 抓取了链接页面。provider 成功 payload 全树中裸露的 `confidence`、`fresh`、`current`、`verified`、`authoritative` 自证字段都会被移除。上游缓存时间只有在它是 Hermes 支持的带时区 RFC 3339 date-time 时才会透传；格式错误的值会变成 `null` 并明确标为 invalid。Hermes 不维护 leap-second 发生表，因此任何 `time-second=60` 写法也会变成 `null`，并使用中性的 `reported_unsupported_second_60`；这个状态既不证明也不否定对应时刻是否真的发生 leap second。
 
 `result_set_truncated` 只表示 Hermes 是否把 bucket 响应切到调用者要求的 limit，不表示上游索引没有更多结果。格式错误的 provider success 会 fail closed、不进缓存、也不会注入 provenance。既有 failure envelope 保持兼容，不获得只属于成功响应的 provenance。
 

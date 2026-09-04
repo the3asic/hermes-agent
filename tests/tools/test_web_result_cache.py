@@ -481,6 +481,8 @@ def test_web_search_accepts_timezone_qualified_rfc3339_timestamps(
     [
         "1990-12-31T23:59:60Z",
         "1990-12-31T15:59:60-08:00",
+        "2026-09-03T15:00:60Z",
+        "1990-12-30T23:59:60Z",
     ],
 )
 def test_web_search_reports_rfc3339_leap_seconds_as_unsupported(
@@ -499,10 +501,10 @@ def test_web_search_reports_rfc3339_leap_seconds_as_unsupported(
     assert provenance["upstream_cache_timestamp"] is None
     assert (
         provenance["upstream_cache_timestamp_status"]
-        == "reported_unsupported_rfc3339_leap_second"
+        == "reported_unsupported_second_60"
     )
     assert (
-        "upstream_cache_timestamp_unsupported_rfc3339_leap_second"
+        "upstream_cache_timestamp_second_60_unsupported"
         in provenance["limitations"]
     )
 

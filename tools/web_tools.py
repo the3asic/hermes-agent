@@ -1048,7 +1048,7 @@ def _inject_search_provenance(
         ):
             upstream_cache_timestamp = None
             upstream_cache_timestamp_status = (
-                "reported_unsupported_rfc3339_leap_second"
+                "reported_unsupported_second_60"
             )
         elif _is_rfc3339_timestamp(candidate_timestamp):
             upstream_cache_timestamp = candidate_timestamp
@@ -1071,9 +1071,9 @@ def _inject_search_provenance(
         ["upstream_cache_timestamp_invalid_rfc3339"]
         if upstream_cache_timestamp_status == "reported_invalid_rfc3339"
         else [],
-        ["upstream_cache_timestamp_unsupported_rfc3339_leap_second"]
+        ["upstream_cache_timestamp_second_60_unsupported"]
         if upstream_cache_timestamp_status
-        == "reported_unsupported_rfc3339_leap_second"
+        == "reported_unsupported_second_60"
         else [],
     )
     transformations = _merge_provenance_lists(
@@ -1212,7 +1212,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                              "reported_in_response" |
                              "not_reported_in_response" |
                              "reported_invalid_rfc3339" |
-                             "reported_unsupported_rfc3339_leap_second"
+                             "reported_unsupported_second_60"
                          ),
                          "limitations": list[str],
                          "transformations": list[str]

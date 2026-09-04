@@ -45,9 +45,10 @@ Search results::
 only facts they can obtain directly from the upstream response there, such as
 the engine identity, source-date semantics, an exact upstream cache timestamp,
 and provider-side transformations or limitations. An
-``upstream_cache_timestamp`` must be a timezone-qualified RFC 3339 date-time;
-Hermes explicitly reports leap-second notation as unsupported rather than
-misclassifying it as an ordinary timestamp.
+``upstream_cache_timestamp`` must be a timezone-qualified RFC 3339 date-time.
+Hermes does not validate leap-second occurrence tables: any ``time-second=60``
+notation is explicitly reported as unsupported rather than accepted or called
+invalid.
 Hermes validates this boundary and overwrites routing, timestamps,
 process-cache state, scope, and result counts at the wrapper. Bare
 ``confidence``, ``fresh``, ``current``, ``verified``, or ``authoritative``

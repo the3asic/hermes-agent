@@ -234,7 +234,7 @@ The boundary is fail-closed: `success` must be the literal JSON boolean `true` o
                 "reported_in_response" |
                 "not_reported_in_response" |
                 "reported_invalid_rfc3339" |
-                "reported_unsupported_rfc3339_leap_second"
+                "reported_unsupported_second_60"
             ),
             "limitations": list[str],
             "transformations": list[str],
@@ -253,7 +253,7 @@ Providers may add stable facts that come directly from their own configuration, 
 
 - Engine identity, such as `engine`.
 - Explicit source-date semantics, such as `source_date_kind` and `source_date_kind_status`. Document the provider-specific values you use.
-- An exact `upstream_cache_timestamp`, but only if the upstream response reports a timezone-qualified RFC 3339 date-time. Providers must not set `upstream_cache_timestamp_status`; Hermes validates the value and derives the status. A supported non-leap-second timestamp produces `"reported_in_response"`; a missing or null value becomes `None` with `"not_reported_in_response"`; malformed values become `None` with `"reported_invalid_rfc3339"`. RFC 3339 leap-second notation is valid but not supported by Hermes' parser, so it becomes `None` with `"reported_unsupported_rfc3339_leap_second"` rather than being called invalid. Rejected values include an explicit limitation.
+- An exact `upstream_cache_timestamp`, but only if the upstream response reports a timezone-qualified RFC 3339 date-time. Providers must not set `upstream_cache_timestamp_status`; Hermes validates the value and derives the status. A supported timestamp produces `"reported_in_response"`; a missing or null value becomes `None` with `"not_reported_in_response"`; malformed values become `None` with `"reported_invalid_rfc3339"`. Hermes does not carry an IERS leap-second table, so any lexically shaped `time-second=60` report becomes `None` with `"reported_unsupported_second_60"`; that neutral status neither certifies nor rejects whether a leap second occurred at the represented instant. Rejected values include an explicit limitation.
 - `limitations` and `transformations`. Hermes merges these lists with its own values in stable order and removes duplicates.
 
 Other provider-owned, non-core provenance keys are preserved. Provider values never override the core fields shown above.
