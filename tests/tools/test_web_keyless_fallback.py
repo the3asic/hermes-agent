@@ -16,7 +16,9 @@ import pytest
 
 import tools.web_tools as web_tools
 from agent import web_search_registry as registry
+from agent.web_search_provider import WebSearchProvider
 from plugins.web import keyless_mcp
+from plugins.web.brave_free.provider import BraveFreeWebSearchProvider
 from plugins.web.exa.provider import ExaWebSearchProvider
 from plugins.web.parallel.provider import ParallelWebSearchProvider
 
@@ -172,6 +174,49 @@ class TestKeylessCalls:
 
 
 class TestProviderRouting:
+    def test_search_capability_mismatch_does_not_call_available_fallback(
+        self, fresh_registry, monkeypatch
+    ):
+        """An extract-only selection errors by name and never calls Exa."""
+
+        class ExtractOnlyProvider(WebSearchProvider):
+            @property
+            def name(self):
+                return "extract-only"
+
+            @property
+            def display_name(self):
+                return "Extract Only"
+
+            def is_available(self):
+                return True
+
+            def supports_search(self):
+                return False
+
+            def supports_extract(self):
+                return True
+
+        fresh_registry.register_provider(ExtractOnlyProvider())
+        monkeypatch.setattr(
+            web_tools,
+            "_load_web_config",
+            lambda: {"search_backend": "extract-only"},
+        )
+        monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+        monkeypatch.setattr(
+            "agent.web_search_provider.get_provider_env",
+            lambda name: "sk-real" if name == "EXA_API_KEY" else "",
+        )
+
+        with patch.object(ExaWebSearchProvider, "search") as fallback_search:
+            result = json.loads(web_tools.web_search_tool("query", limit=1))
+
+        assert result["success"] is False
+        assert "Extract Only" in result["error"]
+        assert "does not support web search" in result["error"]
+        fallback_search.assert_not_called()
+
     def test_parallel_keyless_path_when_no_key(self, monkeypatch):
         # Pin parallel so the ring deterministically starts there.
         monkeypatch.setattr(keyless_mcp, "_vendor_pinned", lambda n: n == "parallel")
@@ -276,6 +321,61 @@ class TestProviderRouting:
 
 
 class TestResolutionOrder:
+    def test_explicit_unknown_provider_fails_closed(self, fresh_registry, monkeypatch):
+        """A stale/typoed selection must not be reported as another backend."""
+        monkeypatch.setattr(
+            registry,
+            "_read_config_key",
+            lambda *path: "tavily"
+            if path == ("web", "extract_backend")
+            else None,
+        )
+        monkeypatch.setattr(
+            "agent.web_search_provider.get_provider_env",
+            lambda name: "sk-real" if name == "EXA_API_KEY" else "",
+        )
+
+        # Exa is available, proving None is a strict-selection result rather
+        # than an empty-registry/no-fallback accident.
+        assert fresh_registry.get_provider("exa").is_available() is True
+        assert fresh_registry.get_active_extract_provider() is None
+
+    def test_explicit_capability_mismatch_fails_closed(
+        self, fresh_registry, monkeypatch
+    ):
+        """A search-only selection must not silently hand extract to Exa."""
+        fresh_registry.register_provider(BraveFreeWebSearchProvider())
+        monkeypatch.setattr(
+            registry,
+            "_read_config_key",
+            lambda *path: "brave-free"
+            if path == ("web", "extract_backend")
+            else None,
+        )
+        monkeypatch.setattr(
+            "agent.web_search_provider.get_provider_env",
+            lambda name: "sk-real" if name == "EXA_API_KEY" else "",
+        )
+
+        assert fresh_registry.get_provider("exa").is_available() is True
+        assert fresh_registry.get_active_extract_provider() is None
+
+    def test_explicit_unavailable_provider_is_returned_for_precise_error(
+        self, fresh_registry, monkeypatch
+    ):
+        """Registered explicit selections still reach their own auth error."""
+        monkeypatch.setattr(
+            registry,
+            "_read_config_key",
+            lambda *path: "exa"
+            if path == ("web", "search_backend")
+            else None,
+        )
+        selected = fresh_registry.get_provider("exa")
+
+        assert selected.is_available() is False
+        assert fresh_registry.get_active_search_provider() is selected
+
     def test_registry_falls_back_to_keyless(self, fresh_registry, monkeypatch):
         monkeypatch.setattr(registry, "_read_config_key", lambda *p: None)
         provider = registry.get_active_search_provider()

@@ -248,12 +248,12 @@ class TestIsAvailable:
 
 
 # ---------------------------------------------------------------------------
-# Registry resolution semantics (Option B — conservative smart fallback)
+# Registry resolution semantics (strict selection + unconfigured autodetect)
 # ---------------------------------------------------------------------------
 
 
 class TestRegistryResolution:
-    """``_resolve()`` follows explicit-config + availability-filtered fallback."""
+    """``_resolve()`` keeps explicit selection distinct from autodetection."""
 
     def test_explicit_configured_provider_returned_even_when_unavailable(
         self,
@@ -275,20 +275,16 @@ class TestRegistryResolution:
         # a typed credential-missing error to the caller.
         assert result.is_available() is False
 
-    def test_unknown_configured_name_falls_back_to_available_provider(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("capability", ["search", "extract"])
+    def test_unknown_configured_name_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch, capability: str
     ) -> None:
-        """Typo / uninstalled plugin → walk legacy preference, pick available."""
+        """A typo or unloaded plugin must not be disguised as another backend."""
         _ensure_plugins_loaded()
         from agent.web_search_registry import _resolve
 
         monkeypatch.setenv("EXA_API_KEY", "real")
-        result = _resolve("not-a-real-provider", capability="search")
-        # Either ddgs (no-key fallback) or exa (the only available
-        # premium provider) — both are valid. The point is the unknown
-        # name shouldn't return None when SOMETHING is available.
-        assert result is not None
-        assert result.is_available() is True
+        assert _resolve("not-a-real-provider", capability=capability) is None
 
 
     def test_no_config_no_credentials_returns_none(
@@ -327,5 +323,4 @@ class TestAsyncExtractDispatch:
 
 class TestErrorResponseShapes:
     """When credentials are missing, plugins return typed errors, not raises."""
-
 

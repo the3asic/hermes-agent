@@ -1268,6 +1268,19 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         backend = _get_search_backend()
         provider = _wsp_get_provider(backend) if backend else None
         if provider is None or not provider.supports_search():
+            if provider is not None and not provider.supports_search():
+                error_text = (
+                    f"{provider.display_name} does not support web search. "
+                    "Set web.search_backend to a search-capable provider."
+                )
+                response_data = {"success": False, "error": error_text}
+                result_json = json.dumps(
+                    response_data, indent=2, ensure_ascii=False
+                )
+                debug_call_data["error"] = error_text
+                _debug.log_call("web_search_tool", debug_call_data)
+                _debug.save()
+                return result_json
             from tools.tool_backend_helpers import (
                 selection_error,
                 selection_exists,

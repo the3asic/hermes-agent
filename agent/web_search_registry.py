@@ -14,20 +14,21 @@ The active provider is chosen by configuration with this precedence:
 1. ``web.search_backend`` / ``web.extract_backend``
    (per-capability override).
 2. ``web.backend`` (shared fallback).
-3. If exactly one capability-eligible provider is registered AND available,
-   use it.
-4. Legacy preference order — ``firecrawl`` → ``parallel`` →
-   ``exa`` → ``searxng`` → ``brave-free`` → ``ddgs`` — filtered by
-   availability. Matches the historic ``tools.web_tools._get_backend()``
-   candidate order so installs that never set a config key keep landing
-   on the same provider they did before the plugin migration.
+3. When an explicit selection is present but is not registered or does not
+   support the requested capability, return ``None``. Explicit selections
+   fail closed; they are never silently replaced by another provider.
+4. Only when no selection is configured, use the single available
+   capability-eligible provider, then the legacy preference order —
+   ``firecrawl`` → ``parallel`` → ``exa`` → ``searxng`` →
+   ``brave-free`` → ``ddgs`` — filtered by availability. This preserves
+   autodetection for installs that never selected a backend.
 5. Otherwise ``None`` — the tool surfaces a helpful error pointing at
    ``hermes tools``.
 
 The capability filter (``supports_search`` / ``supports_extract``) is
-applied at every step so a search-only provider (``brave-free``)
-configured as ``web.extract_backend`` correctly falls through to an
-extract-capable backend.
+applied at every step. A search-only provider (``brave-free``) explicitly
+configured as ``web.extract_backend`` therefore fails closed instead of
+quietly routing extraction through a different provider.
 """
 
 from __future__ import annotations
@@ -216,10 +217,15 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
        routing somewhere else. Matches legacy
        :func:`tools.web_tools._get_backend` behavior for configured names.
 
-    2. **Single-provider shortcut.** When only one registered provider
-       supports *capability* AND ``is_available()`` reports True, return it.
+       If the explicit name is not registered, or the provider does not
+       support *capability*, return ``None`` without entering autodetection.
 
-    3. **Legacy preference walk, filtered by availability.** Walk the
+    2. **Single-provider shortcut.** When no provider is configured and only
+       one registered provider supports *capability* AND ``is_available()``
+       reports True, return it.
+
+    3. **Legacy preference walk, filtered by availability.** With no explicit
+       provider configured, walk the
        :data:`_LEGACY_PREFERENCE` order (firecrawl → parallel →
        exa → searxng → brave-free → ddgs) looking for a provider whose
        ``supports_<capability>()`` is True AND whose ``is_available()`` is
@@ -229,9 +235,10 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
        the path that fires when no config key is set — pick the
        highest-priority backend the user actually has credentials for.
 
-    Returns None when no provider is configured AND no available provider
-    matches the legacy preference; the dispatcher then returns a "set up a
-    provider" error to the user.
+    Returns None when an explicit selection is invalid for *capability*, or
+    when no provider is configured and no available provider matches the
+    fallback walks. The dispatcher then returns the corresponding selection
+    or setup error to the user.
     """
     with _lock:
         snapshot = dict(_providers)
@@ -254,26 +261,30 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
 
     # 1. Explicit config wins — return regardless of is_available() so the
     #    user gets a precise downstream error message rather than a silent
-    #    backend switch. Matches _get_backend() in web_tools.py.
+    #    backend switch. An unknown or capability-incompatible selection is
+    #    also final: return None so callers surface that configuration error
+    #    instead of quietly serving the request through another provider.
+    #    Matches the strict-selection contract in web_tools.py.
     if configured:
         provider = snapshot.get(configured)
         if provider is not None and _capable(provider):
             return provider
         if provider is None:
             logger.debug(
-                "web backend '%s' configured but not registered; falling back",
+                "web backend '%s' configured but not registered; refusing fallback",
                 configured,
             )
         else:
             logger.debug(
-                "web backend '%s' configured but does not support '%s'; falling back",
+                "web backend '%s' configured but does not support '%s'; refusing fallback",
                 configured, capability,
             )
+        return None
 
-    # 2. + 3. Fallback path — filter by availability so we don't surface
-    #    a provider the user has no credentials for. Without this filter,
-    #    a registered-but-unconfigured provider could end up "active" on
-    #    a fresh install with no API keys at all.
+    # 2. + 3. Unconfigured fallback path — filter by availability so we don't
+    #    surface a provider the user has no credentials for. Without this
+    #    filter, a registered-but-unconfigured provider could end up "active"
+    #    on a fresh install with no API keys at all.
     eligible = [
         p for p in snapshot.values()
         if _capable(p) and _is_available_safe(p)
