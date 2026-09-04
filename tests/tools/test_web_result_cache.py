@@ -815,6 +815,95 @@ def test_extract_cache_provider_participates_in_key(_isolated_cache):
     assert extract_cache_get("https://e.com/p", provider="keenable") is None
     hit = extract_cache_get("https://e.com/p", provider="firecrawl")
     assert hit is not None and hit["content"] == "firecrawl version"
+    assert hit["served_by"] == "firecrawl"
+    _assert_utc_iso(hit["retrieved_at"])
+
+
+def test_extract_cache_preserves_explicit_retrieval_time(_isolated_cache):
+    retrieved_at = "2020-09-01T01:02:03Z"
+    extract_cache_put(
+        "https://e.com/retrieved-at",
+        "content",
+        provider="firecrawl",
+        served_by="firecrawl",
+        retrieved_at=retrieved_at,
+    )
+
+    hit = extract_cache_get(
+        "https://e.com/retrieved-at", provider="firecrawl"
+    )
+    assert hit is not None
+    assert hit["retrieved_at"] == retrieved_at
+
+
+def test_extract_cache_rejects_mismatched_serving_provider(_isolated_cache):
+    """Fallback content must never populate another provider's cache key."""
+    url = "https://e.com/wrong-provider"
+    extract_cache_put(
+        url,
+        "exa content",
+        provider="firecrawl",
+        served_by="exa",
+    )
+
+    assert extract_cache_get(url, provider="firecrawl") is None
+
+
+def test_extract_cache_tampered_serving_provider_is_miss(_isolated_cache):
+    url = "https://e.com/tampered-provider"
+    extract_cache_put(url, "content", provider="firecrawl")
+    index_path = _isolated_cache / wrc._INDEX_FILENAME
+    index = json.loads(index_path.read_text())
+    entry = index[wrc._url_digest(url, None, "firecrawl")]
+    entry["served_by"] = "exa"
+    index_path.write_text(json.dumps(index))
+
+    assert extract_cache_get(url, provider="firecrawl") is None
+
+
+@pytest.mark.parametrize("bad_fetched_at", ["NaN", "Infinity", 10**30])
+def test_extract_cache_nonfinite_or_abnormal_future_time_is_miss(
+    bad_fetched_at,
+    _isolated_cache,
+):
+    url = "https://e.com/bad-time"
+    extract_cache_put(url, "content", provider="firecrawl")
+    index_path = _isolated_cache / wrc._INDEX_FILENAME
+    index = json.loads(index_path.read_text())
+    entry = index[wrc._url_digest(url, None, "firecrawl")]
+    entry["fetched_at"] = bad_fetched_at
+    index_path.write_text(json.dumps(index))
+
+    assert extract_cache_get(url, provider="firecrawl") is None
+
+
+def test_extract_cache_future_retrieval_time_is_miss(_isolated_cache):
+    url = "https://e.com/future-retrieval"
+    extract_cache_put(url, "content", provider="firecrawl")
+    index_path = _isolated_cache / wrc._INDEX_FILENAME
+    index = json.loads(index_path.read_text())
+    entry = index[wrc._url_digest(url, None, "firecrawl")]
+    entry["retrieved_at"] = "2999-01-01T00:00:00Z"
+    index_path.write_text(json.dumps(index))
+
+    assert extract_cache_get(url, provider="firecrawl") is None
+
+
+@pytest.mark.parametrize("missing_field", ["served_by", "retrieved_at"])
+def test_extract_cache_old_provider_entry_without_provenance_is_miss(
+    missing_field,
+    _isolated_cache,
+):
+    """Pre-provenance entries cannot prove their vendor or retrieval time."""
+    url = "https://e.com/pre-provenance"
+    extract_cache_put(url, "old content", provider="firecrawl")
+    index_path = _isolated_cache / wrc._INDEX_FILENAME
+    index = json.loads(index_path.read_text())
+    entry = index[wrc._url_digest(url, None, "firecrawl")]
+    entry.pop(missing_field)
+    index_path.write_text(json.dumps(index))
+
+    assert extract_cache_get(url, provider="firecrawl") is None
 
 
 def test_extract_cache_oversized_page_not_indexed(_isolated_cache):

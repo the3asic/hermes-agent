@@ -41,6 +41,34 @@ _SESSION_ID = uuid.uuid4().hex
 
 _TIMEOUT_SECONDS = 30
 
+# Internal per-result handoff fields. The web_extract wrapper consumes these
+# before returning its trimmed public envelope; they never enter cached page
+# content or model-visible result rows.
+EXTRACT_SERVED_BY_FIELD = "_hermes_extract_served_by"
+EXTRACT_FALLBACK_ATTEMPTED_FIELD = "_hermes_extract_fallback_attempted"
+EXTRACT_FALLBACK_USED_FIELD = "_hermes_extract_fallback_used"
+
+
+class ExtractFailoverResults(list):
+    """List-compatible extract batch with trusted routing outcome metadata.
+
+    Per-row markers preserve which successful rows came from a fallback
+    vendor.  Batch attributes also preserve an attempted-but-unsuccessful
+    failover when no returned row can carry that fact (including an empty
+    result list).
+    """
+
+    def __init__(
+        self,
+        values=(),
+        *,
+        fallback_attempted: bool = False,
+        fallback_used: bool = False,
+    ) -> None:
+        super().__init__(values)
+        self.fallback_attempted = bool(fallback_attempted)
+        self.fallback_used = bool(fallback_used)
+
 
 class KeylessMCPError(RuntimeError):
     """A keyless MCP call failed (transport, rate limit, or tool error)."""
@@ -733,28 +761,56 @@ def extract_with_failover(name: str, urls: List[str]) -> List[Dict[str, Any]]:
 
     Advances to the next ring vendor only when EVERY url in a batch comes
     back with a rate-limit-shaped error — partial failures are page
-    problems, not throttling, and return as-is.
+    problems, not throttling, and return as-is. Entries carry separate
+    internal attempted/used markers, while successful entries also carry the
+    serving vendor, so the wrapper can report truthful provenance and avoid
+    caching a response under the wrong provider key.
     """
     order = _ring_order(name)
     if not order:
-        return [
-            {"url": u, "title": "", "content": "",
-             "error": "All keyless web providers are pinned to paid tiers."}
-            for u in urls
-        ]
+        return ExtractFailoverResults(
+            [
+                {"url": u, "title": "", "content": "",
+                 "error": "All keyless web providers are pinned to paid tiers."}
+                for u in urls
+            ]
+        )
     last: List[Dict[str, Any]] = []
+    fallback_attempted = False
     for i, vendor in enumerate(order):
         results = _KEYLESS_EXTRACTORS[vendor](list(urls))
+        used_fallback_route = i > 0 or vendor != name
+        fallback_attempted = fallback_attempted or used_fallback_route
+        fallback_used = False
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            if not result.get("error"):
+                result[EXTRACT_SERVED_BY_FIELD] = vendor
+                if used_fallback_route:
+                    result[EXTRACT_FALLBACK_USED_FIELD] = True
+                    fallback_used = True
+            if used_fallback_route:
+                result[EXTRACT_FALLBACK_ATTEMPTED_FIELD] = True
+        batch = ExtractFailoverResults(
+            results,
+            fallback_attempted=fallback_attempted,
+            fallback_used=fallback_used,
+        )
         errors = [r.get("error", "") for r in results]
         all_throttled = bool(results) and all(
             e and _is_rate_limitish(e) for e in errors
         )
         if not all_throttled:
-            return results
-        last = results
+            return batch
+        last = batch
         nxt = order[i + 1] if i + 1 < len(order) else None
         if nxt:
             logger.info(
                 "keyless %s extract throttled; failing over to %s", vendor, nxt
             )
-    return last
+    return ExtractFailoverResults(
+        last,
+        fallback_attempted=fallback_attempted,
+        fallback_used=False,
+    )

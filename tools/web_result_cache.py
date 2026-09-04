@@ -14,9 +14,10 @@ Two caches, both TTL-bounded (default 20 minutes, ``web.cache_ttl_minutes``):
 * **Extract cache** — disk-backed, cross-process. Reuses the existing
   ``cache/web`` full-text store (the same files the truncate-store footer
   points read_file at) plus a small JSON sidecar index mapping URL digest →
-  (file, fetched_at, title). A repeat ``web_extract`` of the same URL within
-  TTL reads the stored clean text back instead of re-scraping, then re-runs
-  the normal truncate pipeline with the caller's char_limit.
+  (file, cache-write time, source-retrieval time, title, serving provider).
+  A repeat ``web_extract`` of the same URL within TTL reads the stored clean
+  text back instead of re-scraping, then re-runs the normal truncate pipeline
+  with the caller's char_limit.
 
 Why this lives here and not in generic tool dispatch (issue #8126): a
 dispatch-level memo would have to reason about middleware, approval gates,
@@ -31,6 +32,7 @@ Disable with ``web.cache_enabled: false``; both TTLs come from
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -54,6 +56,11 @@ _INDEX_FILENAME = "extract-index.json"
 
 # Cap index growth; oldest entries evicted past this.
 _INDEX_MAX_ENTRIES = 500
+
+# Persistent cache timestamps use wall time. Reject entries that are more than
+# a small scheduling/clock-read tolerance into the future rather than letting
+# them remain "fresh" indefinitely after a bad clock or sidecar corruption.
+_MAX_WALL_CLOCK_SKEW_SECONDS = 5.0
 
 
 def _web_config() -> dict:
@@ -129,6 +136,28 @@ def utc_now_iso() -> str:
         datetime.fromtimestamp(time.time(), timezone.utc)
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
+    )
+
+
+def _normalized_utc_timestamp(value: Any) -> Optional[tuple[str, float]]:
+    """Return ``(UTC RFC3339 seconds, epoch)`` for an aware finite timestamp."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = value.strip()
+    try:
+        parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+        if parsed.utcoffset() is None:
+            return None
+        epoch = parsed.timestamp()
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if not math.isfinite(epoch):
+        return None
+    return (
+        parsed.astimezone(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
+        epoch,
     )
 
 
@@ -497,7 +526,13 @@ def extract_cache_get(
     format: Optional[str] = None,
     provider: str = "",
 ) -> Optional[dict]:
-    """Return {'url','title','content'} for a fresh cached page, else None."""
+    """Return a fresh cached page plus source provenance, else None.
+
+    Provider-specific entries written before serving-vendor/retrieval-time
+    provenance was added are deliberately treated as misses: an old key cannot
+    prove that a keyless failover did not populate it under the requested
+    provider's name or preserve the source-retrieval time.
+    """
     if not cache_enabled():
         return None
     if _is_local_dev_url(url) or _is_cache_exempt_host(url):
@@ -507,7 +542,34 @@ def extract_cache_get(
         entry = index.get(_url_digest(url, format, provider))
     if not entry:
         return None
-    if (time.time() - float(entry.get("fetched_at", 0))) >= ttl_seconds():
+    try:
+        fetched_at = float(entry.get("fetched_at", 0))
+    except (TypeError, ValueError):
+        return None
+    now = time.time()
+    age_seconds = now - fetched_at
+    if (
+        not math.isfinite(fetched_at)
+        or not math.isfinite(age_seconds)
+        or age_seconds < -_MAX_WALL_CLOCK_SKEW_SECONDS
+        or age_seconds >= ttl_seconds()
+    ):
+        return None
+    served_by = entry.get("served_by")
+    if provider:
+        if (
+            not isinstance(served_by, str)
+            or served_by.strip() != provider.strip()
+        ):
+            return None
+    retrieved = _normalized_utc_timestamp(entry.get("retrieved_at"))
+    if retrieved is None:
+        return None
+    retrieved_at, retrieved_epoch = retrieved
+    if (
+        retrieved_epoch > now + _MAX_WALL_CLOCK_SKEW_SECONDS
+        or retrieved_epoch > fetched_at + _MAX_WALL_CLOCK_SKEW_SECONDS
+    ):
         return None
     try:
         file_path = Path(entry["file"])
@@ -526,6 +588,8 @@ def extract_cache_get(
         "content": content,
         "error": None,
         "cached": True,
+        "served_by": served_by or None,
+        "retrieved_at": retrieved_at,
     }
 
 
@@ -535,6 +599,8 @@ def extract_cache_put(
     title: str = "",
     format: Optional[str] = None,
     provider: str = "",
+    served_by: str = "",
+    retrieved_at: str = "",
 ) -> None:
     """Store one successful extraction's full clean text for TTL reuse.
 
@@ -549,6 +615,25 @@ def extract_cache_put(
     if _is_local_dev_url(url) or _is_cache_exempt_host(url):
         return
     try:
+        stored_at = time.time()
+        if not math.isfinite(stored_at):
+            return
+        serving_provider = (served_by or provider or "").strip()
+        if provider and serving_provider != provider.strip():
+            return
+        if retrieved_at:
+            retrieved = _normalized_utc_timestamp(retrieved_at)
+            if retrieved is None:
+                return
+            normalized_retrieved_at, retrieved_epoch = retrieved
+            if retrieved_epoch > stored_at + _MAX_WALL_CLOCK_SKEW_SECONDS:
+                return
+        else:
+            normalized_retrieved_at = (
+                datetime.fromtimestamp(stored_at, timezone.utc)
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z")
+            )
         from tools.web_tools import MAX_STORED_TEXT_CHARS
         if len(content) > MAX_STORED_TEXT_CHARS:
             return
@@ -563,7 +648,9 @@ def extract_cache_put(
                 "url": url,
                 "file": str(file_path),
                 "title": title or "",
-                "fetched_at": time.time(),
+                "fetched_at": stored_at,
+                "retrieved_at": normalized_retrieved_at,
+                "served_by": serving_provider or None,
             }
             _save_index(index)
     except Exception as exc:  # noqa: BLE001 — cache writes are best-effort

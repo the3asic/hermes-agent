@@ -110,6 +110,151 @@ def _web_extract_url(value: Any) -> Optional[str]:
     return value or None
 
 
+def _extract_url_identity(url: str) -> str:
+    """Return a deterministic HTTP URL identity for extract result matching.
+
+    The identity normalizes scheme/host case, IDNs, an empty root path,
+    default ports, and fragments. Path and query semantics remain untouched.
+    It is used only to associate a provider row with the URL Hermes requested;
+    the caller-visible row is rewritten to that original normalized URL.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    normalized = normalize_url_for_request(url)
+    try:
+        parsed = urlsplit(normalized)
+        scheme = parsed.scheme.lower()
+        hostname = (parsed.hostname or "").lower()
+        if not scheme or not hostname:
+            return normalized
+
+        userinfo = ""
+        if "@" in parsed.netloc:
+            userinfo = parsed.netloc.rsplit("@", 1)[0] + "@"
+        host = f"[{hostname}]" if ":" in hostname else hostname
+        port = parsed.port
+        if port is not None and not (
+            (scheme == "http" and port == 80)
+            or (scheme == "https" and port == 443)
+        ):
+            host = f"{host}:{port}"
+        return urlunsplit(
+            (scheme, f"{userinfo}{host}", parsed.path or "/", parsed.query, "")
+        )
+    except (TypeError, ValueError):
+        return normalized
+
+
+_EXTRACT_RESULT_MAPPING_ERROR = (
+    "Extract backend returned duplicate, unexpected, or ambiguous URL rows; "
+    "no provider content was accepted for this batch"
+)
+_EXTRACT_RESULT_MISSING_ERROR = "Extract backend returned no result for this URL"
+
+
+def _reconcile_extract_results(
+    requested_urls: List[str],
+    raw_results: Any,
+) -> tuple[list, Dict[str, Dict[str, Any]], bool]:
+    """Match provider rows to requested URLs without relying on list position.
+
+    Missing URLs receive explicit error rows. Any non-object, URL-less,
+    duplicate, unexpected, or ambiguously identified provider row fails the
+    entire batch closed. The returned mapping is keyed by canonical request
+    identity and is the only source used by cache writes and mixed-result
+    assembly.
+    """
+    from plugins.web.keyless_mcp import ExtractFailoverResults
+
+    fallback_attempted = bool(
+        getattr(raw_results, "fallback_attempted", False)
+    )
+    fallback_used = bool(getattr(raw_results, "fallback_used", False))
+    requested_by_identity: Dict[str, str] = {}
+    duplicate_request = False
+    for requested_url in requested_urls:
+        identity = _extract_url_identity(requested_url)
+        if identity in requested_by_identity:
+            duplicate_request = True
+        else:
+            requested_by_identity[identity] = requested_url
+
+    rows = list(raw_results) if isinstance(raw_results, (list, tuple)) else []
+    matched: Dict[str, Dict[str, Any]] = {}
+    invalid_mapping = duplicate_request or not isinstance(
+        raw_results, (list, tuple)
+    )
+    for raw_result in rows:
+        if not isinstance(raw_result, dict):
+            invalid_mapping = True
+            continue
+        candidates = []
+        result_url = raw_result.get("url")
+        if isinstance(result_url, str) and result_url.strip():
+            candidates.append(_extract_url_identity(result_url))
+        metadata = raw_result.get("metadata")
+        if isinstance(metadata, dict):
+            source_url = metadata.get("sourceURL")
+            if isinstance(source_url, str) and source_url.strip():
+                candidates.append(_extract_url_identity(source_url))
+        candidate_identities = set(candidates)
+        if len(candidate_identities) != 1:
+            invalid_mapping = True
+            continue
+        identity = next(iter(candidate_identities))
+        if identity not in requested_by_identity or identity in matched:
+            invalid_mapping = True
+            continue
+        accepted = dict(raw_result)
+        accepted["url"] = requested_by_identity[identity]
+        matched[identity] = accepted
+
+    if invalid_mapping:
+        matched = {
+            identity: {
+                "url": requested_url,
+                "title": "",
+                "content": "",
+                "error": _EXTRACT_RESULT_MAPPING_ERROR,
+            }
+            for identity, requested_url in requested_by_identity.items()
+        }
+        ordered = [
+            matched[_extract_url_identity(url)] for url in requested_urls
+        ]
+        return (
+            ExtractFailoverResults(
+                ordered,
+                fallback_attempted=fallback_attempted,
+                fallback_used=False,
+            ),
+            matched,
+            False,
+        )
+
+    for identity, requested_url in requested_by_identity.items():
+        if identity not in matched:
+            matched[identity] = {
+                "url": requested_url,
+                "title": "",
+                "content": "",
+                "error": _EXTRACT_RESULT_MISSING_ERROR,
+            }
+    ordered = [matched[_extract_url_identity(url)] for url in requested_urls]
+    fallback_used = fallback_used and any(
+        not result.get("error") for result in ordered
+    )
+    return (
+        ExtractFailoverResults(
+            ordered,
+            fallback_attempted=fallback_attempted,
+            fallback_used=fallback_used,
+        ),
+        matched,
+        True,
+    )
+
+
 # ─── Backend Selection ────────────────────────────────────────────────────────
 
 def _env_value(name: str) -> str:
@@ -538,41 +683,85 @@ def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
     by ``_policy_blocked_result`` are never re-fetched through the ring and
     their original (blocked) results are preserved verbatim.
     """
-    from plugins.web.keyless_mcp import extract_with_failover
+    from plugins.web.keyless_mcp import ExtractFailoverResults, extract_with_failover
 
-    # Partition out policy blocks. Rescue only genuine backend failures.
-    if len(results) == len(urls):
-        rescue_idx = [i for i, r in enumerate(results) if not _policy_blocked_result(r)]
-    else:  # defensive: provider broke order parity — treat all as rescueable
-        rescue_idx = list(range(len(results)))
-    if not rescue_idx:
-        return results  # every failure is an intentional policy block
+    aligned, original_by_identity, mapping_valid = _reconcile_extract_results(
+        urls, results
+    )
+    if not mapping_valid:
+        # An invalid provider mapping is an integrity failure, not an outage.
+        # Never route it elsewhere and risk accepting content for the wrong URL.
+        return aligned
 
-    rescue_urls = [urls[i] for i in rescue_idx] if len(results) == len(urls) else list(urls)
+    # Partition by canonical request identity. Rescue only genuine backend
+    # failures; website-policy refusals remain untouched.
+    rescue_urls = [
+        url
+        for url in urls
+        if not _policy_blocked_result(
+            original_by_identity[_extract_url_identity(url)]
+        )
+    ]
+    if not rescue_urls:
+        # Every failure is an intentional policy block.  Preserve the list
+        # contract while explicitly recording that no fallback call occurred.
+        return ExtractFailoverResults(
+            aligned,
+            fallback_attempted=False,
+            fallback_used=False,
+        )
+
     original_error = next(
-        (results[i].get("error") for i in rescue_idx if results[i].get("error")),
+        (
+            original_by_identity[_extract_url_identity(url)].get("error")
+            for url in rescue_urls
+            if original_by_identity[_extract_url_identity(url)].get("error")
+        ),
         "extract failed",
     )
     logger.warning(
         "web_extract backend '%s' failed all %d URL(s) (%s); one-shot keyless rescue",
         provider_name, len(rescue_urls), (original_error or "")[:200],
     )
-    rescued = extract_with_failover(provider_name, list(rescue_urls))
+    rescued_raw = extract_with_failover(provider_name, list(rescue_urls))
+    rescued, rescued_by_identity, rescue_mapping_valid = (
+        _reconcile_extract_results(rescue_urls, rescued_raw)
+    )
+    if not rescue_mapping_valid:
+        merged_by_identity = dict(original_by_identity)
+        merged_by_identity.update(rescued_by_identity)
+        merged = [
+            merged_by_identity[_extract_url_identity(url)] for url in urls
+        ]
+        return ExtractFailoverResults(
+            merged,
+            fallback_attempted=True,
+            fallback_used=False,
+        )
     rescued_errors = [r.get("error", "") for r in rescued]
     if rescued and all(e for e in rescued_errors):
-        return results  # rescue also failed everywhere: keep original errors
+        # Rescue was genuinely attempted but failed everywhere. Keep the
+        # selected provider's more useful errors without losing attempt state.
+        return ExtractFailoverResults(
+            aligned,
+            fallback_attempted=True,
+            fallback_used=False,
+        )
+    fallback_used = any(not r.get("error") for r in rescued)
     for r in rescued:
         if not r.get("error"):
             meta = r.setdefault("metadata", {})
             if isinstance(meta, dict):
                 meta["rescued_from"] = provider_name
                 meta["backend_error"] = (original_error or "")[:300]
-    if len(rescued) == len(rescue_idx) and len(results) == len(urls):
-        merged = list(results)
-        for pos, i in enumerate(rescue_idx):
-            merged[i] = rescued[pos]
-        return merged
-    return rescued
+    merged_by_identity = dict(original_by_identity)
+    merged_by_identity.update(rescued_by_identity)
+    merged = [merged_by_identity[_extract_url_identity(url)] for url in urls]
+    return ExtractFailoverResults(
+        merged,
+        fallback_attempted=True,
+        fallback_used=fallback_used,
+    )
 
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
@@ -1169,6 +1358,151 @@ def _search_provenance_now() -> str:
     return utc_now_iso()
 
 
+_EXTRACT_CACHE_HIT_FIELD = "_hermes_extract_cache_hit"
+_EXTRACT_CACHE_SERVED_BY_FIELD = "_hermes_extract_cache_served_by"
+_EXTRACT_CACHE_RETRIEVED_AT_FIELD = "_hermes_extract_cache_retrieved_at"
+
+
+def _build_extract_provenance(
+    results: List[Dict[str, Any]],
+    *,
+    requested_backend: Optional[str],
+    requested_count: int,
+    cache_status: str,
+    provider_call_attempted: bool,
+    fetch_succeeded: bool,
+    network_retrieved_at: str,
+    fallback_attempted: bool,
+    fallback_used: bool,
+) -> Dict[str, Any]:
+    """Build model-visible extract routing facts without copying page data.
+
+    ``retrieved_at`` is the oldest successful source-retrieval time represented
+    in this response, or ``None`` when no content was retrieved. That is
+    conservative for mixed cache/fetch batches: cached pages may be older than
+    pages fetched during the current call. ``served_by`` is a string for one
+    serving vendor, a sorted list when successful rows came from multiple
+    vendors, and ``None`` when no row succeeded.
+    """
+    from plugins.web.keyless_mcp import (
+        EXTRACT_FALLBACK_ATTEMPTED_FIELD,
+        EXTRACT_FALLBACK_USED_FIELD,
+        EXTRACT_SERVED_BY_FIELD,
+    )
+
+    successful = [result for result in results if not result.get("error")]
+    vendors = set()
+    retrieval_times = []
+    for result in successful:
+        serving_vendor = result.get(EXTRACT_SERVED_BY_FIELD)
+        if not isinstance(serving_vendor, str) or not serving_vendor.strip():
+            serving_vendor = (
+                result.get(_EXTRACT_CACHE_SERVED_BY_FIELD)
+                if result.get(_EXTRACT_CACHE_HIT_FIELD)
+                else None
+            )
+        if not isinstance(serving_vendor, str) or not serving_vendor.strip():
+            serving_vendor = (
+                requested_backend
+                if isinstance(requested_backend, str)
+                and requested_backend.strip()
+                else None
+            )
+        if isinstance(serving_vendor, str) and serving_vendor.strip():
+            vendors.add(serving_vendor.strip())
+
+        cached_retrieved_at = result.get(_EXTRACT_CACHE_RETRIEVED_AT_FIELD)
+        if (
+            result.get(_EXTRACT_CACHE_HIT_FIELD)
+            and isinstance(cached_retrieved_at, str)
+            and cached_retrieved_at.strip()
+        ):
+            retrieval_times.append(cached_retrieved_at.strip())
+
+    if fetch_succeeded and network_retrieved_at:
+        retrieval_times.append(network_retrieved_at)
+
+    served_by: Any
+    if not vendors:
+        served_by = None
+    elif len(vendors) == 1:
+        served_by = next(iter(vendors))
+    else:
+        served_by = sorted(vendors)
+
+    fallback_attempt_observed = any(
+        bool(result.get(EXTRACT_FALLBACK_ATTEMPTED_FIELD))
+        or bool(result.get(EXTRACT_FALLBACK_USED_FIELD))
+        for result in results
+    )
+    fallback_success_observed = (
+        any(
+            not result.get("error")
+            and bool(result.get(EXTRACT_FALLBACK_USED_FIELD))
+            for result in results
+        )
+        or (
+            isinstance(requested_backend, str)
+            and bool(requested_backend.strip())
+            and any(vendor != requested_backend for vendor in vendors)
+        )
+    )
+    fallback_used = bool(fallback_used or fallback_success_observed)
+    fallback_attempted = bool(
+        fallback_attempted or fallback_attempt_observed or fallback_used
+    )
+    served_at = _search_provenance_now()
+    return {
+        "requested_backend": requested_backend,
+        "served_by": served_by,
+        "fallback_attempted": fallback_attempted,
+        "fallback_used": bool(fallback_used),
+        "cache_status": cache_status,
+        "provider_call_attempted": bool(provider_call_attempted),
+        "fetch_succeeded": bool(fetch_succeeded),
+        "retrieved_at": min(retrieval_times) if retrieval_times else None,
+        "served_at": served_at,
+        "requested_count": max(0, int(requested_count)),
+        "returned_count": len(results),
+        "success_count": len(successful),
+        "failure_count": len(results) - len(successful),
+    }
+
+
+def _extract_error_response(
+    error: str,
+    *,
+    requested_count: int,
+    requested_backend: Optional[str] = None,
+    cache_status: str = "bypass",
+    provider_call_attempted: bool = False,
+    fetch_succeeded: bool = False,
+    network_retrieved_at: str = "",
+    fallback_attempted: bool = False,
+    fallback_used: bool = False,
+    success_false: bool = False,
+) -> str:
+    """Return a legacy-compatible error envelope with mandatory provenance."""
+    payload: Dict[str, Any] = {
+        "provenance": _build_extract_provenance(
+            [],
+            requested_backend=requested_backend,
+            requested_count=requested_count,
+            cache_status=cache_status,
+            provider_call_attempted=provider_call_attempted,
+            fetch_succeeded=fetch_succeeded,
+            network_retrieved_at=network_retrieved_at,
+            fallback_attempted=fallback_attempted,
+            fallback_used=fallback_used,
+        )
+    }
+    bounded_error = json.loads(tool_error(error))["error"]
+    if success_false:
+        payload["success"] = False
+    payload["error"] = bounded_error
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def web_search_tool(query: str, limit: int = 5) -> str:
     """
     Search through the configured backend and return result metadata.
@@ -1534,13 +1868,26 @@ async def web_extract_tool(
     Security: URLs are checked for embedded secrets before fetching.
 
     Returns:
-        str: JSON string with a ``results`` list; each entry has
-             ``url``, ``title``, ``content``, ``error``. ``content`` is the
-             (possibly truncated) clean page text.
+        str: JSON string with a top-level ``provenance`` object followed by a
+             ``results`` list; each result keeps the existing ``url``,
+             ``title``, ``content``, ``error`` shape. Provenance contains only
+             routing, fallback attempt/use, cache, provider-call, successful
+             fetch timing, and aggregate-count facts — never page URLs,
+             content, or error text. Error envelopes retain their legacy keys
+             and also begin with the same mandatory provenance object.
 
     Raises:
         Exception: If extraction fails or API key is not set
     """
+    _extract_requested_count = len(urls)
+    _extract_requested_backend: Optional[str] = None
+    _extract_cache_status = "bypass"
+    _extract_provider_call_attempted = False
+    _extract_fetch_succeeded = False
+    _extract_network_retrieved_at = ""
+    _extract_fallback_attempted = False
+    _extract_fallback_used = False
+
     # Block URLs containing embedded secrets (exfiltration prevention).
     # URL-decode first so percent-encoded secrets (%73k- = sk-) are caught.
     from agent.redact import _PREFIX_RE
@@ -1568,22 +1915,24 @@ async def web_extract_tool(
             or _PREFIX_RE.search(normalized_url)
             or _PREFIX_RE.search(unquote(normalized_url))
         ):
-            return json.dumps({
-                "success": False,
-                "error": "Blocked: URL contains what appears to be an API key or token. "
-                         "Secrets must not be sent in URLs.",
-            })
+            return _extract_error_response(
+                "Blocked: URL contains what appears to be an API key or token. "
+                "Secrets must not be sent in URLs.",
+                requested_count=_extract_requested_count,
+                success_false=True,
+            )
         sensitive_query_key = sensitive_query_param_name(normalized_url)
         if sensitive_query_key:
-            return json.dumps({
-                "success": False,
-                "error": (
+            return _extract_error_response(
+                (
                     "Blocked: URL contains a credential-like query parameter "
                     f"({sensitive_query_key}). Web extract backends are third-party "
                     "readers; remove the sensitive query parameter or use a local "
                     "browser session when this access is explicitly required."
                 ),
-            })
+                requested_count=_extract_requested_count,
+                success_false=True,
+            )
         normalized_urls.append(normalized_url)
         normalized_indices.append(index)
 
@@ -1601,7 +1950,7 @@ async def web_extract_tool(
         "truncation_metrics": [],
         "processing_applied": []
     }
-    
+
     try:
         logger.info("Extracting content from %d URL(s)", len(normalized_urls))
 
@@ -1618,12 +1967,14 @@ async def web_extract_tool(
             else:
                 safe_urls.append(url)
                 safe_indices.append(index)
+        safe_result_by_identity: Dict[str, Dict[str, Any]] = {}
 
         # Dispatch only safe URLs to the configured backend
         if not safe_urls:
             results = []
         else:
             backend = _get_extract_backend()
+            _extract_requested_backend = backend or None
 
             # All eight providers (brave-free, ddgs, searxng, exa, parallel,
             # firecrawl, keenable, xai) now live as plugins. The dispatcher is a
@@ -1653,17 +2004,16 @@ async def web_extract_tool(
                     and not provider.supports_extract()
                     and _has_explicit_capability_backend("extract")
                 ):
-                    return json.dumps(
-                        {
-                            "success": False,
-                            "error": (
-                                f"{provider.display_name} is a search-only "
-                                "backend and cannot extract URL content. "
-                                "Set web.extract_backend to firecrawl, "
-                                "keenable, exa, or parallel."
-                            ),
-                        },
-                        ensure_ascii=False,
+                    return _extract_error_response(
+                        (
+                            f"{provider.display_name} is a search-only "
+                            "backend and cannot extract URL content. "
+                            "Set web.extract_backend to firecrawl, "
+                            "keenable, exa, or parallel."
+                        ),
+                        requested_count=_extract_requested_count,
+                        requested_backend=_extract_requested_backend,
+                        success_false=True,
                     )
                 from tools.tool_backend_helpers import (
                     selection_error,
@@ -1690,9 +2040,11 @@ async def web_extract_tool(
                             f"'{backend}'",
                             "no registered web extract provider has that name",
                         )
-                    return json.dumps(
-                        {"success": False, "error": error_text},
-                        ensure_ascii=False,
+                    return _extract_error_response(
+                        error_text,
+                        requested_count=_extract_requested_count,
+                        requested_backend=_extract_requested_backend,
+                        success_false=True,
                     )
                 provider = get_active_extract_provider()
                 if provider is None:
@@ -1704,33 +2056,33 @@ async def web_extract_tool(
                     disabled_key = _disabled_web_plugin_for(capability="extract")
                     if disabled_key:
                         _vendor = disabled_key.split("/", 1)[-1]
-                        return json.dumps(
-                            {
-                                "success": False,
-                                "error": (
-                                    f"web.extract_backend is set to '{_vendor}', "
-                                    f"but its plugin ('{disabled_key}') is disabled "
-                                    "in config. Re-enable it with "
-                                    f"`hermes plugins enable {disabled_key}` "
-                                    "(or remove it from plugins.disabled)."
-                                ),
-                            },
-                            ensure_ascii=False,
-                        )
-                    return json.dumps(
-                        {
-                            "success": False,
-                            "error": (
-                                "No web extract provider configured. "
-                                "Set web.extract_backend to firecrawl, "
-                                "keenable, exa, or parallel."
+                        return _extract_error_response(
+                            (
+                                f"web.extract_backend is set to '{_vendor}', "
+                                f"but its plugin ('{disabled_key}') is disabled "
+                                "in config. Re-enable it with "
+                                f"`hermes plugins enable {disabled_key}` "
+                                "(or remove it from plugins.disabled)."
                             ),
-                        },
-                        ensure_ascii=False,
+                            requested_count=_extract_requested_count,
+                            requested_backend=_extract_requested_backend,
+                            success_false=True,
+                        )
+                    return _extract_error_response(
+                        (
+                            "No web extract provider configured. "
+                            "Set web.extract_backend to firecrawl, "
+                            "keenable, exa, or parallel."
+                        ),
+                        requested_count=_extract_requested_count,
+                        requested_backend=_extract_requested_backend,
+                        success_false=True,
                     )
 
 
             # ── Extract cache (tools/web_result_cache.py) ─────────────────
+            _extract_requested_backend = provider.name
+
             # Disk-backed via cache/web: a URL extracted within the TTL is
             # served from disk instead of re-scraped. Deliberately placed
             # AFTER the secret-URL gate, SSRF gate, provider resolution, and
@@ -1741,14 +2093,20 @@ async def web_extract_tool(
             # Keys include the provider and format, so switching backends or
             # formats within the TTL never serves the other's content.
             from tools.web_result_cache import (
+                cache_enabled as _extract_cache_enabled,
                 extract_cache_get as _extract_cache_get,
                 extract_cache_put as _extract_cache_put,
             )
             from tools.website_policy import check_website_access as _check_site
-            cached_results: Dict[int, Dict[str, Any]] = {}
+            cached_results: Dict[str, Dict[str, Any]] = {}
             fetch_urls: List[str] = []
-            fetch_positions: List[int] = []
-            for position, url in enumerate(safe_urls):
+            safe_identity_order = [
+                _extract_url_identity(url) for url in safe_urls
+            ]
+            representative_url_by_identity: Dict[str, str] = {}
+            for identity, url in zip(safe_identity_order, safe_urls):
+                representative_url_by_identity.setdefault(identity, url)
+            for identity, url in representative_url_by_identity.items():
                 hit = None
                 try:
                     _policy_block = _check_site(url)
@@ -1759,13 +2117,33 @@ async def web_extract_tool(
                         url, format=format, provider=provider.name
                     )
                 if hit is not None:
-                    cached_results[position] = hit
+                    hit[_EXTRACT_CACHE_HIT_FIELD] = True
+                    hit[_EXTRACT_CACHE_SERVED_BY_FIELD] = hit.get("served_by")
+                    hit[_EXTRACT_CACHE_RETRIEVED_AT_FIELD] = hit.get(
+                        "retrieved_at"
+                    )
+                    cached_results[identity] = hit
                 else:
                     fetch_urls.append(url)
-                    fetch_positions.append(position)
 
             if not fetch_urls:
-                results = [cached_results[i] for i in range(len(safe_urls))]
+                _extract_cache_status = "hit"
+            elif cached_results:
+                _extract_cache_status = "mixed"
+            elif _extract_cache_enabled():
+                _extract_cache_status = "miss"
+            else:
+                _extract_cache_status = "bypass"
+
+            if not fetch_urls:
+                safe_result_by_identity = dict(cached_results)
+                results = [
+                    {
+                        **cached_results[identity],
+                        "url": url,
+                    }
+                    for identity, url in zip(safe_identity_order, safe_urls)
+                ]
             else:
                 logger.info(
                     "Web extract via %s: %d URL(s)", provider.name, len(fetch_urls)
@@ -1774,7 +2152,8 @@ async def web_extract_tool(
                 # Async-or-sync dispatch: parallel + firecrawl have async
                 # extract(); exa + keenable are sync.
                 import inspect
-                _extract_rescued = False
+                _extract_provider_call_attempted = True
+                _extract_result_mapping_valid = True
                 try:
                     if inspect.iscoroutinefunction(provider.extract):
                         results = await provider.extract(fetch_urls, format=format)
@@ -1786,7 +2165,7 @@ async def web_extract_tool(
                         )
                 except Exception as exc:  # noqa: BLE001 — candidate for rescue
                     if _rescue_eligible(provider):
-                        _extract_rescued = True
+                        _extract_fallback_attempted = True
                         failed = [
                             {"url": u, "title": "", "content": "", "error": str(exc)}
                             for u in fetch_urls
@@ -1797,18 +2176,76 @@ async def web_extract_tool(
                     else:
                         raise
                 else:
+                    results, _, _extract_result_mapping_valid = (
+                        _reconcile_extract_results(fetch_urls, results)
+                    )
                     # One-shot keyless rescue when the WHOLE batch failed
                     # (backend-level outage, not per-page problems). Stateless:
                     # the next web_extract call uses the chosen backend again.
                     if (
                         results
                         and all(r.get("error") for r in results)
+                        and _extract_result_mapping_valid
                         and _rescue_eligible(provider)
+                        and any(
+                            not _policy_blocked_result(result)
+                            for result in results
+                        )
                     ):
-                        _extract_rescued = True
+                        _extract_fallback_attempted = True
                         results = await asyncio.to_thread(
                             _rescue_extract, provider.name, fetch_urls, results
                         )
+
+                results, fetched_results_by_identity, _ = (
+                    _reconcile_extract_results(fetch_urls, results)
+                )
+
+                from plugins.web.keyless_mcp import (
+                    EXTRACT_FALLBACK_ATTEMPTED_FIELD,
+                    EXTRACT_FALLBACK_USED_FIELD,
+                    EXTRACT_SERVED_BY_FIELD,
+                    ExtractFailoverResults,
+                )
+                _extract_fallback_attempted = bool(
+                    _extract_fallback_attempted
+                    or getattr(results, "fallback_attempted", False)
+                    or any(
+                        bool(result.get(EXTRACT_FALLBACK_ATTEMPTED_FIELD))
+                        or bool(result.get(EXTRACT_FALLBACK_USED_FIELD))
+                        for result in results
+                    )
+                )
+                _extract_fallback_used = bool(
+                    getattr(results, "fallback_used", False)
+                    or any(
+                        not result.get("error")
+                        and bool(result.get(EXTRACT_FALLBACK_USED_FIELD))
+                        for result in results
+                    )
+                )
+                _extract_fetch_succeeded = any(
+                    not result.get("error")
+                    and bool(
+                        result.get("raw_content", "")
+                        or result.get("content", "")
+                    )
+                    for result in results
+                )
+                _extract_vendor_drift = any(
+                    not result.get("error")
+                    and isinstance(result.get(EXTRACT_SERVED_BY_FIELD), str)
+                    and result[EXTRACT_SERVED_BY_FIELD] != provider.name
+                    for result in results
+                )
+                _extract_fallback_used = bool(
+                    _extract_fallback_used or _extract_vendor_drift
+                )
+                _extract_fallback_attempted = bool(
+                    _extract_fallback_attempted or _extract_fallback_used
+                )
+                if _extract_fetch_succeeded:
+                    _extract_network_retrieved_at = _search_provenance_now()
 
                 # Cache each successful fetch's full clean text for TTL reuse
                 # (best-effort; oversized pages are skipped by the cache).
@@ -1816,10 +2253,11 @@ async def web_extract_tool(
                 # vendor, not the chosen backend, and caching it would make
                 # the one-shot rescue sticky for a whole TTL — the next call
                 # must attempt the chosen backend again.
-                if not _extract_rescued:
-                    for fetched_pos, fetched in enumerate(results):
-                        if fetched_pos >= len(fetch_urls):
-                            break
+                if not (_extract_fallback_attempted or _extract_fallback_used):
+                    for requested_url in fetch_urls:
+                        fetched = fetched_results_by_identity[
+                            _extract_url_identity(requested_url)
+                        ]
                         if fetched.get("error"):
                             continue
                         _content = (
@@ -1827,48 +2265,44 @@ async def web_extract_tool(
                         )
                         if _content:
                             _extract_cache_put(
-                                fetch_urls[fetched_pos],
+                                requested_url,
                                 _content,
                                 title=fetched.get("title", ""),
                                 format=format,
                                 provider=provider.name,
+                                served_by=provider.name,
+                                retrieved_at=_extract_network_retrieved_at,
                             )
 
-                # Merge fetched results back with cache hits, restoring the
-                # safe_urls order the downstream reconstruction expects.
-                if cached_results:
-                    merged: List[Dict[str, Any]] = [None] * len(safe_urls)  # type: ignore[list-item]
-                    for position, hit in cached_results.items():
-                        merged[position] = hit
-                    for fetched_pos, position in enumerate(fetch_positions):
-                        merged[position] = (
-                            results[fetched_pos]
-                            if fetched_pos < len(results)
-                            else {
-                                "url": safe_urls[position],
-                                "title": "",
-                                "content": "",
-                                "error": "Extract backend returned no result for this URL",
-                            }
+                # Merge by canonical request identity only. Provider result
+                # order is not a contract (Parallel appends failures after
+                # successes), so positional assembly can cross-wire content.
+                safe_result_by_identity = dict(cached_results)
+                safe_result_by_identity.update(fetched_results_by_identity)
+                results = ExtractFailoverResults(
+                    [
+                        {
+                            **safe_result_by_identity[identity],
+                            "url": url,
+                        }
+                        for identity, url in zip(
+                            safe_identity_order, safe_urls
                         )
-                    results = merged
+                    ],
+                    fallback_attempted=_extract_fallback_attempted,
+                    fallback_used=_extract_fallback_used,
+                )
 
-        # Reconstruct the original input order across invalid, blocked, and
-        # provider-processed entries. Providers are expected to preserve the
-        # order of the safe URL list they receive.
+        # Reconstruct original input order across invalid, blocked, and
+        # provider-processed entries from the canonical URL map. Provider list
+        # position is never used as identity.
         if invalid_urls or ssrf_blocked:
             safe_results = {
-                index: (
-                    results[position]
-                    if position < len(results)
-                    else {
-                        "url": safe_urls[position],
-                        "title": "",
-                        "content": "",
-                        "error": "Extract backend returned no result for this URL",
-                    }
-                )
-                for position, index in enumerate(safe_indices)
+                index: {
+                    **safe_result_by_identity[_extract_url_identity(url)],
+                    "url": url,
+                }
+                for index, url in zip(safe_indices, safe_urls)
             }
             by_index = {**safe_results, **ssrf_blocked, **invalid_urls}
             results = [by_index[index] for index in range(len(urls))]
@@ -1924,10 +2358,33 @@ async def web_extract_tool(
             }
             for r in response.get("results", [])
         ]
-        trimmed_response = {"results": trimmed_results}
+        trimmed_response: Dict[str, Any] = {
+            "provenance": _build_extract_provenance(
+                response["results"],
+                requested_backend=_extract_requested_backend,
+                requested_count=_extract_requested_count,
+                cache_status=_extract_cache_status,
+                provider_call_attempted=_extract_provider_call_attempted,
+                fetch_succeeded=_extract_fetch_succeeded,
+                network_retrieved_at=_extract_network_retrieved_at,
+                fallback_attempted=_extract_fallback_attempted,
+                fallback_used=_extract_fallback_used,
+            ),
+            "results": trimmed_results,
+        }
 
         if trimmed_response.get("results") == []:
-            result_json = tool_error("Content was inaccessible or not found")
+            result_json = _extract_error_response(
+                "Content was inaccessible or not found",
+                requested_count=_extract_requested_count,
+                requested_backend=_extract_requested_backend,
+                cache_status=_extract_cache_status,
+                provider_call_attempted=_extract_provider_call_attempted,
+                fetch_succeeded=_extract_fetch_succeeded,
+                network_retrieved_at=_extract_network_retrieved_at,
+                fallback_attempted=_extract_fallback_attempted,
+                fallback_used=_extract_fallback_used,
+            )
         else:
             result_json = json.dumps(trimmed_response, indent=2, ensure_ascii=False)
 
@@ -1953,7 +2410,17 @@ async def web_extract_tool(
         _debug.log_call("web_extract_tool", debug_call_data)
         _debug.save()
         
-        return tool_error(error_msg)
+        return _extract_error_response(
+            error_msg,
+            requested_count=_extract_requested_count,
+            requested_backend=_extract_requested_backend,
+            cache_status=_extract_cache_status,
+            provider_call_attempted=_extract_provider_call_attempted,
+            fetch_succeeded=_extract_fetch_succeeded,
+            network_retrieved_at=_extract_network_retrieved_at,
+            fallback_attempted=_extract_fallback_attempted,
+            fallback_used=_extract_fallback_used,
+        )
 
 
 # Convenience function to check Firecrawl credentials
@@ -2157,7 +2624,7 @@ WEB_SEARCH_SCHEMA = {
 
 WEB_EXTRACT_SCHEMA = {
     "name": "web_extract",
-    "description": "Extract content from web page URLs. Returns clean page content in markdown/text (no LLM summarization — fast). Also works with PDF URLs (arxiv papers, documents) — pass the PDF link directly. Pages within the char budget (default 15000) return whole; larger pages return a head+tail window with a footer telling you the full text's saved file path and the read_file call to page through the omitted middle. Inline images appear as [IMAGE: alt] placeholders; real image URLs are kept as links. If a URL fails or times out, use the browser tool instead.",
+    "description": "Extract content from web page URLs. Returns clean page content in markdown/text (no LLM summarization — fast). Every normal or safety-error response begins with mandatory provenance naming the requested/serving backend, fallback attempt/use, cache state, whether a provider call was attempted, whether uncached content was fetched successfully, successful retrieval/serve times, and requested/returned/success/failure counts. Provenance never contains page URLs, content, or error text. Also works with PDF URLs (arxiv papers, documents) — pass the PDF link directly. Pages within the char budget (default 15000) return whole; larger pages return a head+tail window with a footer telling you the full text's saved file path and the read_file call to page through the omitted middle. Inline images appear as [IMAGE: alt] placeholders; real image URLs are kept as links. If a URL fails or times out, use the browser tool instead.",
     "parameters": {
         "type": "object",
         "properties": {
