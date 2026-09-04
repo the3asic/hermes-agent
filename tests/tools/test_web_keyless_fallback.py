@@ -60,6 +60,45 @@ def fresh_registry():
         registry._scoped_providers.update(saved_scoped)
 
 
+class _CapabilityProvider(WebSearchProvider):
+    """Available test provider with independently selectable capabilities."""
+
+    def __init__(self, name, *, search, extract):
+        self._name = name
+        self._supports_search = search
+        self._supports_extract = extract
+        self.search_calls = 0
+        self.extract_calls = 0
+
+    @property
+    def name(self):
+        return self._name
+
+    @property
+    def display_name(self):
+        return self._name.replace("-", " ").title()
+
+    def is_available(self):
+        return True
+
+    def supports_search(self):
+        return self._supports_search
+
+    def supports_extract(self):
+        return self._supports_extract
+
+    def search(self, query, limit=5):
+        self.search_calls += 1
+        return {"success": True, "data": {"web": []}}
+
+    async def extract(self, urls, **kwargs):
+        self.extract_calls += 1
+        return [
+            {"url": url, "title": "", "content": "body"}
+            for url in urls
+        ]
+
+
 # ---------------------------------------------------------------------------
 # keyless_mcp parsing
 # ---------------------------------------------------------------------------
@@ -174,34 +213,18 @@ class TestKeylessCalls:
 
 
 class TestProviderRouting:
+    @pytest.mark.parametrize("config_key", ["search_backend", "backend"])
     def test_search_capability_mismatch_does_not_call_available_fallback(
-        self, fresh_registry, monkeypatch
+        self, fresh_registry, monkeypatch, config_key
     ):
         """An extract-only selection errors by name and never calls Exa."""
-
-        class ExtractOnlyProvider(WebSearchProvider):
-            @property
-            def name(self):
-                return "extract-only"
-
-            @property
-            def display_name(self):
-                return "Extract Only"
-
-            def is_available(self):
-                return True
-
-            def supports_search(self):
-                return False
-
-            def supports_extract(self):
-                return True
-
-        fresh_registry.register_provider(ExtractOnlyProvider())
+        fresh_registry.register_provider(
+            _CapabilityProvider("extract-only", search=False, extract=True)
+        )
         monkeypatch.setattr(
             web_tools,
             "_load_web_config",
-            lambda: {"search_backend": "extract-only"},
+            lambda: {config_key: "extract-only"},
         )
         monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
         monkeypatch.setattr(
@@ -216,6 +239,71 @@ class TestProviderRouting:
         assert "Extract Only" in result["error"]
         assert "does not support web search" in result["error"]
         fallback_search.assert_not_called()
+
+    def test_search_no_config_mismatch_uses_capable_active_provider(
+        self, fresh_registry, monkeypatch
+    ):
+        """Autodetect skips an available extract-only custom provider."""
+        capable = _CapabilityProvider(
+            "zzz-search-only", search=True, extract=False
+        )
+        fresh_registry.register_provider(
+            _CapabilityProvider("aaa-extract-only", search=False, extract=True)
+        )
+        fresh_registry.register_provider(capable)
+        monkeypatch.setattr(web_tools, "_load_web_config", dict)
+        monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+        monkeypatch.setattr(registry, "_read_config_key", lambda *path: None)
+        monkeypatch.setattr(registry, "_keyless_tier_enabled", lambda: False)
+        monkeypatch.setattr(
+            "tools.tool_backend_helpers.selection_exists", lambda section: False
+        )
+        monkeypatch.setattr("tools.web_result_cache.cache_enabled", lambda: False)
+        monkeypatch.setattr(web_tools._debug, "log_call", lambda *args, **kwargs: None)
+        monkeypatch.setattr(web_tools._debug, "save", lambda: None)
+
+        result = json.loads(web_tools.web_search_tool("query", limit=1))
+
+        assert result["success"] is True
+        assert result["data"]["provenance"]["served_by"] == capable.name
+        assert capable.search_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_extract_no_config_mismatch_uses_capable_active_provider(
+        self, fresh_registry, monkeypatch
+    ):
+        """Autodetect skips an available search-only custom provider."""
+        capable = _CapabilityProvider(
+            "zzz-extract-only", search=False, extract=True
+        )
+        fresh_registry.register_provider(
+            _CapabilityProvider("aaa-search-only", search=True, extract=False)
+        )
+        fresh_registry.register_provider(capable)
+        monkeypatch.setattr(web_tools, "_load_web_config", dict)
+        monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+        monkeypatch.setattr(registry, "_read_config_key", lambda *path: None)
+        monkeypatch.setattr(registry, "_keyless_tier_enabled", lambda: False)
+        monkeypatch.setattr(
+            "tools.tool_backend_helpers.selection_exists", lambda section: False
+        )
+
+        async def _safe(_url):
+            return True
+
+        monkeypatch.setattr(web_tools, "async_is_safe_url", _safe)
+        monkeypatch.setattr("tools.web_result_cache.extract_cache_get", lambda *a, **k: None)
+        monkeypatch.setattr("tools.web_result_cache.extract_cache_put", lambda *a, **k: None)
+        monkeypatch.setattr("tools.website_policy.check_website_access", lambda url: None)
+        monkeypatch.setattr(web_tools._debug, "log_call", lambda *args, **kwargs: None)
+        monkeypatch.setattr(web_tools._debug, "save", lambda: None)
+
+        result = json.loads(
+            await web_tools.web_extract_tool(["https://example.com/page"])
+        )
+
+        assert result["results"][0]["content"] == "body"
+        assert capable.extract_calls == 1
 
     def test_parallel_keyless_path_when_no_key(self, monkeypatch):
         # Pin parallel so the ring deterministically starts there.
@@ -321,6 +409,21 @@ class TestProviderRouting:
 
 
 class TestResolutionOrder:
+    @pytest.mark.parametrize(
+        "config,capability,expected",
+        [
+            ({}, "search", False),
+            ({"extract_backend": "firecrawl"}, "search", False),
+            ({"search_backend": "searxng"}, "search", True),
+            ({"backend": "firecrawl"}, "search", True),
+        ],
+    )
+    def test_explicit_capability_selection_uses_current_or_shared_key(
+        self, monkeypatch, config, capability, expected
+    ):
+        monkeypatch.setattr(web_tools, "_load_web_config", lambda: config)
+        assert web_tools._has_explicit_capability_backend(capability) is expected
+
     def test_explicit_unknown_provider_fails_closed(self, fresh_registry, monkeypatch):
         """A stale/typoed selection must not be reported as another backend."""
         monkeypatch.setattr(

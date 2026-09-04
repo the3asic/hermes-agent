@@ -7,8 +7,8 @@ Covers:
   capabilities + ABC-derived defaults.
 - Each plugin's ``is_available()`` correctly reflects env-var presence.
 - The web_search_registry resolves an active provider in the documented
-  scenarios (explicit config wins ignoring availability, fallback walks
-  legacy preference filtered by availability, unknown name falls back).
+  scenarios (explicit config wins ignoring availability, unknown names fail
+  closed, and unconfigured installs autodetect by capability + availability).
 - Plugin response shapes match the legacy bit-for-bit contract.
 
 Per the dev skill: these tests use *real* imports from the plugin
@@ -286,6 +286,37 @@ class TestRegistryResolution:
         monkeypatch.setenv("EXA_API_KEY", "real")
         assert _resolve("not-a-real-provider", capability=capability) is None
 
+    @pytest.mark.parametrize("capability", ["search", "extract"])
+    def test_managed_nous_selection_resolves_to_firecrawl(
+        self, monkeypatch: pytest.MonkeyPatch, capability: str
+    ) -> None:
+        """The managed selection is an alias for Firecrawl, not an unknown."""
+        _ensure_plugins_loaded()
+        from agent import web_search_registry
+
+        monkeypatch.setattr(
+            web_search_registry,
+            "_read_config_key",
+            lambda *path: "nous"
+            if path == ("web", f"{capability}_backend")
+            else None,
+        )
+        monkeypatch.setattr(
+            "tools.tool_backend_helpers.read_selection",
+            lambda section: "nous",
+        )
+        monkeypatch.setattr(
+            "plugins.web.firecrawl.provider._is_tool_gateway_ready",
+            lambda: True,
+        )
+        getter = getattr(
+            web_search_registry, f"get_active_{capability}_provider"
+        )
+
+        result = getter()
+        assert result is not None
+        assert result.name == "firecrawl"
+        assert result.is_available() is True
 
     def test_no_config_no_credentials_returns_none(
         self,
@@ -323,4 +354,3 @@ class TestAsyncExtractDispatch:
 
 class TestErrorResponseShapes:
     """When credentials are missing, plugins return typed errors, not raises."""
-

@@ -204,6 +204,25 @@ def _keyless_preference() -> tuple:
     return _KEYLESS_PREFERENCE
 
 
+def _provider_name_for_selection(configured: Optional[str]) -> Optional[str]:
+    """Map a stored selection value to its registry provider name.
+
+    ``nous`` is a real, user-visible selection owned by the managed Tool
+    Gateway, but its web implementation is the registered ``firecrawl``
+    provider. Keep the stored value untouched so Firecrawl can still choose
+    its managed credential path via :func:`tools.tool_backend_helpers.read_selection`;
+    this normalization is local to registry lookup.
+    """
+    if not configured:
+        return configured
+
+    from tools.tool_backend_helpers import NOUS_MANAGED_PROVIDER
+
+    if configured.strip().lower() == NOUS_MANAGED_PROVIDER:
+        return "firecrawl"
+    return configured
+
+
 def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearchProvider]:
     """Resolve the active provider for a capability ("search" | "extract").
 
@@ -240,6 +259,8 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
     fallback walks. The dispatcher then returns the corresponding selection
     or setup error to the user.
     """
+    configured = _provider_name_for_selection(configured)
+
     with _lock:
         snapshot = dict(_providers)
         snapshot.update(_scoped_providers.get(hermes_home_key(), {}))
@@ -349,11 +370,11 @@ def _disabled_web_plugin_for(configured: Optional[str] = None, *, capability: Op
 
     Pass ``capability`` ("search" | "extract") to resolve the configured
     name straight from ``config.yaml`` (``web.<capability>_backend`` →
-    ``web.backend``). This is more reliable than the resolved backend the
-    dispatcher fell back to, since a disabled provider fails the
-    ``_is_backend_available`` gate and the dispatcher silently drops to
-    the shared default. An explicit ``configured`` name still wins when
-    given.
+    ``web.backend``). Looking up the stored selection matters because a
+    disabled provider never registers, so active-provider resolution can
+    only return ``None``. Managed ``nous`` selections are normalized to the
+    implementing ``firecrawl`` plugin for this diagnostic. An explicit
+    ``configured`` name still wins when given.
 
     Matching is by convention: bundled web plugins live under the
     ``web/<vendor>`` key with the provider ``name`` differing only in
@@ -373,7 +394,7 @@ def _disabled_web_plugin_for(configured: Optional[str] = None, *, capability: Op
     if not configured:
         return None
 
-    want = _norm(configured)
+    want = _norm(_provider_name_for_selection(configured) or "")
     try:
         from hermes_cli.plugins import get_plugin_manager
 

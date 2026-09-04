@@ -333,6 +333,21 @@ def _get_extract_backend() -> str:
     return _get_capability_backend("extract")
 
 
+def _has_explicit_capability_backend(capability: str) -> bool:
+    """Whether this capability has a direct or shared backend selection.
+
+    Per-capability selection must not be inferred from another capability's
+    key: ``web.extract_backend`` alone does not make an autodetected search
+    candidate explicit. This distinction lets a never-configured capability
+    continue through the registry's capability-aware autodetect walk.
+    """
+    cfg = _load_web_config()
+    return bool(
+        str(cfg.get(f"{capability}_backend") or "").strip()
+        or str(cfg.get("backend") or "").strip()
+    )
+
+
 def _get_capability_backend(capability: str) -> str:
     """Shared helper for per-capability backend selection.
 
@@ -1268,7 +1283,11 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         backend = _get_search_backend()
         provider = _wsp_get_provider(backend) if backend else None
         if provider is None or not provider.supports_search():
-            if provider is not None and not provider.supports_search():
+            if (
+                provider is not None
+                and not provider.supports_search()
+                and _has_explicit_capability_backend("search")
+            ):
                 error_text = (
                     f"{provider.display_name} does not support web search. "
                     "Set web.search_backend to a search-capable provider."
@@ -1622,13 +1641,18 @@ async def web_extract_tool(
 
             provider = _wsp_get_provider(backend) if backend else None
             if provider is None or not provider.supports_extract():
-                # When the configured name IS registered but doesn't support
-                # extract (search-only providers like brave-free / ddgs /
-                # searxng), surface that as a typed "search-only" error
-                # rather than silently switching backends. When the name
-                # isn't registered at all (typo / uninstalled plugin), fall
-                # through to the active-provider walk.
-                if provider is not None and not provider.supports_extract():
+                # When an explicitly configured name is registered but does
+                # not support extract (search-only providers like brave-free /
+                # ddgs / searxng), surface a typed error. An autodetected
+                # capability mismatch instead continues through the registry's
+                # capability-aware provider walk. An unregistered name (typo /
+                # unloaded plugin) is handled by the strict-selection check
+                # below.
+                if (
+                    provider is not None
+                    and not provider.supports_extract()
+                    and _has_explicit_capability_backend("extract")
+                ):
                     return json.dumps(
                         {
                             "success": False,
@@ -1646,7 +1670,7 @@ async def web_extract_tool(
                     selection_exists,
                 )
 
-                if backend and selection_exists("web"):
+                if provider is None and backend and selection_exists("web"):
                     # Strict selection: a stored-but-unregistered backend
                     # errors by name instead of silently switching to
                     # whatever the availability walk finds.
