@@ -12,7 +12,7 @@ Hermes Agent includes two model-callable web tools backed by multiple providers:
 - **`web_search`** — search the web and return ranked results
 - **`web_extract`** — fetch and extract readable content from one or more URLs
 
-Both are configured through a single backend selection. Providers are chosen via `hermes tools` or set directly in `config.yaml`.
+Providers are chosen via `hermes tools` or set directly in `config.yaml`; search and extract can use separate backends.
 
 ## Backends
 
@@ -40,6 +40,20 @@ A fresh install with **no web credentials at all** gets working `web_search` and
 :::tip Nous Subscribers
 If you have a paid [Nous Portal](https://portal.nousresearch.com) subscription, web search and extract are available through the **[Tool Gateway](tool-gateway.md)** via managed Firecrawl — no API key needed. New installs can run `hermes setup --portal` to log in and turn on all gateway tools at once; existing installs can flip just web via `hermes tools`.
 :::
+
+---
+
+## What a `web_search` success proves
+
+Every well-formed success emitted by Hermes' client-function `web_search` wrapper contains a core-owned `data.provenance` block before `data.web`. It identifies the requested and serving backends, whether `served_by` was provider-reported or defaulted, fallback use, retrieval/serve times, Hermes process-cache status and key scope, result counts, and evidence limitations.
+
+Scope matters: when an xAI Responses inference session selects xAI search, Hermes uses xAI's provider-executed native search instead of the client function. That server-side surface does not emit a Hermes tool-result envelope and therefore has no `data.provenance` block.
+
+This is metadata about a top-N search response, not proof that a snippet is current or correct and not evidence that Hermes fetched the linked page. Bare provider claims named `confidence`, `fresh`, `current`, `verified`, or `authoritative` are removed throughout the successful provider payload. An upstream cache timestamp is exposed only when it is a supported timezone-qualified RFC 3339 date-time. Malformed values become `null` with an explicit invalid status; valid RFC 3339 leap-second notation is also `null` but is reported separately as unsupported, not invalid.
+
+`result_set_truncated` reports only whether Hermes sliced its bucketed provider response to the caller's limit. It does not say whether the upstream index has more results. Malformed provider successes fail closed, are not cached, and receive no provenance. Existing failure envelopes remain unchanged and do not receive the success-only block.
+
+The wrapper-generated `web_search` object is self-consistent at this boundary. A configured `transform_tool_result` plugin remains trusted, high-privilege middleware and can intentionally replace it—for example, to redact secrets or PII. Hermes logs a warning for a non-equivalent successful-search rewrite, but preserves the documented hook behavior; after that point the plugin owns the relationship between transformed results and provenance. Use `web_extract` and inspect the primary source when the factual claim itself matters.
 
 ---
 
@@ -71,6 +85,8 @@ Repeat web calls within a short window are served from cache instead of the paid
 | `web_extract` — same URL, same format, same provider | Full text stored under `~/.hermes/cache/web/` | Shared across CLI, gateway, cron, and subagent processes |
 
 Concurrent identical searches (a parallel subagent fan-out firing the same query at once) are **coalesced into a single backend request** — the first caller pays; the rest share the response. Requested search limits are bucketed up to 10/20/50/100 so near-identical requests (`limit=5` vs `limit=8`) share one entry, with each caller receiving its requested count.
+
+The search-cache key contains only provider name, normalized query, and bucketed limit. It does **not** include credential identity, locale, or provider configuration; each successful response discloses those omissions in `data.provenance.cache`.
 
 Only successful responses are cached. Failures always retry the backend, responses served by the one-shot keyless rescue are never cached (the next call attempts your chosen backend again), and URLs matched by your `security.website_blocklist` are never served from cache. Cached extracts re-run the normal truncation pipeline, so a different `char_limit` on the second call works off the same stored scrape.
 

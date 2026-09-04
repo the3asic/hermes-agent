@@ -440,7 +440,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 |---|---|---|---|---|
 | [`pre_tool_call`](#pre_tool_call) | Directive/control | Once before execution; first valid `block` or `approve` directive wins, and `modify` returns are shallow-merged into the tool arguments. | `tool_name`, `args`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `middleware_trace` | Raw arguments may contain user content, paths, commands, or secrets. |
 | `post_tool_call` | Observer | After blocked, error, or successful result; return ignored. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message`, `middleware_trace` | Result/error text may contain arbitrary tool or user content and secrets. |
-| `transform_tool_result` | Transform | After `post_tool_call`, before conversation append; first string replaces the result. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message` | Exposes the full model-bound result and arguments. |
+| `transform_tool_result` | Transform | After `post_tool_call`, before conversation append; first accepted string replaces the result. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message` | Exposes the full model-bound result and arguments. A non-equivalent rewrite of successful `web_search` JSON is accepted but logged because wrapper provenance may no longer describe it. |
 | `transform_terminal_output` | Transform | After bounded foreground process capture, before final output limiting; first string replaces output. | `command`, `output`, `returncode`, `task_id`, `env_type` | Command/output may contain credentials. |
 | `pre_transcription` | Transform | Fired by the STT dispatcher after provider resolution and before any backend (built-in, command-type, or plugin-registered) is invoked; dict results are applied in registration order, last-writer-wins per field (`prompt`, `language`, `model`; `file_path` is read-only). | `file_path`, `provider`, `model`, `language`, `prompt`, `source` | The final prompt is uploaded to the configured STT provider with the audio — keep secrets out of hook returns. |
 | `pre_llm_call` | Directive/control | Once per turn before the loop; all valid string/`{"context": ...}` returns are joined and injected into the user message. | `session_id`, `task_id`, `turn_id`, `user_message`, `conversation_history`, `is_first_turn`, `model`, `platform`, `parent_session_id`, `sender_id` | Full user message and conversation history. |
@@ -1419,7 +1419,9 @@ def my_callback(tool_name: str, args: dict, result: str, task_id: str, **kwargs)
 
 The full payload also includes `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, and `error_message`. `result` is the final result returned by tool dispatch; it and `args` can contain arbitrary user/tool content and secrets.
 
-**Return value:** The first `str` replaces the result (including an empty string); `None` leaves it unchanged.
+**Return value:** The first accepted `str` replaces the result (including an empty string); `None` leaves it unchanged.
+
+For a successful structured `web_search`, Hermes logs a warning when the replacement is not semantically equivalent JSON. The replacement still wins: this hook is trusted, high-privilege middleware and may be required for secret or PII redaction. After such a rewrite, the plugin owns the relationship between the transformed result and its provenance; the original wrapper contract no longer describes the model-bound string automatically.
 
 **Use cases:** Redact organization-specific PII from `web_extract` output, wrap long JSON tool responses in a summary header, inject retrieval-augmented hints into `read_file` results, rewrite `delegate_task` subagent reports into a project-specific schema.
 
@@ -1436,7 +1438,7 @@ def register(ctx):
     ctx.register_hook("transform_tool_result", redact_secrets)
 ```
 
-Applies to every tool. For terminal-only rewriting see `transform_terminal_output` below — it is narrower, runs before `transform_tool_result`, and its replacement is still subject to the terminal tool's final output limit.
+Runs for every tool. For terminal-only rewriting see `transform_terminal_output` below — it is narrower, runs before `transform_tool_result`, and its replacement is still subject to the terminal tool's final output limit.
 
 ---
 

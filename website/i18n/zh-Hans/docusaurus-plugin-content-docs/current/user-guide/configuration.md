@@ -1495,11 +1495,11 @@ code_execution:
 
 ## Web 搜索后端
 
-`web_search` 和 `web_extract` 工具支持五种后端 provider。在 `config.yaml` 中或通过 `hermes tools` 配置后端：
+`web_search` 和 `web_extract` 共用八个 plugin 后端（其中部分仅支持搜索）。在 `config.yaml` 中或通过 `hermes tools` 配置：
 
 ```yaml
 web:
-  backend: firecrawl    # firecrawl | searxng | parallel | tavily | exa
+  backend: firecrawl    # firecrawl | searxng | brave-free | ddgs | parallel | keenable | exa | xai
 
   # 或使用每功能键混合 provider（例如免费搜索 + 付费提取）：
   search_backend: "searxng"
@@ -1510,11 +1510,14 @@ web:
 |---------|---------|--------|---------|
 | **Firecrawl**（默认） | `FIRECRAWL_API_KEY` | ✔ | ✔ |
 | **SearXNG** | `SEARXNG_URL` | ✔ | — |
-| **Parallel** | `PARALLEL_API_KEY` | ✔ | ✔ |
-| **Tavily** | `TAVILY_API_KEY` | ✔ | ✔ |
-| **Exa** | `EXA_API_KEY` | ✔ | ✔ |
+| **Brave Search（免费层级）** | `BRAVE_SEARCH_API_KEY` | ✔ | — |
+| **DDGS (DuckDuckGo)** | — | ✔ | — |
+| **Parallel** | `PARALLEL_API_KEY`（可选 keyless） | ✔ | ✔ |
+| **Keenable** | `KEENABLE_API_KEY`（可选 keyless） | ✔ | ✔ |
+| **Exa** | `EXA_API_KEY`（可选 keyless） | ✔ | ✔ |
+| **xAI (Grok)** | `XAI_API_KEY` 或 xAI OAuth | ✔ | — |
 
-**后端选择：** 如果未设置 `web.backend`，后端从可用的 API 密钥自动检测。如果仅设置了 `SEARXNG_URL`，使用 SearXNG。如果仅设置了 `EXA_API_KEY`，使用 Exa。如果仅设置了 `TAVILY_API_KEY`，使用 Tavily。如果仅设置了 `PARALLEL_API_KEY`，使用 Parallel。否则 Firecrawl 是默认值。
+**后端选择：** 运行时优先使用 `hermes tools` 写入的 `web.backend`（或按能力设置的 `web.search_backend` / `web.extract_backend`）。只有从未保存过选择时才按现有凭证自动检测；没有选择也没有任何凭证时，Exa / Parallel / Firecrawl / Keenable 的 keyless ring 会轮转服务。xAI 不参加自动检测，必须显式选择。
 
 **SearXNG** 是一个免费、自托管、尊重隐私的元搜索引擎，查询 70+ 个搜索引擎。无需 API 密钥 —— 只需将 `SEARXNG_URL` 设置为您的实例（例如 `http://localhost:8080`）。SearXNG 仅限搜索；`web_extract` 需要单独的提取 provider（设置 `web.extract_backend`）。Docker 设置说明请参阅 [Web 搜索设置指南](/user-guide/features/web-search)。
 

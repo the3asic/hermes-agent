@@ -105,6 +105,22 @@ def test_search_memo_never_caches_failures():
     assert memo.lookup("firecrawl", "q", 5) is None
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"success": "true", "data": {"web": []}},
+        {"success": 1, "data": {"web": []}},
+        {"success": True, "data": None},
+        {"success": True, "data": {"web": "not-a-list"}},
+        {"success": True, "data": {"web": ["not-an-object"]}},
+    ],
+)
+def test_search_memo_never_caches_malformed_success(response):
+    memo = SearchMemo()
+    memo.store("firecrawl", "q", 5, response)
+    assert memo.lookup("firecrawl", "q", 5) is None
+
+
 def test_search_memo_disabled_by_config(monkeypatch):
     monkeypatch.setattr(wrc, "_web_config", lambda: {"cache_enabled": False})
     memo = SearchMemo()
@@ -168,10 +184,12 @@ def test_search_memo_strips_dynamic_but_preserves_provider_provenance():
         "transformations": ["snippet_normalized"],
         "provider_extension": {"method": "organic"},
         "requested_backend": "spoofed",
+        "served_by_source": "spoofed",
         "retrieved_at": "stale",
         "served_at": "stale",
         "cache": {"status": "miss"},
         "upstream_cache_timestamp_status": "spoofed",
+        "result_set_truncation_scope": "spoofed",
     }
     memo.store_with_metadata(
         "serper", "q", 5, response, retrieved_at="2026-09-03T15:04:09Z"
@@ -259,7 +277,7 @@ def _assert_utc_iso(value):
     assert parsed.utcoffset().total_seconds() == 0
 
 
-def test_web_search_success_injects_authoritative_provenance_before_results(
+def test_web_search_success_injects_core_provenance_before_results(
     monkeypatch,
 ):
     response = _ok_response()
@@ -278,11 +296,30 @@ def test_web_search_success_injects_authoritative_provenance_before_results(
             "retrieved_at": "spoofed",
             "served_at": "spoofed",
             "cache": {"status": "hit"},
+            "confidence": 0.99,
+            "verified": True,
+            " Fresh ": True,
+            "current": True,
+            "authoritative": True,
+            "my_backend_relevance_score": 0.91,
             "provider_extension": "kept",
         },
         "served_by": "parallel",
+        "verified": True,
+        "nested": {
+            "fresh": True,
+            "provider_confidence": 0.82,
+            "items": [
+                {" Current ": True, "my_verified_state": "reported"}
+            ],
+        },
+        "tuple_meta": ({"confidence": 0.71, "provider_confidence": 0.72},),
         "web": _ok_response()["data"]["web"],
     }
+    response["confidence"] = 0.5
+    response["provider_confidence"] = 0.7
+    response["data"]["web"][0]["authoritative"] = True
+    response["data"]["web"][0]["source_verified_state"] = "unknown"
     provider = _FakeSearchProvider(response)
     web_tools = _install_search_provider(monkeypatch, provider)
 
@@ -292,6 +329,7 @@ def test_web_search_success_injects_authoritative_provenance_before_results(
     provenance = out["data"]["provenance"]
     assert provenance["requested_backend"] == "serper"
     assert provenance["served_by"] == "parallel"
+    assert provenance["served_by_source"] == "provider_reported"
     assert provenance["fallback_used"] is True
     _assert_utc_iso(provenance["retrieved_at"])
     _assert_utc_iso(provenance["served_at"])
@@ -300,6 +338,14 @@ def test_web_search_success_injects_authoritative_provenance_before_results(
         "status": "miss",
         "age_seconds": None,
         "ttl_seconds": 1200.0,
+        "key_dimensions": [
+            "provider_name",
+            "normalized_query",
+            "bucketed_limit",
+        ],
+        "credential_identity_in_key": False,
+        "locale_in_key": False,
+        "provider_configuration_in_key": False,
     }
     assert provenance["evidence_scope"] == "search_result_metadata_only"
     assert provenance["page_fetched"] is False
@@ -308,6 +354,10 @@ def test_web_search_success_injects_authoritative_provenance_before_results(
     assert provenance["fetched_result_count"] == 10
     assert provenance["returned_count"] == 3
     assert provenance["result_set_truncated"] is True
+    assert (
+        provenance["result_set_truncation_scope"]
+        == "hermes_bucket_slice_only"
+    )
     assert provenance["upstream_cache_timestamp"] is None
     assert (
         provenance["upstream_cache_timestamp_status"]
@@ -320,14 +370,69 @@ def test_web_search_success_injects_authoritative_provenance_before_results(
         "upstream_cache_time_not_reported",
     }
     assert len(provenance["limitations"]) == 4
-    assert provenance["transformations"] == ["snippet_normalized", "limit_slice"]
+    assert provenance["transformations"] == [
+        "snippet_normalized",
+        "limit_slice",
+        "provider_self_certification_fields_omitted",
+    ]
     assert provenance["engine"] == "google"
     assert provenance["source_date_kind"] == "mixed"
     assert (
         provenance["source_date_kind_status"] == "inferred_from_google_serp"
     )
     assert provenance["provider_extension"] == "kept"
+    assert provenance["my_backend_relevance_score"] == 0.91
+    forbidden = {
+        "confidence",
+        "fresh",
+        "current",
+        "verified",
+        "authoritative",
+    }
+
+    def keys_in(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                yield key
+                yield from keys_in(item)
+        elif isinstance(value, list):
+            for item in value:
+                yield from keys_in(item)
+
+    assert not forbidden.intersection(
+        key.strip().casefold()
+        for key in keys_in(out)
+        if isinstance(key, str)
+    )
+    assert out["provider_confidence"] == 0.7
+    assert out["data"]["nested"]["provider_confidence"] == 0.82
+    assert out["data"]["nested"]["items"][0]["my_verified_state"] == "reported"
+    assert out["data"]["tuple_meta"] == [{"provider_confidence": 0.72}]
+    assert out["data"]["web"][0]["source_verified_state"] == "unknown"
     assert len(out["data"]["web"]) == 3
+
+
+def test_web_search_namespaced_truth_metrics_do_not_claim_omission(monkeypatch):
+    response = _ok_response(1)
+    response["provider_confidence"] = 0.7
+    response["data"]["provenance"] = {
+        "provider_confidence": 0.8,
+        "my_verified_state": "reported",
+    }
+    response["data"]["web"][0]["source_current_state"] = "unknown"
+    provider = _FakeSearchProvider(response)
+    web_tools = _install_search_provider(monkeypatch, provider)
+
+    out = json.loads(web_tools.web_search_tool("namespaced metrics", limit=1))
+    provenance = out["data"]["provenance"]
+
+    assert out["provider_confidence"] == 0.7
+    assert provenance["provider_confidence"] == 0.8
+    assert provenance["my_verified_state"] == "reported"
+    assert out["data"]["web"][0]["source_current_state"] == "unknown"
+    assert "provider_self_certification_fields_omitted" not in provenance[
+        "transformations"
+    ]
 
 
 def test_web_search_defaults_non_null_upstream_timestamp_to_reported(monkeypatch):
@@ -347,7 +452,75 @@ def test_web_search_defaults_non_null_upstream_timestamp_to_reported(monkeypatch
     assert "upstream_cache_time_not_reported" not in provenance["limitations"]
 
 
-@pytest.mark.parametrize("invalid_timestamp", ["", "   ", 0, {"at": "now"}])
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        "2026-09-03T15:00:00.123+08:00",
+        "2026-09-03t15:00:00z",
+    ],
+)
+def test_web_search_accepts_timezone_qualified_rfc3339_timestamps(
+    monkeypatch, timestamp
+):
+    response = _ok_response(1)
+    response["data"]["provenance"] = {
+        "upstream_cache_timestamp": timestamp,
+    }
+    provider = _FakeSearchProvider(response)
+    web_tools = _install_search_provider(monkeypatch, provider)
+
+    out = json.loads(web_tools.web_search_tool("rfc3339 timestamp", limit=1))
+    provenance = out["data"]["provenance"]
+
+    assert provenance["upstream_cache_timestamp"] == timestamp
+    assert provenance["upstream_cache_timestamp_status"] == "reported_in_response"
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        "1990-12-31T23:59:60Z",
+        "1990-12-31T15:59:60-08:00",
+    ],
+)
+def test_web_search_reports_rfc3339_leap_seconds_as_unsupported(
+    monkeypatch, timestamp
+):
+    response = _ok_response(1)
+    response["data"]["provenance"] = {
+        "upstream_cache_timestamp": timestamp,
+    }
+    provider = _FakeSearchProvider(response)
+    web_tools = _install_search_provider(monkeypatch, provider)
+
+    out = json.loads(web_tools.web_search_tool("leap second", limit=1))
+    provenance = out["data"]["provenance"]
+
+    assert provenance["upstream_cache_timestamp"] is None
+    assert (
+        provenance["upstream_cache_timestamp_status"]
+        == "reported_unsupported_rfc3339_leap_second"
+    )
+    assert (
+        "upstream_cache_timestamp_unsupported_rfc3339_leap_second"
+        in provenance["limitations"]
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid_timestamp",
+    [
+        "",
+        "   ",
+        0,
+        {"at": "now"},
+        "yesterday",
+        "2026-09-03T15:00:00",
+        "2026-13-03T15:00:00Z",
+        "2026-09-03 15:00:00Z",
+        "2026-09-03T15:00:61Z",
+    ],
+)
 def test_web_search_normalizes_invalid_upstream_timestamp_to_null(
     monkeypatch, invalid_timestamp
 ):
@@ -364,9 +537,13 @@ def test_web_search_normalizes_invalid_upstream_timestamp_to_null(
     assert provenance["upstream_cache_timestamp"] is None
     assert (
         provenance["upstream_cache_timestamp_status"]
-        == "not_reported_in_response"
+        == "reported_invalid_rfc3339"
     )
-    assert "upstream_cache_time_not_reported" in provenance["limitations"]
+    assert (
+        "upstream_cache_timestamp_invalid_rfc3339"
+        in provenance["limitations"]
+    )
+    assert "upstream_cache_time_not_reported" not in provenance["limitations"]
 
 
 def test_web_search_derives_status_from_timestamp_not_provider_claim(
@@ -413,6 +590,14 @@ def test_web_search_cache_hit_preserves_retrieval_time_and_recomputes_age(
         "status": "hit",
         "age_seconds": 10.0,
         "ttl_seconds": 1200.0,
+        "key_dimensions": [
+            "provider_name",
+            "normalized_query",
+            "bucketed_limit",
+        ],
+        "credential_identity_in_key": False,
+        "locale_in_key": False,
+        "provider_configuration_in_key": False,
     }
     assert second_provenance["retrieved_at"] == first_provenance["retrieved_at"]
     assert second_provenance["served_at"] != first_provenance["served_at"]
@@ -435,9 +620,17 @@ def test_web_search_cache_disabled_is_bypass_and_does_not_store(
     for out in (first, second):
         assert out["data"]["provenance"]["cache"] == {
             "layer": "hermes_process_memory",
-            "status": "bypass",
-            "age_seconds": None,
-            "ttl_seconds": None,
+                "status": "bypass",
+                "age_seconds": None,
+                "ttl_seconds": None,
+                "key_dimensions": [
+                    "provider_name",
+                    "normalized_query",
+                    "bucketed_limit",
+                ],
+                "credential_identity_in_key": False,
+                "locale_in_key": False,
+                "provider_configuration_in_key": False,
         }
 
 
@@ -467,12 +660,21 @@ def test_web_search_successful_rescue_is_fallback_bypass_and_not_cached(
         provenance = out["data"]["provenance"]
         assert provenance["requested_backend"] == "serper"
         assert provenance["served_by"] == "parallel"
+        assert provenance["served_by_source"] == "provider_reported"
         assert provenance["fallback_used"] is True
         assert provenance["cache"] == {
             "layer": "hermes_process_memory",
-            "status": "bypass",
-            "age_seconds": None,
-            "ttl_seconds": None,
+                "status": "bypass",
+                "age_seconds": None,
+                "ttl_seconds": None,
+                "key_dimensions": [
+                    "provider_name",
+                    "normalized_query",
+                    "bucketed_limit",
+                ],
+                "credential_identity_in_key": False,
+                "locale_in_key": False,
+                "provider_configuration_in_key": False,
         }
 
 
@@ -487,6 +689,63 @@ def test_web_search_failure_keeps_legacy_error_shape_without_provenance(
 
     assert out == {"success": False, "error": "backend down"}
     assert provider.calls == 1
+
+
+def test_web_search_failure_with_non_mapping_data_keeps_provider_envelope(
+    monkeypatch,
+):
+    response = {"success": False, "error": "backend down", "data": None}
+    provider = _FakeSearchProvider(response)
+    web_tools = _install_search_provider(monkeypatch, provider)
+    monkeypatch.setattr(web_tools, "_rescue_eligible", lambda candidate: False)
+
+    out = json.loads(web_tools.web_search_tool("failure", limit=2))
+
+    assert out == response
+    assert provider.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("response", "error_fragment"),
+    [
+        ({"success": "true", "data": {"web": []}}, "JSON boolean"),
+        ({"success": 1, "data": {"web": []}}, "JSON boolean"),
+        ({"data": {"web": []}}, "JSON boolean"),
+        ({"success": True, "data": None}, "object at 'data'"),
+        ({"success": True, "data": {"web": None}}, "list at 'data.web'"),
+        (
+            {"success": True, "data": {"web": ["not-an-object"]}},
+            "every 'data.web' item",
+        ),
+        (
+            {"success": True, "data": {"web": [], "score": float("nan")}},
+            "JSON-compatible",
+        ),
+        ([{"success": True}], "expected an object"),
+    ],
+)
+def test_web_search_malformed_success_fails_closed_and_is_not_cached(
+    monkeypatch, response, error_fragment
+):
+    provider = _FakeSearchProvider(response)
+    web_tools = _install_search_provider(monkeypatch, provider)
+    monkeypatch.setattr(web_tools, "_rescue_eligible", lambda candidate: True)
+    monkeypatch.setattr(
+        web_tools,
+        "_rescue_search",
+        lambda *args, **kwargs: pytest.fail(
+            "a malformed success must fail closed, not enter rescue"
+        ),
+    )
+
+    first = json.loads(web_tools.web_search_tool("malformed", limit=2))
+    second = json.loads(web_tools.web_search_tool("malformed", limit=2))
+
+    for out in (first, second):
+        assert out["success"] is False
+        assert error_fragment in out["error"]
+        assert "data" not in out
+    assert provider.calls == 2
 
 
 def test_web_search_single_flight_waiter_is_reported_as_cache_hit(monkeypatch):

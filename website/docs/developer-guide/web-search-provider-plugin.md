@@ -169,7 +169,11 @@ Providers can advertise multiple capabilities from a single class — Firecrawl,
 
 ## Response shape
 
-Providers return a compact, fixed envelope so the tool wrapper does not have to translate between backends. The wrapper adds a mandatory `data.provenance` block to every successful `web_search` response. A provider does not need to construct the wrapper-owned fields itself.
+Providers return a compact, fixed envelope so the tool wrapper does not have to translate between backends. The client-function wrapper adds a mandatory `data.provenance` block to every successful `web_search` response it handles. A provider does not need to construct the wrapper-owned fields itself.
+
+This contract belongs specifically to `tools.web_tools.web_search_tool`. When an xAI Responses inference session selects xAI search, the transport swaps that client function for xAI's provider-executed native `web_search`; no Hermes function-result envelope exists on that separate surface, so it does not carry this provenance block.
+
+The boundary is fail-closed: `success` must be the literal JSON boolean `true` or `false`. A successful response must contain an object at `data`, a list at `data.web`, and only result objects inside that list. A malformed “success” is returned as a bounded failure, is not cached, and never receives provenance.
 
 **Provider search success:**
 
@@ -199,6 +203,9 @@ Providers return a compact, fixed envelope so the tool wrapper does not have to 
         "provenance": {
             "requested_backend": str,
             "served_by": str,
+            "served_by_source": (
+                "provider_reported" | "requested_backend_default"
+            ),
             "fallback_used": bool,
             "retrieved_at": str,        # UTC ISO-8601; original retrieval time
             "served_at": str,           # UTC ISO-8601; this response time
@@ -207,6 +214,12 @@ Providers return a compact, fixed envelope so the tool wrapper does not have to 
                 "status": "hit" | "miss" | "bypass",
                 "age_seconds": float | None,
                 "ttl_seconds": float | None,
+                "key_dimensions": [
+                    "provider_name", "normalized_query", "bucketed_limit"
+                ],
+                "credential_identity_in_key": False,
+                "locale_in_key": False,
+                "provider_configuration_in_key": False,
             },
             "evidence_scope": "search_result_metadata_only",
             "page_fetched": False,
@@ -215,9 +228,13 @@ Providers return a compact, fixed envelope so the tool wrapper does not have to 
             "fetched_result_count": int,
             "returned_count": int,
             "result_set_truncated": bool,
+            "result_set_truncation_scope": "hermes_bucket_slice_only",
             "upstream_cache_timestamp": str | None,
             "upstream_cache_timestamp_status": (
-                "reported_in_response" | "not_reported_in_response"
+                "reported_in_response" |
+                "not_reported_in_response" |
+                "reported_invalid_rfc3339" |
+                "reported_unsupported_rfc3339_leap_second"
             ),
             "limitations": list[str],
             "transformations": list[str],
@@ -228,20 +245,24 @@ Providers return a compact, fixed envelope so the tool wrapper does not have to 
 }
 ```
 
-The wrapper owns routing, timing, Hermes' process-memory cache state, evidence scope, and result counts. It overwrites those fields even if a provider supplies values for them. On a cache hit, `retrieved_at` remains the time of the original provider response while `served_at` records the current tool response; `cache.age_seconds` is calculated with a monotonic clock. `fetched_result_count` is the number returned for Hermes' bucketed provider request, while `returned_count` is the caller-visible count after the requested limit is applied. `result_set_truncated` reports that Hermes slice only; it does not claim the upstream result set was exhaustive.
+The wrapper owns routing, timing, Hermes' process-memory cache state, evidence scope, and result counts. It overwrites those fields even if a provider supplies values for them. `served_by_source` says whether `served_by` came from the provider's legacy `data.served_by` field or defaulted to the selected provider name. On a cache hit, `retrieved_at` remains the time of the original provider response while `served_at` records the current tool response; `cache.age_seconds` is calculated with a monotonic clock.
+
+The search memo key contains only provider name, normalized query, and bucketed limit. Credential identity, locale, and provider configuration are not key dimensions; the fixed boolean fields in `cache` disclose those omissions on every success. `fetched_result_count` is the number returned for Hermes' bucketed provider request, while `returned_count` is the caller-visible count after the requested limit is applied. `result_set_truncated` and `result_set_truncation_scope="hermes_bucket_slice_only"` report only that Hermes slice; they do not claim the upstream result set was exhaustive.
 
 Providers may add stable facts that come directly from their own configuration, documented API semantics, or the upstream response:
 
 - Engine identity, such as `engine`.
 - Explicit source-date semantics, such as `source_date_kind` and `source_date_kind_status`. Document the provider-specific values you use.
-- An exact `upstream_cache_timestamp`, but only if the upstream response reports one. Providers must not set `upstream_cache_timestamp_status`; Hermes derives it from the normalized timestamp. A non-empty string produces `"reported_in_response"`; a missing, empty, or non-string timestamp becomes `None` with `"not_reported_in_response"`.
+- An exact `upstream_cache_timestamp`, but only if the upstream response reports a timezone-qualified RFC 3339 date-time. Providers must not set `upstream_cache_timestamp_status`; Hermes validates the value and derives the status. A supported non-leap-second timestamp produces `"reported_in_response"`; a missing or null value becomes `None` with `"not_reported_in_response"`; malformed values become `None` with `"reported_invalid_rfc3339"`. RFC 3339 leap-second notation is valid but not supported by Hermes' parser, so it becomes `None` with `"reported_unsupported_rfc3339_leap_second"` rather than being called invalid. Rejected values include an explicit limitation.
 - `limitations` and `transformations`. Hermes merges these lists with its own values in stable order and removes duplicates.
 
 Other provider-owned, non-core provenance keys are preserved. Provider values never override the core fields shown above.
 
 :::warning
-Do not infer freshness or authority. Providers must not emit bare `confidence`, `fresh`, `current`, `verified`, or `authoritative` claims. Hermes deliberately does not rely on an incomplete blacklist to sanitize arbitrary plugin claims, so this is a provider contract, not a post-processing promise. If the upstream explicitly reports a related metric, keep the exact fact under a provider-namespaced key (for example, `my_backend_relevance_score`) and document its semantics instead of normalizing it into one of those labels. Do not turn a relative result date into a guessed publication timestamp, invent an upstream crawl/cache time, or describe a top-N response as complete. `description` remains search-result metadata, not fetched page text; use `web_extract` when page content is required.
+Do not infer freshness or authority. Hermes recursively removes case-insensitive bare `confidence`, `fresh`, `current`, `verified`, and `authoritative` keys throughout the provider-owned successful payload and records that omission in `transformations`. If the upstream explicitly reports a related metric, keep the exact fact under a provider-namespaced key (for example, `my_backend_relevance_score`) and document its semantics instead of normalizing it into one of those labels. This fixed guard matches exact keys only; it is not a general semantic judge for arbitrary extension names. Do not turn a relative result date into a guessed publication timestamp, invent an upstream crawl/cache time, or describe a top-N response as complete. `description` remains search-result metadata, not fetched page text; use `web_extract` when page content is required.
 :::
+
+The generic `transform_tool_result` hook remains trusted, high-privilege middleware for every tool. If it returns a non-equivalent replacement for a successful structured `web_search`, Hermes accepts the replacement to preserve redaction and plugin compatibility, and logs that the wrapper truth contract no longer describes the model-bound output. A transforming plugin must preserve or recompute provenance for the result it emits.
 
 **Extract success:**
 
@@ -270,7 +291,7 @@ Do not infer freshness or authority. Providers must not emit bare `confidence`, 
 
 Failed `web_search` responses intentionally retain this existing envelope and do not receive `data.provenance`.
 
-Both `search()` and `extract()` may be `async def` — the dispatcher detects coroutine functions via `inspect.iscoroutinefunction` and awaits accordingly. Sync implementations that do blocking I/O (HTTP, SDK calls) are fine for small backends; the dispatcher handles threading. The mandatory provenance contract applies to every successful `web_search` response; `web_extract` keeps the extract envelope above.
+Both `search()` and `extract()` may be `async def` — the dispatcher detects coroutine functions via `inspect.iscoroutinefunction` and awaits accordingly. Sync implementations that do blocking I/O (HTTP, SDK calls) are fine for small backends; the dispatcher handles threading. The mandatory provenance contract applies to every well-formed success emitted by Hermes' client-function wrapper; `web_extract` keeps the extract envelope above.
 
 ## Capability flags
 
@@ -295,8 +316,9 @@ The `web_search` and `web_extract` tools live in `tools/web_tools.py`. At call t
 2. Ask the registry for the provider with that `name`
 3. Check `is_available()` and the matching `supports_*()` flag
 4. Dispatch to `search()` / `extract()` (deep crawl runs as a mode inside `extract()`), awaiting if the method is a coroutine
-5. Add the mandatory provenance contract to every successful `web_search` response
-6. JSON-serialize the response envelope and hand it back to the LLM
+5. Validate the strict success/data/web envelope and cache only valid successes
+6. Add the mandatory provenance contract to every valid successful `web_search` response
+7. JSON-serialize the response envelope; the generic transform hook cannot rewrite a successful search into a different value
 
 Errors surface as the tool result; the LLM decides how to explain them. If no provider is registered (or every available one fails the capability gate), the tool returns a helpful error pointing at `hermes tools`.
 

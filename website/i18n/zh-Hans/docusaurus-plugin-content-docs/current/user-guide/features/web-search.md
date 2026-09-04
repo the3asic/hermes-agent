@@ -12,28 +12,42 @@ Hermes Agent 内置两个可供模型调用的网页工具，由多个提供商�
 - **`web_search`** — 搜索网页并返回排序结果
 - **`web_extract`** — 从一个或多个 URL 获取并提取可读内容
 
-两者均通过单一后端选择进行配置。提供商可通过 `hermes tools` 选择，或直接在 `config.yaml` 中设置。
+提供商可通过 `hermes tools` 选择，或直接在 `config.yaml` 中设置；搜索和提取可以分别使用不同后端。
 
 ## 后端
 
 | 提供商 | 环境变量 | 搜索 | 提取 | 免费层级 |
 |----------|---------|--------|---------|-----------|
-| **Firecrawl**（默认） | `FIRECRAWL_API_KEY` | ✔ | ✔ | 500 积分/月 |
+| **Firecrawl**（默认） | `FIRECRAWL_API_KEY`（选择后可无密钥） | ✔ | ✔ | 500 积分/月 · 可选 keyless cloud |
 | **SearXNG** | `SEARXNG_URL` | ✔ | — | ✔ 免费（自托管） |
 | **Brave Search（免费层级）** | `BRAVE_SEARCH_API_KEY` | ✔ | — | 2 000 次查询/月 |
 | **DDGS (DuckDuckGo)** | —（无需密钥） | ✔ | — | ✔ 免费 |
-| **Tavily** | `TAVILY_API_KEY` | ✔ | ✔ | 1 000 次搜索/月 |
-| **Exa** | `EXA_API_KEY` | ✔ | ✔ | 1 000 次搜索/月 |
-| **Parallel** | `PARALLEL_API_KEY` | ✔ | ✔ | 付费 |
-| **xAI (Grok)** | `XAI_API_KEY` 或 `hermes auth login xai-oauth` | ✔ | — | 付费（SuperGrok 或按 token 计费） |
+| **Exa** | `EXA_API_KEY`（可选） | ✔ | ✔ | keyless ring 成员 · 有密钥时按套餐 |
+| **Parallel** | `PARALLEL_API_KEY`（可选） | ✔ | ✔ | keyless ring 成员 · 有密钥时付费 |
+| **Keenable** | `KEENABLE_API_KEY`（可选） | ✔ | ✔ | keyless ring 成员 · 有密钥时付费 |
+| **xAI (Grok)** | `XAI_API_KEY` 或 `hermes auth add xai-oauth` | ✔ | — | 付费（SuperGrok 或按 token 计费） |
 
-Brave Search、DDGS 和 xAI 均为**仅搜索**——如果同时需要 `web_extract`，可将其中任意一个与 Firecrawl/Tavily/Exa/Parallel 配合使用。DDGS 底层使用 [`ddgs` Python 包](https://pypi.org/project/ddgs/)；若尚未安装，请运行 `pip install ddgs`（或让 Hermes 在首次使用时懒加载安装）。xAI 通过 Responses API 运行 Grok 服务端的 `web_search` 工具——结果由 LLM 生成而非基于索引，因此标题、描述和 URL 选择均为模型输出（参见下方[信任模型说明](#xai-grok)）。
+Brave Search、DDGS 和 xAI 均为**仅搜索**——如果同时需要 `web_extract`，可将其中任意一个与 Firecrawl/Keenable/Exa/Parallel 配合使用。DDGS 底层使用 [`ddgs` Python 包](https://pypi.org/project/ddgs/)；若尚未安装，请运行 `pip install ddgs`（或让 Hermes 在首次使用时懒加载安装）。xAI 通过 Responses API 运行 Grok 服务端的 `web_search` 工具——结果由 LLM 生成而非基于索引，因此标题、描述和 URL 选择均为模型输出（参见下方[信任模型说明](#xai-grok)）。
 
 **按能力拆分：** 搜索和提取可分别使用不同的提供商——例如搜索使用 SearXNG（免费），提取使用 Firecrawl。详见下方[按能力配置](#per-capability-configuration)。
 
 :::tip Nous 订阅用户
 如果您拥有付费 [Nous Portal](https://portal.nousresearch.com) 订阅，网页搜索和提取可通过 **[Tool Gateway](tool-gateway.md)** 使用托管的 Firecrawl——无需 API 密钥。新安装可运行 `hermes setup --portal` 登录并一次性开启所有 gateway 工具；现有安装可通过 `hermes tools` 单独开启网页功能。
 :::
+
+---
+
+## 成功的 `web_search` 到底证明了什么
+
+每个由 Hermes client-function `web_search` wrapper 输出、且格式正确的 success，都会在 `data.web` 前包含由 Core 固定生成的 `data.provenance`。它说明请求与实际服务后端、`served_by` 是 provider 上报还是按请求后端默认、是否 fallback、检索与返回时间、Hermes 进程缓存状态和 key 范围、结果计数及证据局限。
+
+范围边界：xAI Responses 推理会话选择 xAI 搜索时，Hermes 使用由 xAI provider 在服务端执行的原生 search，而不是 client function。这个独立表面没有 Hermes tool-result envelope，因此也没有 `data.provenance`。
+
+这些只是 top-N 搜索结果的元数据，不证明摘要当前或正确，也不代表 Hermes 抓取了链接页面。provider 成功 payload 全树中裸露的 `confidence`、`fresh`、`current`、`verified`、`authoritative` 自证字段都会被移除。上游缓存时间只有在它是 Hermes 支持的带时区 RFC 3339 date-time 时才会透传；格式错误的值会变成 `null` 并明确标为 invalid。RFC 3339 的 leap-second 写法本身有效，但 Hermes parser 不支持，因此也会变成 `null`，并单独标为 unsupported，而不是误称 invalid。
+
+`result_set_truncated` 只表示 Hermes 是否把 bucket 响应切到调用者要求的 limit，不表示上游索引没有更多结果。格式错误的 provider success 会 fail closed、不进缓存、也不会注入 provenance。既有 failure envelope 保持兼容，不获得只属于成功响应的 provenance。
+
+wrapper 生成的 `web_search` 对象在这个边界上自洽。已配置的 `transform_tool_result` plugin 仍是受信任的高权限 middleware，可以为了 secret 或 PII 脱敏而主动替换它。成功搜索被不等价改写时 Hermes 会告警，但仍保留既有 hook 行为；此后由 plugin 自己保证转换结果与 provenance 的关系。事实结论重要时，继续用 `web_extract` 并检查原始来源。
 
 ---
 
@@ -208,23 +222,23 @@ SearXNG 负责搜索；`web_extract` 需要单独的提供商。使用按能力�
 # ~/.hermes/config.yaml
 web:
   search_backend: "searxng"
-  extract_backend: "firecrawl"   # 或 tavily、exa、parallel
+  extract_backend: "firecrawl"   # 或 keenable、exa、parallel
 ```
 
 使用此配置，Hermes 对所有搜索查询使用 SearXNG，对 URL 提取使用 Firecrawl——将免费搜索与高质量提取相结合。
 
 ---
 
-### Tavily
+### Keenable
 
-针对 AI 优化的搜索和提取，免费层级慷慨。
+提供搜索和提取，可使用匿名 keyless 层，也可以配置付费 API key。
 
 ```bash
 # ~/.hermes/.env
-TAVILY_API_KEY=tvly-your-key-here
+KEENABLE_API_KEY=your-keenable-key-here
 ```
 
-在 [app.tavily.com](https://app.tavily.com/home) 获取密钥。免费层级包含每月 1 000 次搜索。
+在 [keenable.ai](https://keenable.ai) 获取密钥，或在 `hermes tools` 中选择 Free (keyless)。
 
 ---
 
@@ -268,7 +282,7 @@ XAI_API_KEY=sk-xai-your-key-here
 或对于 SuperGrok 订阅用户：
 
 ```bash
-hermes auth login xai-oauth
+hermes auth add xai-oauth
 ```
 
 然后选择 xAI 作为搜索后端：
@@ -293,10 +307,10 @@ web:
     timeout: 90                  # 秒（默认）
 ```
 
-**仅搜索**——如果同时需要 `web_extract`，请与 Firecrawl / Tavily / Exa / Parallel 配合使用。遇到 401 时，提供商会执行一次强制 OAuth token 刷新并重试（覆盖窗口中途吊销和主动过期检查无法解码的不透明 token）；环境变量凭证跳过重试。
+**仅搜索**——如果同时需要 `web_extract`，请与 Firecrawl / Keenable / Exa / Parallel 配合使用。遇到 401 时，提供商会执行一次强制 OAuth token 刷新并重试（覆盖窗口中途吊销和主动过期检查无法解码的不透明 token）；环境变量凭证跳过重试。
 
 :::caution 信任模型
-与基于索引的提供商（Brave、Tavily、Exa）返回逐字搜索引擎结果不同，xAI 是由 LLM 选择要呈现的 URL 并自行撰写标题和描述。查询的*内容*会影响输出，因此恶意构造的查询（例如通过 agent 获取的不可信上游输入注入）原则上可以引导 Grok 输出攻击者指定的 URL。对返回的 URL 应与对待任何模型生成链接一样——在获取前进行验证，尤其是当查询来自不可信输入时。
+与基于索引的提供商（Brave、Keenable、Exa）返回搜索索引结果不同，xAI 是由 LLM 选择要呈现的 URL 并自行撰写标题和描述。查询的*内容*会影响输出，因此恶意构造的查询（例如通过 agent 获取的不可信上游输入注入）原则上可以引导 Grok 输出攻击者指定的 URL。对返回的 URL 应与对待任何模型生成链接一样——在获取前进行验证，尤其是当查询来自不可信输入时。
 :::
 
 ---
@@ -310,7 +324,7 @@ web:
 ```yaml
 # ~/.hermes/config.yaml
 web:
-  backend: "searxng"   # firecrawl | searxng | brave-free | ddgs | tavily | exa | parallel | xai
+  backend: "searxng"   # firecrawl | searxng | brave-free | ddgs | keenable | exa | parallel | xai
 ```
 
 ### 按能力配置 {#per-capability-configuration}
@@ -339,7 +353,7 @@ web:
 |--------------------|-----------------------|
 | `FIRECRAWL_API_KEY` 或 `FIRECRAWL_API_URL` | firecrawl |
 | `PARALLEL_API_KEY` | parallel |
-| `TAVILY_API_KEY` | tavily |
+| `KEENABLE_API_KEY` | keenable |
 | `EXA_API_KEY` | exa |
 | `SEARXNG_URL` | searxng |
 
@@ -387,7 +401,7 @@ SearXNG 无法提取 URL 内容。将 `web.extract_backend` 设置为支持提�
 ```yaml
 web:
   search_backend: "searxng"
-  extract_backend: "firecrawl"  # 或 tavily / exa / parallel
+  extract_backend: "firecrawl"  # 或 keenable / exa / parallel
 ```
 
 ### SearXNG 返回 0 条结果

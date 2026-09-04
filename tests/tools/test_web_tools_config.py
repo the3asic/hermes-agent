@@ -455,6 +455,7 @@ class TestWebSearchSchema:
                 "provenance": {
                     "requested_backend": "parallel",
                     "served_by": "parallel",
+                    "served_by_source": "requested_backend_default",
                     "fallback_used": False,
                     "retrieved_at": "2026-09-03T15:04:09Z",
                     "served_at": "2026-09-03T15:04:10Z",
@@ -463,6 +464,14 @@ class TestWebSearchSchema:
                         "status": "bypass",
                         "age_seconds": None,
                         "ttl_seconds": None,
+                        "key_dimensions": [
+                            "provider_name",
+                            "normalized_query",
+                            "bucketed_limit",
+                        ],
+                        "credential_identity_in_key": False,
+                        "locale_in_key": False,
+                        "provider_configuration_in_key": False,
                     },
                     "evidence_scope": "search_result_metadata_only",
                     "page_fetched": False,
@@ -471,6 +480,9 @@ class TestWebSearchSchema:
                     "fetched_result_count": 0,
                     "returned_count": 0,
                     "result_set_truncated": False,
+                    "result_set_truncation_scope": (
+                        "hermes_bucket_slice_only"
+                    ),
                     "upstream_cache_timestamp": None,
                     "upstream_cache_timestamp_status": (
                         "not_reported_in_response"

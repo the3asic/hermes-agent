@@ -2364,11 +2364,11 @@ Environment scrubbing (strips `*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, 
 
 ## Web Search Backends
 
-The `web_search` and `web_extract` tools support five backend providers. Configure the backend in `config.yaml` or via `hermes tools`:
+The `web_search` and `web_extract` tools share eight plugin backends (some are search-only). Configure them in `config.yaml` or via `hermes tools`:
 
 ```yaml
 web:
-  backend: firecrawl    # firecrawl | searxng | parallel | keenable | exa
+  backend: firecrawl    # firecrawl | searxng | brave-free | ddgs | parallel | keenable | exa | xai
 
   # Or use per-capability keys to mix providers (e.g. free search + paid extract):
   search_backend: "searxng"
@@ -2396,8 +2396,12 @@ web:
 |---------|---------|--------|---------|
 | **Firecrawl** (default) | `FIRECRAWL_API_KEY` | ✔ | ✔ |
 | **SearXNG** | `SEARXNG_URL` | ✔ | — |
+| **Brave Search (free tier)** | `BRAVE_SEARCH_API_KEY` | ✔ | — |
+| **DDGS (DuckDuckGo)** | — | ✔ | — |
 | **Parallel** | `PARALLEL_API_KEY` (optional — keyless free tier) | ✔ | ✔ |
+| **Keenable** | `KEENABLE_API_KEY` (optional — keyless free tier) | ✔ | ✔ |
 | **Exa** | `EXA_API_KEY` (optional — keyless free tier) | ✔ | ✔ |
+| **xAI (Grok)** | `XAI_API_KEY` or xAI OAuth | ✔ | — |
 
 **Backend selection:** The runtime always uses the stored `web.backend` selection (set via `hermes tools`; `nous` routes through the managed Tool Gateway). Only if no web backend has ever been selected is one auto-detected from available API keys: if only `SEARXNG_URL` is set, SearXNG is used; if only `EXA_API_KEY` is set, Exa; if only `PARALLEL_API_KEY` is set, Parallel; if only `KEENABLE_API_KEY` is set, Keenable. With **no selection and no credentials at all**, requests rotate round-robin across the keyless free-tier ring (Exa / Parallel / Firecrawl / Keenable) with automatic next-in-line failover on rate limits — see the [Web Search guide](/user-guide/features/web-search) for details. Once a selection exists, adding a key to `.env` does not change the route. Selecting Firecrawl or Keenable in `hermes tools` also works without a key.
 

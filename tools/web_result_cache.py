@@ -7,7 +7,9 @@ Two caches, both TTL-bounded (default 20 minutes, ``web.cache_ttl_minutes``):
   the first caller performs the paid request while the rest wait and share
   the response. Requested limits are bucketed up to 10/20/50/100 so
   near-identical requests (limit=5 vs limit=8) share one entry; callers get
-  their requested count sliced from the bucket.
+  their requested count sliced from the bucket. Credential identity, locale,
+  and provider configuration are deliberately not key dimensions; the final
+  provenance block discloses those omissions.
 
 * **Extract cache** — disk-backed, cross-process. Reuses the existing
   ``cache/web`` full-text store (the same files the truncate-store footer
@@ -103,6 +105,7 @@ _RUNTIME_PROVENANCE_FIELDS = frozenset(
     {
         "requested_backend",
         "served_by",
+        "served_by_source",
         "fallback_used",
         "retrieved_at",
         "served_at",
@@ -114,6 +117,7 @@ _RUNTIME_PROVENANCE_FIELDS = frozenset(
         "fetched_result_count",
         "returned_count",
         "result_set_truncated",
+        "result_set_truncation_scope",
         "upstream_cache_timestamp_status",
     }
 )
@@ -236,7 +240,13 @@ class SearchMemo:
         """Cache a successful response and return its immutable timing facts."""
         if not cache_enabled():
             return None
-        if not isinstance(response, dict) or not response.get("success"):
+        if not isinstance(response, dict) or response.get("success") is not True:
+            return None
+        data = response.get("data")
+        web = data.get("web") if isinstance(data, dict) else None
+        if not isinstance(web, list) or any(
+            not isinstance(item, dict) for item in web
+        ):
             return None
         key = self._key(provider, query, limit)
         stored_monotonic = time.monotonic()

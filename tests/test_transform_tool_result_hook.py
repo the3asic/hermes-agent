@@ -5,6 +5,7 @@ Mirrors the ``transform_terminal_output`` hook tests from Phase 1 but
 targets the generic tool-result seam that runs for every tool dispatch.
 """
 
+import json
 import os
 from pathlib import Path
 
@@ -63,6 +64,110 @@ def test_first_valid_string_return_replaces_result(monkeypatch):
         invoke_hook=lambda hook_name, **kw: [None, {"x": 1}, "first", "second"],
     )
     assert out == "first"
+
+
+def test_web_search_success_accepts_truth_contract_rewrite_with_warning(
+    monkeypatch, caplog
+):
+    original = json.dumps(
+        {
+            "success": True,
+            "data": {
+                "provenance": {
+                    "requested_backend": "serper",
+                    "served_by": "serper",
+                    "returned_count": 1,
+                },
+                "web": [{"url": "https://example.com"}],
+            },
+        }
+    )
+    out = _run_handle_function_call(
+        monkeypatch,
+        tool_name="web_search",
+        dispatch_result=original,
+        invoke_hook=lambda hook_name, **kw: [
+            '{"success": true, "data": {"web": []}}'
+        ]
+        if hook_name == "transform_tool_result"
+        else [],
+    )
+
+    assert json.loads(out) == {"success": True, "data": {"web": []}}
+    assert "truth contract no longer describes" in caplog.text
+
+
+def test_web_search_success_accepts_semantically_identical_json_without_warning(
+    monkeypatch, caplog
+):
+    original = (
+        '{"success":true,"data":{"provenance":{"served_by":"serper"},'
+        '"web":[]}}'
+    )
+    reformatted = json.dumps(json.loads(original), indent=2, sort_keys=True)
+    out = _run_handle_function_call(
+        monkeypatch,
+        tool_name="web_search",
+        dispatch_result=original,
+        invoke_hook=lambda hook_name, **kw: [reformatted]
+        if hook_name == "transform_tool_result"
+        else [],
+    )
+
+    assert out == reformatted
+    assert "truth contract no longer describes" not in caplog.text
+
+
+def test_web_search_success_accepts_json_number_type_change_with_warning(
+    monkeypatch, caplog
+):
+    original = (
+        '{"success":true,"data":{"provenance":{"returned_count":1},'
+        '"web":[{"position":1}]}}'
+    )
+    candidate = original.replace('"returned_count":1', '"returned_count":1.0')
+    out = _run_handle_function_call(
+        monkeypatch,
+        tool_name="web_search",
+        dispatch_result=original,
+        invoke_hook=lambda hook_name, **kw: [candidate]
+        if hook_name == "transform_tool_result"
+        else [],
+    )
+
+    assert out == candidate
+    assert "truth contract no longer describes" in caplog.text
+
+
+def test_web_search_duplicate_json_keys_are_treated_as_changed(
+    monkeypatch, caplog
+):
+    original = '{"success":true,"data":{"web":[]}}'
+    candidate = '{"success":false,"success":true,"data":{"web":[]}}'
+    out = _run_handle_function_call(
+        monkeypatch,
+        tool_name="web_search",
+        dispatch_result=original,
+        invoke_hook=lambda hook_name, **kw: [candidate]
+        if hook_name == "transform_tool_result"
+        else [],
+    )
+
+    assert out == candidate
+    assert "truth contract no longer describes" in caplog.text
+
+
+def test_web_search_failure_remains_transformable(monkeypatch):
+    out = _run_handle_function_call(
+        monkeypatch,
+        tool_name="web_search",
+        dispatch_result='{"success": false, "error": "down"}',
+        invoke_hook=lambda hook_name, **kw: ["redacted failure"]
+        if hook_name == "transform_tool_result"
+        else [],
+    )
+
+    assert out == "redacted failure"
 
 
 def test_hook_receives_expected_kwargs(monkeypatch):

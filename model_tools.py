@@ -61,6 +61,71 @@ def suppress_post_tool_call_hook():
 _WARNED_DISABLED_BUNDLES: set = set()
 
 
+def _same_json_value(left: Any, right: Any) -> bool:
+    """Deep JSON equality that does not conflate booleans/ints/floats."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _same_json_value(value, right[key]) for key, value in left.items()
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _same_json_value(a, b) for a, b in zip(left, right)
+        )
+    return left == right
+
+
+def _load_strict_json(value: str) -> Any:
+    """Decode standard JSON and reject duplicate object keys."""
+
+    def _object_without_duplicates(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON object key: {key!r}")
+            result[key] = item
+        return result
+
+    def _reject_nonstandard_constant(constant):
+        raise ValueError(f"non-standard JSON constant: {constant}")
+
+    return json.loads(
+        value,
+        object_pairs_hook=_object_without_duplicates,
+        parse_constant=_reject_nonstandard_constant,
+    )
+
+
+def _web_search_transform_changes_success_result(
+    original: Any,
+    candidate: str,
+) -> bool:
+    """Detect a high-privilege rewrite of successful ``web_search`` JSON.
+
+    ``transform_tool_result`` is a documented replacement hook and may be used
+    for mandatory redaction, so Hermes must not silently disable it.  A
+    non-equivalent rewrite does, however, move the output beyond the wrapper's
+    truth-contract boundary; warn operators without changing the hook result.
+    """
+    try:
+        original_json = (
+            _load_strict_json(original) if isinstance(original, str) else original
+        )
+    except (TypeError, ValueError):
+        return False
+    if (
+        not isinstance(original_json, dict)
+        or original_json.get("success") is not True
+    ):
+        return False
+    try:
+        candidate_json = _load_strict_json(candidate)
+    except (TypeError, ValueError):
+        return True
+    return not _same_json_value(candidate_json, original_json)
+
+
 def _is_delegated_child_context() -> bool:
     try:
         from agent.delegation_context import is_delegated_child_context
@@ -1626,6 +1691,16 @@ def handle_function_call(
                 )
                 for hook_result in hook_results:
                     if isinstance(hook_result, str):
+                        if function_name == "web_search" and (
+                            _web_search_transform_changes_success_result(
+                                result, hook_result
+                            )
+                        ):
+                            logger.warning(
+                                "transform_tool_result rewrote a successful "
+                                "web_search result; the wrapper truth contract "
+                                "no longer describes the model-bound output"
+                            )
                         result = hook_result
                         break
         except Exception as _hook_err:

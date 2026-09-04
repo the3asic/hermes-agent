@@ -12,13 +12,15 @@ Providers live in ``<repo>/plugins/web/<name>/`` (built-in, auto-loaded as
 ``kind: backend``) or ``~/.hermes/plugins/web/<name>/`` (user, opt-in via
 ``plugins.enabled``).
 
-This ABC is the SINGLE plugin-facing surface for web providers — every
-provider in the tree (brave-free, ddgs, searxng, exa, parallel, keenable,
-firecrawl) implements it. The legacy in-tree ``tools.web_providers.base``
+This ABC is the SINGLE plugin-facing surface for web providers — all eight
+providers in the tree (brave-free, ddgs, searxng, exa, parallel, keenable,
+firecrawl, xai) implement it. The legacy in-tree ``tools.web_providers.base``
 ABCs were deleted in PR #25182 along with the per-vendor inline helpers
 in ``tools/web_tools.py``. Providers keep the compact response contract
 documented below; the tool wrapper adds Hermes-owned request provenance to
-every successful ``web_search`` response before it reaches the model.
+every successful client-function ``web_search`` response it handles before it
+reaches the model. xAI's provider-executed native Responses tool is a separate
+surface and does not emit this client-function envelope.
 
 Provider response shape:
 
@@ -42,12 +44,16 @@ Search results::
 ``data.provenance`` is optional at the provider boundary. Providers may put
 only facts they can obtain directly from the upstream response there, such as
 the engine identity, source-date semantics, an exact upstream cache timestamp,
-and provider-side transformations or limitations. Hermes overwrites routing,
-timestamps, process-cache state, scope, and result counts at the wrapper. Do
-not infer or emit bare ``confidence``, ``fresh``, ``current``, ``verified``,
-or ``authoritative`` claims. If an upstream response explicitly reports a
-related metric, preserve it under a provider-namespaced key and document its
-exact semantics.
+and provider-side transformations or limitations. An
+``upstream_cache_timestamp`` must be a timezone-qualified RFC 3339 date-time;
+Hermes explicitly reports leap-second notation as unsupported rather than
+misclassifying it as an ordinary timestamp.
+Hermes validates this boundary and overwrites routing, timestamps,
+process-cache state, scope, and result counts at the wrapper. Bare
+``confidence``, ``fresh``, ``current``, ``verified``, or ``authoritative``
+keys are recursively removed from the successful provider payload; if an
+upstream response explicitly reports a related metric, preserve it under a
+provider-namespaced key and document its exact semantics.
 
 Extract results::
 
@@ -181,21 +187,21 @@ class WebSearchProvider(abc.ABC):
         raises NotImplementedError; callers should gate on
         :meth:`supports_search` before calling.
 
-        Every successful ``web_search`` provider response must contain
+        Every successful client-function ``web_search`` provider response must contain
         ``data.web``. It may also contain provider-owned static facts under
         ``data.provenance``. The wrapper injects the complete request-time
-        truth contract into every successful ``web_search`` response and gives
+        truth contract into every successful response it handles and gives
         its dynamic fields precedence. Provider ``limitations`` and
         ``transformations`` are merged with wrapper-owned values without
         duplicates; other non-core fields such as ``engine`` and explicit
-        source-date semantics are preserved. A provider may supply
+        source-date semantics are preserved. A provider may supply an RFC 3339
         ``upstream_cache_timestamp`` when the upstream response reports one;
-        Hermes alone derives ``upstream_cache_timestamp_status`` from the
-        normalized timestamp.
+        Hermes validates its supported non-leap-second form and alone derives
+        ``upstream_cache_timestamp_status``.
 
-        Providers must not guess freshness or authority. In particular, do
-        not emit bare ``confidence``, ``fresh``, ``current``, ``verified``, or
-        ``authoritative`` claims. An explicitly reported upstream metric
+        Providers must not guess freshness or authority. Hermes recursively removes bare
+        ``confidence``, ``fresh``, ``current``, ``verified``, or
+        ``authoritative`` keys from the successful payload. An explicitly reported upstream metric
         belongs under a provider-namespaced key whose semantics the plugin
         documents.
         """
