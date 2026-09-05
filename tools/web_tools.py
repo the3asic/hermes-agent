@@ -42,6 +42,12 @@ import asyncio
 from datetime import datetime
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 import httpx  # noqa: F401 — kept at module top so tests can patch tools.web_tools.httpx
+from plugins.web.keyless_mcp import (
+    interrupted_extract_results,
+    is_extract_refusal,
+    web_interruptible,
+    web_is_interrupted,
+)
 # After the web-provider plugin migration (PR #25182), the Firecrawl SDK
 # proxy, client construction, and response-shape normalizers all live in
 # plugins.web.firecrawl.provider. We re-export the names that external
@@ -194,9 +200,10 @@ def _reconcile_extract_results(
             candidates.append(_extract_url_identity(result_url))
         metadata = raw_result.get("metadata")
         if isinstance(metadata, dict):
-            source_url = metadata.get("sourceURL")
-            if isinstance(source_url, str) and source_url.strip():
-                candidates.append(_extract_url_identity(source_url))
+            for source_key in ("sourceURL", "source_url"):
+                source_url = metadata.get(source_key)
+                if isinstance(source_url, str) and source_url.strip():
+                    candidates.append(_extract_url_identity(source_url))
         candidate_identities = set(candidates)
         if len(candidate_identities) != 1:
             invalid_mapping = True
@@ -600,7 +607,7 @@ def _rescue_eligible(provider) -> bool:
     went through the keyless ring (its failure means the ring was walked;
     re-walking would just repeat it).
     """
-    if not _keyless_rescue_enabled():
+    if web_is_interrupted() or not _keyless_rescue_enabled():
         return False
     if provider is None:
         return False
@@ -641,11 +648,19 @@ def _rescue_search(provider_name: str, original_error: str, query: str, limit: i
     """
     from plugins.web.keyless_mcp import search_with_failover
 
+    if web_is_interrupted() or is_extract_refusal({"error": original_error}):
+        return {"success": False, "error": "Interrupted" if web_is_interrupted() else original_error}
+
     logger.warning(
         "web_search backend '%s' failed (%s); one-shot keyless rescue",
         provider_name, (original_error or "")[:200],
     )
     rescued = search_with_failover(provider_name, query, limit)
+    if web_is_interrupted() or is_extract_refusal(rescued):
+        return {
+            "success": False,
+            "error": "Interrupted" if web_is_interrupted() else rescued.get("error", "Request refused"),
+        }
     if rescued.get("success"):
         data = rescued.setdefault("data", {})
         data["rescued_from"] = provider_name
@@ -667,16 +682,6 @@ def _rescue_search(provider_name: str, original_error: str, query: str, limit: i
     }
 
 
-def _policy_blocked_result(result: dict) -> bool:
-    """True when an extract result failed because of the user's website
-    policy — an intentional refusal, never a backend outage. Policy blocks
-    must NOT be rescued: routing the same URL through the keyless ring
-    would fetch content the user explicitly blocked."""
-    if result.get("blocked_by_policy"):
-        return True
-    return "blocked by website policy" in str(result.get("error") or "").lower()
-
-
 def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
     """One-shot keyless-ring rescue for a failed keyed/configured extract.
 
@@ -684,9 +689,8 @@ def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
     results are page problems and pass through untouched. Stateless —
     the next web_extract call attempts the chosen backend again.
 
-    Website-policy refusals are intentional, not failures: entries flagged
-    by ``_policy_blocked_result`` are never re-fetched through the ring and
-    their original (blocked) results are preserved verbatim.
+    Cancellation, website-policy and security refusals are intentional, not
+    outages. They are never re-fetched, and completed pages are preserved.
     """
     from plugins.web.keyless_mcp import ExtractFailoverResults, extract_with_failover
 
@@ -698,12 +702,24 @@ def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
         # Never route it elsewhere and risk accepting content for the wrong URL.
         return aligned
 
+    if web_is_interrupted():
+        return ExtractFailoverResults(interrupted_extract_results(urls, aligned))
+    if any(
+        result.get("interrupted")
+        or "interrupted" in str(result.get("error") or "").lower()
+        for result in aligned
+    ):
+        # A provider may observe cancellation before the originating thread's
+        # bit is visible here. Its explicit stop still ends the whole batch.
+        return ExtractFailoverResults(aligned)
+
     # Partition by canonical request identity. Rescue only genuine backend
     # failures; website-policy refusals remain untouched.
     rescue_urls = [
         url
         for url in urls
-        if not _policy_blocked_result(
+        if original_by_identity[_extract_url_identity(url)].get("error")
+        and not is_extract_refusal(
             original_by_identity[_extract_url_identity(url)]
         )
     ]
@@ -746,9 +762,14 @@ def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
     rescued_errors = [r.get("error", "") for r in rescued]
     if rescued and all(e for e in rescued_errors):
         # Rescue was genuinely attempted but failed everywhere. Keep the
-        # selected provider's more useful errors without losing attempt state.
+        # selected provider's errors, except that a later refusal must survive.
+        preserved = dict(original_by_identity)
+        preserved.update({
+            identity: row for identity, row in rescued_by_identity.items()
+            if is_extract_refusal(row)
+        })
         return ExtractFailoverResults(
-            aligned,
+            [preserved[_extract_url_identity(url)] for url in urls],
             fallback_attempted=True,
             fallback_used=False,
         )
@@ -1508,6 +1529,7 @@ def _extract_error_response(
     return json.dumps(payload, ensure_ascii=False)
 
 
+@web_interruptible
 def web_search_tool(query: str, limit: int = 5) -> str:
     """
     Search through the configured backend and return result metadata.
@@ -1604,8 +1626,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
     }
     
     try:
-        from tools.interrupt import is_interrupted
-        if is_interrupted():
+        if web_is_interrupted():
             return tool_error("Interrupted", success=False)
 
         # Dispatch through the web search registry. All 8 providers
@@ -1718,10 +1739,14 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             def _paid_search() -> tuple[dict, bool, str]:
                 _fetch_limit = _bucket_limit(limit)
                 _rescued = False
+                if web_is_interrupted():
+                    return {"success": False, "error": "Interrupted"}, False, ""
                 try:
                     _resp = provider.search(query, _fetch_limit)
                 except Exception as exc:  # noqa: BLE001 — candidate for rescue
-                    if _rescue_eligible(provider):
+                    if web_is_interrupted():
+                        _resp = {"success": False, "error": "Interrupted"}
+                    elif not is_extract_refusal({"error": str(exc)}) and _rescue_eligible(provider):
                         _rescued = True
                         _resp = _rescue_search(
                             provider.name, str(exc), query, _fetch_limit
@@ -1729,9 +1754,12 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                     else:
                         raise
                 else:
+                    if web_is_interrupted():
+                        _resp = {"success": False, "error": "Interrupted"}
                     if (
                         isinstance(_resp, dict)
                         and _resp.get("success") is False
+                        and not is_extract_refusal(_resp)
                         and _rescue_eligible(provider)
                     ):
                         # One-shot keyless rescue: THIS call rides the
@@ -1847,6 +1875,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         return tool_error(error_msg)
 
 
+@web_interruptible
 async def web_extract_tool(
     urls: List[Any],
     format: str = None,
@@ -1892,6 +1921,11 @@ async def web_extract_tool(
     _extract_network_retrieved_at = ""
     _extract_fallback_attempted = False
     _extract_fallback_used = False
+    if web_is_interrupted():
+        return _extract_error_response(
+            "Interrupted", requested_count=_extract_requested_count,
+            success_false=True,
+        )
 
     # Block URLs containing embedded secrets (exfiltration prevention).
     # URL-decode first so percent-encoded secrets (%73k- = sk-) are caught.
@@ -2093,8 +2127,7 @@ async def web_extract_tool(
             # AFTER the secret-URL gate, SSRF gate, provider resolution, and
             # strict-selection validation, and gated per-URL on the website
             # blocklist policy — a hit skips only the vendor call, never a
-            # control. Policy-blocked URLs are treated as cache misses so
-            # dispatch handles them exactly as it would without a cache.
+            # control. Refused URLs never enter provider or fallback dispatch.
             # Keys include the provider and format, so switching backends or
             # formats within the TTL never serves the other's content.
             from tools.web_result_cache import (
@@ -2104,6 +2137,7 @@ async def web_extract_tool(
             )
             from tools.website_policy import check_website_access as _check_site
             cached_results: Dict[str, Dict[str, Any]] = {}
+            refused_results: Dict[str, Dict[str, Any]] = {}
             fetch_urls: List[str] = []
             safe_identity_order = [
                 _extract_url_identity(url) for url in safe_urls
@@ -2115,13 +2149,54 @@ async def web_extract_tool(
                 hit = None
                 try:
                     _policy_block = _check_site(url)
-                except Exception:  # noqa: BLE001 — policy errors fail open like dispatch
-                    _policy_block = None
-                if _policy_block is None:
-                    hit = _extract_cache_get(
-                        url, format=format, provider=provider.name
-                    )
+                except Exception as exc:
+                    refused_results[identity] = {
+                        "url": url, "title": "", "content": "",
+                        "error": f"Website policy check failed: {exc}",
+                        "blocked_by_security": True,
+                    }
+                    continue
+                if _policy_block is not None:
+                    refused_results[identity] = {
+                        "url": url, "title": "", "content": "",
+                        "error": _policy_block["message"],
+                        "blocked_by_policy": {
+                            key: _policy_block[key]
+                            for key in ("host", "rule", "source")
+                        },
+                    }
+                    continue
+                hit = _extract_cache_get(
+                    url, format=format, provider=provider.name
+                )
                 if hit is not None:
+                    final_url = hit.get("final_url", url)
+                    if not await async_is_safe_url(final_url):
+                        refused_results[identity] = {
+                            "url": url, "title": "", "content": "",
+                            "error": "Blocked: URL targets a private or internal network address",
+                            "blocked_by_security": True,
+                        }
+                        continue
+                    try:
+                        final_block = _check_site(final_url)
+                    except Exception as exc:
+                        refused_results[identity] = {
+                            "url": url, "title": "", "content": "",
+                            "error": f"Website policy check failed: {exc}",
+                            "blocked_by_security": True,
+                        }
+                        continue
+                    if final_block is not None:
+                        refused_results[identity] = {
+                            "url": url, "title": "", "content": "",
+                            "error": final_block["message"],
+                            "blocked_by_policy": {
+                                key: final_block[key]
+                                for key in ("host", "rule", "source")
+                            },
+                        }
+                        continue
                     hit[_EXTRACT_CACHE_HIT_FIELD] = True
                     hit[_EXTRACT_CACHE_SERVED_BY_FIELD] = hit.get("served_by")
                     hit[_EXTRACT_CACHE_RETRIEVED_AT_FIELD] = hit.get(
@@ -2132,7 +2207,7 @@ async def web_extract_tool(
                     fetch_urls.append(url)
 
             if not fetch_urls:
-                _extract_cache_status = "hit"
+                _extract_cache_status = "hit" if cached_results else "bypass"
             elif cached_results:
                 _extract_cache_status = "mixed"
             elif _extract_cache_enabled():
@@ -2141,10 +2216,10 @@ async def web_extract_tool(
                 _extract_cache_status = "bypass"
 
             if not fetch_urls:
-                safe_result_by_identity = dict(cached_results)
+                safe_result_by_identity = {**refused_results, **cached_results}
                 results = [
                     {
-                        **cached_results[identity],
+                        **safe_result_by_identity[identity],
                         "url": url,
                     }
                     for identity, url in zip(safe_identity_order, safe_urls)
@@ -2157,10 +2232,12 @@ async def web_extract_tool(
                 # Async-or-sync dispatch: parallel + firecrawl have async
                 # extract(); exa + keenable are sync.
                 import inspect
-                _extract_provider_call_attempted = True
+                _extract_provider_call_attempted = not web_is_interrupted()
                 _extract_result_mapping_valid = True
                 try:
-                    if inspect.iscoroutinefunction(provider.extract):
+                    if not _extract_provider_call_attempted:
+                        results = interrupted_extract_results(fetch_urls)
+                    elif inspect.iscoroutinefunction(provider.extract):
                         results = await provider.extract(fetch_urls, format=format)
                     else:
                         # Run sync extract() in a thread so we don't block the
@@ -2169,8 +2246,9 @@ async def web_extract_tool(
                             provider.extract, fetch_urls, format=format
                         )
                 except Exception as exc:  # noqa: BLE001 — candidate for rescue
-                    if _rescue_eligible(provider):
-                        _extract_fallback_attempted = True
+                    if web_is_interrupted():
+                        results = interrupted_extract_results(fetch_urls)
+                    elif not is_extract_refusal({"error": str(exc)}) and _rescue_eligible(provider):
                         failed = [
                             {"url": u, "title": "", "content": "", "error": str(exc)}
                             for u in fetch_urls
@@ -2193,11 +2271,10 @@ async def web_extract_tool(
                         and _extract_result_mapping_valid
                         and _rescue_eligible(provider)
                         and any(
-                            not _policy_blocked_result(result)
+                            not is_extract_refusal(result)
                             for result in results
                         )
                     ):
-                        _extract_fallback_attempted = True
                         results = await asyncio.to_thread(
                             _rescue_extract, provider.name, fetch_urls, results
                         )
@@ -2258,7 +2335,7 @@ async def web_extract_tool(
                 # vendor, not the chosen backend, and caching it would make
                 # the one-shot rescue sticky for a whole TTL — the next call
                 # must attempt the chosen backend again.
-                if not (_extract_fallback_attempted or _extract_fallback_used):
+                if not (_extract_fallback_attempted or _extract_fallback_used or web_is_interrupted()):
                     for requested_url in fetch_urls:
                         fetched = fetched_results_by_identity[
                             _extract_url_identity(requested_url)
@@ -2269,6 +2346,11 @@ async def web_extract_tool(
                             fetched.get("raw_content", "") or fetched.get("content", "")
                         )
                         if _content:
+                            metadata = fetched.get("metadata")
+                            final_url = (
+                                metadata.get("url")
+                                if isinstance(metadata, dict) else None
+                            )
                             _extract_cache_put(
                                 requested_url,
                                 _content,
@@ -2277,12 +2359,13 @@ async def web_extract_tool(
                                 provider=provider.name,
                                 served_by=provider.name,
                                 retrieved_at=_extract_network_retrieved_at,
+                                final_url=final_url or requested_url,
                             )
 
                 # Merge by canonical request identity only. Provider result
                 # order is not a contract (Parallel appends failures after
                 # successes), so positional assembly can cross-wire content.
-                safe_result_by_identity = dict(cached_results)
+                safe_result_by_identity = {**refused_results, **cached_results}
                 safe_result_by_identity.update(fetched_results_by_identity)
                 results = ExtractFailoverResults(
                     [
@@ -2360,6 +2443,8 @@ async def web_extract_tool(
                 "content": r.get("content", ""),
                 "error": r.get("error"),
                 **({  "blocked_by_policy": r["blocked_by_policy"]} if "blocked_by_policy" in r else {}),
+                **({"blocked_by_security": True} if r.get("blocked_by_security") else {}),
+                **({"interrupted": True} if r.get("interrupted") else {}),
             }
             for r in response.get("results", [])
         ]

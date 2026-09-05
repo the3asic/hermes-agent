@@ -53,6 +53,7 @@ from typing import Any, Dict, List, NoReturn, Optional, TYPE_CHECKING
 import httpx
 
 from agent.web_search_provider import WebSearchProvider
+from plugins.web.keyless_mcp import web_interruptible, web_is_interrupted
 from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
 
@@ -211,12 +212,16 @@ class _KeylessFirecrawlClient:
         self.api_url = api_url.rstrip("/")
 
     def _post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if web_is_interrupted():
+            raise RuntimeError("Interrupted")
         response = httpx.post(
             f"{self.api_url}{path}",
             json=payload,
             headers={"Content-Type": "application/json"},
             timeout=60.0,
         )
+        if web_is_interrupted():
+            raise RuntimeError("Interrupted")
         response.raise_for_status()
         return response.json()
 
@@ -516,6 +521,81 @@ def _extract_scrape_payload(scrape_result: Any) -> Dict[str, Any]:
     return result_plain
 
 
+def _website_refusal(url: str) -> Optional[Dict[str, Any]]:
+    """Return an explicit refusal, including policy-loader failures."""
+    try:
+        blocked = check_website_access(url)
+    except Exception as exc:
+        return {
+            "url": url, "title": "", "content": "",
+            "error": f"Website policy check failed: {exc}",
+            "blocked_by_security": True,
+        }
+    if not blocked:
+        return None
+    return {
+        "url": url, "title": "", "content": "",
+        "error": blocked["message"],
+        "blocked_by_policy": {
+            "host": blocked["host"], "rule": blocked["rule"],
+            "source": blocked["source"],
+        },
+    }
+
+
+def _scrape_result_for_request(
+    url: str, scrape_result: Any, format: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Validate Firecrawl source identity and its separately reported final URL.
+
+    REST uses sourceURL; SDK model_dump uses source_url. Both identify the
+    request, never the redirect destination. metadata.url is the selected
+    engine's final address. Older payloads may omit it; in that case only the
+    original address can be checked, not an unreported redirect.
+    """
+    from tools.web_tools import _EXTRACT_RESULT_MAPPING_ERROR, _extract_url_identity
+
+    payload = _extract_scrape_payload(scrape_result)
+    metadata = _to_plain_object(payload.get("metadata"))
+    if not isinstance(metadata, dict):
+        metadata = {}
+    for key in ("sourceURL", "source_url"):
+        source = metadata.get(key)
+        if source is not None and (
+            not isinstance(source, str)
+            or not source.strip()
+            or _extract_url_identity(source) != _extract_url_identity(url)
+        ):
+            return {
+                "url": url, "title": "", "content": "",
+                "error": _EXTRACT_RESULT_MAPPING_ERROR,
+                "blocked_by_security": True,
+            }
+
+    final_url = metadata.get("url")
+    if final_url is None:
+        final_url = url
+    if not isinstance(final_url, str) or not is_safe_url(final_url):
+        return {
+            "url": url, "title": "", "content": "",
+            "error": "Blocked: URL targets a private or internal network address",
+            "blocked_by_security": True,
+        }
+    refusal = _website_refusal(final_url)
+    if refusal is not None:
+        return {**refusal, "url": url}
+
+    markdown, html = payload.get("markdown"), payload.get("html")
+    if format == "markdown" or (format is None and markdown):
+        content = markdown or ""
+    else:
+        content = html or markdown or ""
+    return {
+        "url": url, "title": metadata.get("title") or "",
+        "content": content, "raw_content": content, "metadata": metadata,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Provider class
 # ---------------------------------------------------------------------------
@@ -595,6 +675,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
             logger.warning("Firecrawl search error: %s", exc)
             return {"success": False, "error": f"Firecrawl search failed: {exc}"}
 
+    @web_interruptible
     async def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
         """Extract content from one or more URLs via Firecrawl.
 
@@ -610,10 +691,10 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
         (timeout, SSRF block, scrape error, policy block) become items
         with an ``error`` field rather than raising.
         """
-        from tools.interrupt import is_interrupted as _is_interrupted
+        from plugins.web.keyless_mcp import interrupted_extract_results
 
-        if _is_interrupted():
-            return [{"url": u, "error": "Interrupted", "title": ""} for u in urls]
+        if web_is_interrupted():
+            return interrupted_extract_results(urls)
 
         if _use_keyless_ring():
             # No credentials and no managed gateway: ring dispatch with
@@ -643,31 +724,14 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
         results: List[Dict[str, Any]] = []
 
         for url in urls:
-            if _is_interrupted():
-                results.append({"url": url, "error": "Interrupted", "title": ""})
-                continue
+            if web_is_interrupted():
+                results.extend(interrupted_extract_results(urls[len(results):]))
+                break
 
-            # Pre-scrape website policy gate
-            blocked = check_website_access(url)
-            if blocked:
-                logger.info(
-                    "Blocked web_extract for %s by rule %s",
-                    blocked["host"],
-                    blocked["rule"],
-                )
-                results.append(
-                    {
-                        "url": url,
-                        "title": "",
-                        "content": "",
-                        "error": blocked["message"],
-                        "blocked_by_policy": {
-                            "host": blocked["host"],
-                            "rule": blocked["rule"],
-                            "source": blocked["source"],
-                        },
-                    }
-                )
+            # Policy failures are intentional refusals, not backend outages.
+            refusal = _website_refusal(url)
+            if refusal is not None:
+                results.append(refusal)
                 continue
 
             try:
@@ -696,82 +760,10 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                     )
                     continue
 
-                scrape_payload = _extract_scrape_payload(scrape_result)
-                metadata = scrape_payload.get("metadata", {})
-                content_markdown = scrape_payload.get("markdown")
-                content_html = scrape_payload.get("html")
-
-                # Ensure metadata is a dict (SDK may return a typed object)
-                if not isinstance(metadata, dict):
-                    if hasattr(metadata, "model_dump"):
-                        metadata = metadata.model_dump()
-                    elif hasattr(metadata, "__dict__"):
-                        metadata = metadata.__dict__
-                    else:
-                        metadata = {}
-
-                title = metadata.get("title", "")
-                final_url = metadata.get("sourceURL", url)
-
-                # Re-check SSRF safety after any redirect reported by Firecrawl.
-                if not is_safe_url(final_url):
-                    logger.info(
-                        "Blocked redirected web_extract for unsafe final URL: %s",
-                        final_url,
-                    )
-                    results.append(
-                        {
-                            "url": final_url,
-                            "title": title,
-                            "content": "",
-                            "raw_content": "",
-                            "error": (
-                                "Blocked: URL targets a private or internal "
-                                "network address"
-                            ),
-                        }
-                    )
-                    continue
-
-                # Re-check website-access policy after any redirect
-                final_blocked = check_website_access(final_url)
-                if final_blocked:
-                    logger.info(
-                        "Blocked redirected web_extract for %s by rule %s",
-                        final_blocked["host"],
-                        final_blocked["rule"],
-                    )
-                    results.append(
-                        {
-                            "url": final_url,
-                            "title": title,
-                            "content": "",
-                            "raw_content": "",
-                            "error": final_blocked["message"],
-                            "blocked_by_policy": {
-                                "host": final_blocked["host"],
-                                "rule": final_blocked["rule"],
-                                "source": final_blocked["source"],
-                            },
-                        }
-                    )
-                    continue
-
-                # Choose markdown vs html according to the requested format
-                if format == "markdown" or (format is None and content_markdown):
-                    chosen_content = content_markdown
-                else:
-                    chosen_content = content_html or content_markdown or ""
-
-                results.append(
-                    {
-                        "url": final_url,
-                        "title": title,
-                        "content": chosen_content,
-                        "raw_content": chosen_content,
-                        "metadata": metadata,
-                    }
-                )
+                if web_is_interrupted():
+                    results.extend(interrupted_extract_results(urls[len(results):]))
+                    break
+                results.append(_scrape_result_for_request(url, scrape_result, format))
             except Exception as scrape_err:  # noqa: BLE001
                 logger.debug("Firecrawl scrape failed for %s: %s", url, scrape_err)
                 results.append(

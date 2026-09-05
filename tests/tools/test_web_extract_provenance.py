@@ -636,6 +636,7 @@ async def test_only_second_provider_row_is_matched_by_url_not_position(
             "provider": "firecrawl",
             "served_by": "firecrawl",
             "retrieved_at": provenance["retrieved_at"],
+            "final_url": urls[1],
         })
     ]
 

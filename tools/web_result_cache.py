@@ -562,6 +562,13 @@ def extract_cache_get(
             or served_by.strip() != provider.strip()
         ):
             return None
+    final_url = entry.get("final_url")
+    # Old Firecrawl entries cannot prove which redirect destination supplied
+    # their content, so they cannot safely survive a website-policy change.
+    if provider == "firecrawl" and (
+        not isinstance(final_url, str) or not final_url.strip()
+    ):
+        return None
     retrieved = _normalized_utc_timestamp(entry.get("retrieved_at"))
     if retrieved is None:
         return None
@@ -590,6 +597,7 @@ def extract_cache_get(
         "cached": True,
         "served_by": served_by or None,
         "retrieved_at": retrieved_at,
+        "final_url": final_url or url,
     }
 
 
@@ -601,6 +609,7 @@ def extract_cache_put(
     provider: str = "",
     served_by: str = "",
     retrieved_at: str = "",
+    final_url: Optional[str] = None,
 ) -> None:
     """Store one successful extraction's full clean text for TTL reuse.
 
@@ -651,6 +660,7 @@ def extract_cache_put(
                 "fetched_at": stored_at,
                 "retrieved_at": normalized_retrieved_at,
                 "served_by": serving_provider or None,
+                "final_url": final_url or url,
             }
             _save_index(index)
     except Exception as exc:  # noqa: BLE001 — cache writes are best-effort

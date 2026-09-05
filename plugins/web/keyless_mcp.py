@@ -27,10 +27,79 @@ from __future__ import annotations
 
 import json
 import logging
+import inspect
+import threading
 import uuid
+from contextvars import ContextVar
+from functools import wraps
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# asyncio.to_thread copies contextvars, but interrupt bits belong to the
+# originating tool thread. Keep that identity across nested provider workers
+# without changing the plugin ABC or sharing state across conversations.
+_web_interrupt_thread = ContextVar("web_interrupt_thread", default=None)
+
+
+def web_is_interrupted() -> bool:
+    from tools.interrupt import is_interrupted, is_thread_interrupted
+
+    return is_interrupted() or is_thread_interrupted(_web_interrupt_thread.get())
+
+
+def web_interruptible(function):
+    """Bind one web call's interrupt owner, including its executor workers."""
+    if inspect.iscoroutinefunction(function):
+        @wraps(function)
+        async def async_wrapper(*args, **kwargs):
+            token = _web_interrupt_thread.set(
+                _web_interrupt_thread.get() or threading.get_ident()
+            )
+            try:
+                return await function(*args, **kwargs)
+            finally:
+                _web_interrupt_thread.reset(token)
+        return async_wrapper
+
+    @wraps(function)
+    def sync_wrapper(*args, **kwargs):
+        token = _web_interrupt_thread.set(
+            _web_interrupt_thread.get() or threading.get_ident()
+        )
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _web_interrupt_thread.reset(token)
+    return sync_wrapper
+
+
+def is_extract_refusal(result: dict) -> bool:
+    """User cancellation and security decisions must never trigger rescue."""
+    if any(result.get(key) for key in (
+        "interrupted", "blocked_by_policy", "blocked_by_security",
+    )):
+        return True
+    error = str(result.get("error") or "").lower()
+    return any(marker in error for marker in (
+        "interrupted", "blocked by website policy",
+        "blocked: url targets a private or internal", "ssrf",
+    ))
+
+
+def interrupted_extract_results(urls, results=()):
+    """Keep completed pages and refusals; mark unfinished work interrupted."""
+    from tools.web_tools import _extract_url_identity, _reconcile_extract_results
+
+    _, by_identity, _ = _reconcile_extract_results(urls, list(results))
+    return [
+        row if not row.get("error") or is_extract_refusal(row) else {
+            "url": url, "title": "", "content": "",
+            "error": "Interrupted", "interrupted": True,
+        }
+        for url in urls
+        for row in [by_identity[_extract_url_identity(url)]]
+    ]
 
 EXA_MCP_URL = "https://mcp.exa.ai/mcp"
 PARALLEL_MCP_URL = "https://search.parallel.ai/mcp"
@@ -214,6 +283,9 @@ def mcp_call(
     """
     import requests
 
+    if web_is_interrupted():
+        raise KeylessMCPError("Interrupted")
+
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -229,6 +301,8 @@ def mcp_call(
         response = requests.post(url, json=payload, headers=headers, timeout=timeout)
     except requests.RequestException as exc:
         raise KeylessMCPError(f"request failed: {exc}") from exc
+    if web_is_interrupted():
+        raise KeylessMCPError("Interrupted")
     if response.status_code >= 400:
         raise KeylessMCPError(
             f"HTTP {response.status_code}: {response.text[:300]}"
@@ -428,6 +502,9 @@ def exa_extract_keyless(urls: List[str]) -> List[Dict[str, Any]]:
     """
     results: List[Dict[str, Any]] = []
     for url in urls:
+        if web_is_interrupted():
+            results.extend(interrupted_extract_results(urls[len(results):]))
+            break
         try:
             text = mcp_call(EXA_MCP_URL, "web_fetch_exa", {"urls": [url]})
         except KeylessMCPError as exc:
@@ -496,29 +573,26 @@ def firecrawl_extract_keyless(urls: List[str]) -> List[Dict[str, Any]]:
     """Keyless Firecrawl cloud scrape → legacy extract result list."""
     from plugins.web.firecrawl.provider import (
         _KeylessFirecrawlClient,
-        _extract_scrape_payload,
+        _scrape_result_for_request,
+        _website_refusal,
     )
 
     client = _KeylessFirecrawlClient()
     results: List[Dict[str, Any]] = []
     for url in urls:
+        if web_is_interrupted():
+            results.extend(interrupted_extract_results(urls[len(results):]))
+            break
+        refusal = _website_refusal(url)
+        if refusal is not None:
+            results.append(refusal)
+            continue
         try:
             response = client.scrape(url=url, formats=["markdown"])
-            payload = _extract_scrape_payload(response) or {}
-            metadata = payload.get("metadata") or {}
-            if not isinstance(metadata, dict):
-                metadata = {}
-            content = payload.get("markdown") or payload.get("html") or ""
-            title = metadata.get("title") or ""
-            results.append(
-                {
-                    "url": url,
-                    "title": title,
-                    "content": content,
-                    "raw_content": content,
-                    "metadata": {"sourceURL": url, "title": title},
-                }
-            )
+            if web_is_interrupted():
+                results.extend(interrupted_extract_results(urls[len(results):]))
+                break
+            results.append(_scrape_result_for_request(url, response))
         except Exception as exc:  # noqa: BLE001 — per-URL error entry
             results.append(
                 {
@@ -607,6 +681,9 @@ def keenable_extract_keyless(urls: List[str]) -> List[Dict[str, Any]]:
 
     results: List[Dict[str, Any]] = []
     for url in urls:
+        if web_is_interrupted():
+            results.extend(interrupted_extract_results(urls[len(results):]))
+            break
         try:
             response = requests.get(
                 f"{KEENABLE_API_URL}/v1/fetch/public",
@@ -614,6 +691,9 @@ def keenable_extract_keyless(urls: List[str]) -> List[Dict[str, Any]]:
                 headers={"X-Keenable-Title": _KEENABLE_TITLE},
                 timeout=_TIMEOUT_SECONDS,
             )
+            if web_is_interrupted():
+                results.extend(interrupted_extract_results(urls[len(results):]))
+                break
             if response.status_code >= 400:
                 raise KeylessMCPError(
                     (response.text or "").strip() or f"HTTP {response.status_code}"
@@ -719,6 +799,7 @@ def _ring_order(name: str) -> List[str]:
     return [v for v in ordered if provider_tier(v) != "paid"]
 
 
+@web_interruptible
 def search_with_failover(name: str, query: str, limit: int = 5) -> Dict[str, Any]:
     """Keyless search across the vendor ring with next-in-line failover.
 
@@ -728,6 +809,8 @@ def search_with_failover(name: str, query: str, limit: int = 5) -> Dict[str, Any
     The result notes the serving vendor via ``data.served_by`` whenever it
     differs from *name*.
     """
+    if web_is_interrupted():
+        return {"success": False, "error": "Interrupted"}
     order = _ring_order(name)
     if not order:
         return {
@@ -736,13 +819,17 @@ def search_with_failover(name: str, query: str, limit: int = 5) -> Dict[str, Any
         }
     last: Dict[str, Any] = {}
     for i, vendor in enumerate(order):
+        if web_is_interrupted():
+            return {"success": False, "error": "Interrupted"}
         result = _KEYLESS_SEARCHERS[vendor](query, limit)
+        if web_is_interrupted():
+            return {"success": False, "error": "Interrupted"}
         if result.get("success"):
             if vendor != name:
                 result.setdefault("data", {})["served_by"] = vendor
             return result
         last = result
-        if not _is_rate_limitish(result.get("error", "")):
+        if is_extract_refusal(result) or not _is_rate_limitish(result.get("error", "")):
             return result
         nxt = order[i + 1] if i + 1 < len(order) else None
         if nxt:
@@ -756,6 +843,7 @@ def search_with_failover(name: str, query: str, limit: int = 5) -> Dict[str, Any
     return last
 
 
+@web_interruptible
 def extract_with_failover(name: str, urls: List[str]) -> List[Dict[str, Any]]:
     """Keyless extract across the vendor ring, failing over per-batch.
 
@@ -766,6 +854,8 @@ def extract_with_failover(name: str, urls: List[str]) -> List[Dict[str, Any]]:
     serving vendor, so the wrapper can report truthful provenance and avoid
     caching a response under the wrong provider key.
     """
+    if web_is_interrupted():
+        return ExtractFailoverResults(interrupted_extract_results(urls))
     order = _ring_order(name)
     if not order:
         return ExtractFailoverResults(
@@ -778,6 +868,11 @@ def extract_with_failover(name: str, urls: List[str]) -> List[Dict[str, Any]]:
     last: List[Dict[str, Any]] = []
     fallback_attempted = False
     for i, vendor in enumerate(order):
+        if web_is_interrupted():
+            return ExtractFailoverResults(
+                interrupted_extract_results(urls, last),
+                fallback_attempted=fallback_attempted,
+            )
         results = _KEYLESS_EXTRACTORS[vendor](list(urls))
         used_fallback_route = i > 0 or vendor != name
         fallback_attempted = fallback_attempted or used_fallback_route
@@ -797,10 +892,16 @@ def extract_with_failover(name: str, urls: List[str]) -> List[Dict[str, Any]]:
             fallback_attempted=fallback_attempted,
             fallback_used=fallback_used,
         )
+        if web_is_interrupted():
+            return ExtractFailoverResults(
+                interrupted_extract_results(urls, results),
+                fallback_attempted=fallback_attempted,
+                fallback_used=fallback_used,
+            )
         errors = [r.get("error", "") for r in results]
         all_throttled = bool(results) and all(
             e and _is_rate_limitish(e) for e in errors
-        )
+        ) and not any(is_extract_refusal(row) for row in results)
         if not all_throttled:
             return batch
         last = batch
