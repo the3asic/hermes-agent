@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.cache_diagnostic import observe, instrument_openai_client
 
 logger = logging.getLogger(__name__)
 
@@ -1601,6 +1602,7 @@ def _bypass_sdk_request_transform(stream_kwargs: dict) -> dict:
     return bypassed
 
 
+@observe("main")
 def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):
     """Execute one streaming Responses API request and return the final response.
 
@@ -1616,6 +1618,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     from agent import relay_llm
 
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
+    instrument_openai_client(active_client)
     max_stream_retries = 1
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []

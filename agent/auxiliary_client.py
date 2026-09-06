@@ -1579,6 +1579,9 @@ class _CodexCompletionsAdapter:
         self._client = real_client
         self._model = model
 
+    from agent.cache_diagnostic import observe as _observe_cache_diagnostic
+
+    @_observe_cache_diagnostic("auxiliary")
     def create(self, **kwargs) -> Any:
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
