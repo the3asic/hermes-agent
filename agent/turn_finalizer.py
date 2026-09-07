@@ -437,7 +437,15 @@ def finalize_turn(
                     and not getattr(agent, "_persist_disabled", False)
                 ):
                     _before = len(messages)
-                    _compacted = _compressor._micro_compact(messages)
+                    # A fallback or model switch may have changed reasoning
+                    # since turn_context published the initial runtime.
+                    from agent.auxiliary_client import scoped_runtime_main
+                    from agent.prompt_cache_scope import resolve_prompt_cache_scope_safe
+
+                    micro_runtime = agent._current_main_runtime()
+                    micro_runtime["cache_scope"] = resolve_prompt_cache_scope_safe(agent) or ""
+                    with scoped_runtime_main(micro_runtime):
+                        _compacted = _compressor._micro_compact(messages)
                     # Micro-compaction defrag rewrites the newest MICRO
                     # marker's content and pops _db_persisted from the live
                     # dict in place — the sibling of the pop site above. The

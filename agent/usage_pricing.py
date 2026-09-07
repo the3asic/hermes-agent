@@ -1491,6 +1491,10 @@ def normalize_usage(
             cache_write_tokens = _usage_count(
                 _usage_get(response_usage, "cache_write_tokens", 0)
             )
+        if not cache_write_tokens:
+            cache_write_tokens = _usage_count(
+                _usage_get(details, "cache_creation_tokens", 0) if details else 0
+            )
         input_tokens = max(0, prompt_total - cache_read_tokens - cache_write_tokens)
 
     reasoning_tokens = 0

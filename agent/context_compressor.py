@@ -95,6 +95,8 @@ _PINNED_ROUTE_FIELDS: tuple[str, ...] = (
     "reasoning_config",
 )
 
+_REASONING_CONFIG_UNSET = object()
+
 
 @contextlib.contextmanager
 def pin_summary_route(route: Optional[Dict[str, Any]]):
@@ -3136,6 +3138,7 @@ class ContextCompressor(ContextEngine):
         provider: str = "",
         api_mode: str = "",
         max_tokens: int | None = None,
+        reasoning_config: Any = _REASONING_CONFIG_UNSET,
     ) -> None:
         """Update model info after a model switch or fallback activation."""
         runtime_changed = any((
@@ -3144,6 +3147,12 @@ class ContextCompressor(ContextEngine):
             base_url != self.base_url,
             api_mode != self.api_mode,
         ))
+        if reasoning_config is not _REASONING_CONFIG_UNSET:
+            self.reasoning_config = copy.deepcopy(reasoning_config)
+        elif runtime_changed:
+            # An omitted effort cannot carry the previous route's policy.
+            # Same-route context-window recalibration keeps the snapshot.
+            self.reasoning_config = None
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
@@ -3399,12 +3408,14 @@ class ContextCompressor(ContextEngine):
         proactive_prune_min_reclaim_tokens: int = 4096,
         min_tail_user_messages: int = 1,
         tail_mode: str = "lean",
+        reasoning_config: Optional[Dict[str, Any]] = None,
     ):
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
         self.provider = provider
         self.api_mode = api_mode
+        self.reasoning_config = copy.deepcopy(reasoning_config)
         # Lean tail mode (#compaction-v2): "lean" = small clamped recency
         # tail + verbatim-user-message summary section + recovery pointers;
         # "legacy" = 0.20*window tail (shipping behavior).
@@ -4935,11 +4946,37 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self.summary_model = ""  # empty = use main model
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
 
+    def _summary_main_runtime(self) -> Dict[str, Any]:
+        """Use the owning session's attempt snapshot, including explicit None.
+
+        A reused compressor can outlive a session effort/model switch. The
+        host scopes a fresh runtime before dispatching each compression worker;
+        that ContextVar also isolates a detached worker from a later attempt.
+        Never merge another session's runtime, even on the same deployment.
+        Standalone compressors retain their construct/update snapshot.
+        """
+        from agent.auxiliary_client import get_scoped_runtime_main
+
+        runtime = get_scoped_runtime_main()
+        session_id = getattr(self, "_session_id", "")
+        if session_id and runtime.get("session_id") == session_id:
+            return runtime
+        return {
+            "model": self.model,
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "api_key": self.api_key,
+            "api_mode": self.api_mode,
+            "reasoning_config": copy.deepcopy(self.reasoning_config),
+        }
+
     def _generate_summary(
         self,
         turns_to_summarize: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
         memory_context: str = "",
+        *,
+        _main_runtime: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Generate a structured summary of conversation turns.
 
@@ -4959,6 +4996,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         placeholder.
         """
         prompt_started_at = time.monotonic()
+        if _main_runtime is None:
+            _main_runtime = self._summary_main_runtime()
         if self._compression_cancelled():
             raise AuxiliaryExplicitCancellation()
         now = prompt_started_at
@@ -5272,13 +5311,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         try:
             call_kwargs = {
                 "task": "compression",
-                "main_runtime": {
-                    "model": self.model,
-                    "provider": self.provider,
-                    "base_url": self.base_url,
-                    "api_key": self.api_key,
-                    "api_mode": self.api_mode,
-                },
+                "main_runtime": _main_runtime,
                 "messages": [{"role": "user", "content": prompt}],
                 # NO max_tokens: the output cap must never truncate a summary.
                 # ``summary_budget`` is prompt-level guidance only ("Target ~N
@@ -5548,6 +5581,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     turns_to_summarize,
                     focus_topic=focus_topic,
                     memory_context=memory_context,
+                    _main_runtime=_main_runtime,
                 )  # retry immediately
 
             # Unknown-error best-effort retry on main model.  Losing N turns of
@@ -5569,6 +5603,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     turns_to_summarize,
                     focus_topic=focus_topic,
                     memory_context=memory_context,
+                    _main_runtime=_main_runtime,
                 )
 
             # Transient errors (timeout, rate limit, network, JSON decode,
@@ -7097,13 +7132,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         if self.summary_model:
             call_kwargs["model"] = self.summary_model
         if self.model:
-            call_kwargs.setdefault("main_runtime", {
-                "model": self.model,
-                "provider": self.provider or "",
-                "base_url": self.base_url or "",
-                "api_key": self.api_key or "",
-                "api_mode": getattr(self, "api_mode", "") or "",
-            })
+            call_kwargs["main_runtime"] = self._summary_main_runtime()
 
         try:
             with aux_interrupt_protection():

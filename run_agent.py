@@ -1444,7 +1444,7 @@ class AIAgent:
             "api_mode": getattr(self, "api_mode", "") or "",
             "auth_mode": getattr(self, "auth_mode", "") or "",
             "session_id": getattr(self, "session_id", "") or "",
-            "reasoning_config": getattr(self, "reasoning_config", None),
+            "reasoning_config": copy.deepcopy(getattr(self, "reasoning_config", None)),
         }
 
     def _check_compression_model_feasibility(self) -> None:

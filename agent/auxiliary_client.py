@@ -1661,6 +1661,11 @@ class _CodexCompletionsAdapter:
         extra_body = kwargs.get("extra_body") or {}
         if isinstance(extra_body, dict):
             reasoning_cfg = extra_body.get("reasoning")
+            if not isinstance(reasoning_cfg, dict) and kwargs.get("reasoning_effort") is not None:
+                # Custom/OpenAI chat profiles project session reasoning into
+                # this top-level field. Preserve it across the Responses bridge
+                # just like an explicit auxiliary extra_body.reasoning override.
+                reasoning_cfg = {"effort": kwargs["reasoning_effort"]}
             if isinstance(reasoning_cfg, dict):
                 if reasoning_cfg.get("enabled") is False:
                     # Reasoning explicitly disabled — do not set reasoning
@@ -2084,6 +2089,23 @@ class _CodexCompletionsAdapter:
                     total_tokens=getattr(resp_usage, "total_tokens", 0)
                         or (resp_usage.get("total_tokens", 0) if isinstance(resp_usage, dict) else 0),
                 )
+                # Preserve the Responses detail buckets when adapting to Chat
+                # usage names. Dropping these miscounts cached input as fresh
+                # input and hides reasoning tokens from auxiliary consumers.
+                for source_field, target_field in (
+                    ("input_tokens_details", "prompt_tokens_details"),
+                    ("output_tokens_details", "completion_tokens_details"),
+                ):
+                    if isinstance(resp_usage, dict):
+                        if source_field in resp_usage:
+                            setattr(usage, target_field, resp_usage[source_field])
+                    else:
+                        fields_set = getattr(resp_usage, "model_fields_set", None)
+                        if (
+                            (fields_set is None or source_field in fields_set)
+                            and hasattr(resp_usage, source_field)
+                        ):
+                            setattr(usage, target_field, getattr(resp_usage, source_field))
         except Exception as exc:
             if timed_out.is_set():
                 raise TimeoutError(_timeout_message()) from exc
@@ -3768,6 +3790,11 @@ def scoped_runtime_main(main_runtime: Optional[Dict[str, Any]]):
         yield runtime
     finally:
         _RUNTIME_MAIN_CONTEXT.reset(token)
+
+
+def get_scoped_runtime_main() -> Dict[str, Any]:
+    """Snapshot only the caller's runtime; never consult legacy globals/config."""
+    return _normalize_main_runtime(_RUNTIME_MAIN_CONTEXT.get() or {})
 
 
 def clear_runtime_main() -> None:
