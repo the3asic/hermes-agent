@@ -34,6 +34,36 @@ class TestAuxProbeMode:
         with aux._client_cache_lock:
             assert key not in aux._client_cache
 
+    def test_probe_stub_never_cached_through_codex_wrapper(self):
+        import agent.auxiliary_client as aux
+
+        with aux.aux_probe_mode():
+            stub = aux._create_openai_client(
+                api_key="k", base_url="http://127.0.0.1:8317/v1"
+            )
+        wrapped = aux.CodexAuxiliaryClient(stub, "m")
+        key = ("probe-test", False, "", "", "", (), False, "", None, "m")
+        with aux._client_cache_lock:
+            aux._client_cache.pop(key, None)
+        try:
+            with aux.aux_probe_mode():
+                _, runtime_model = aux._get_cached_client(
+                    "cliproxyapi",
+                    "m",
+                    api_mode="codex_responses",
+                    base_url="http://127.0.0.1:8317/v1",
+                    api_key="k",
+                    is_vision=True,
+                )
+            with aux._client_cache_lock:
+                assert key not in aux._client_cache
+            assert runtime_model == "m"
+        finally:
+            with aux._client_cache_lock:
+                aux._client_cache.pop(key, None)
+        with aux._client_cache_lock:
+            assert key not in aux._client_cache
+
     def test_probe_stub_raises_on_runtime_use(self):
         import agent.auxiliary_client as aux
 

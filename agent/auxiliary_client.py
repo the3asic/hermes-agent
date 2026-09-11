@@ -8498,7 +8498,7 @@ def _store_cached_client(
     fallback_route_ref: Optional[_FallbackRouteRef] = None,
 ) -> None:
     if isinstance(client, _AuxProbeClientStub):
-        # Probe stubs must never enter the cache — a runtime caller would
+        # Probe stubs must never enter the cache; a runtime caller would
         # receive a non-functional client on the next cache hit.
         return
     with _client_cache_lock:
@@ -8870,11 +8870,24 @@ def _get_cached_client(
         task=task,
     )
     selected_fallback_ref = _SELECTED_FALLBACK_ROUTE_REF.get()
+    if _aux_probe_active() and client is not None:
+        # A named custom transport may wrap the stub in CodexAuxiliaryClient.
+        # The wrapper remains availability evidence, but must not leak into the
+        # cache under its wrapper type.
+        inner_client = (
+            client._real_client
+            if isinstance(client, CodexAuxiliaryClient)
+            else client
+        )
+        if isinstance(inner_client, _AuxProbeClientStub):
+            client = inner_client
     if client is not None:
         # For async clients, remember which loop they were created on so we
         # can detect stale entries later.
         bound_loop = current_loop
         with _client_cache_lock:
+            if isinstance(client, _AuxProbeClientStub):
+                return client, default_model
             if cache_key not in _client_cache:
                 # Safety belt: if the cache has grown beyond the max, evict
                 # the oldest entries (FIFO — dict preserves insertion order).
