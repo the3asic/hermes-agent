@@ -15,7 +15,6 @@ from unittest.mock import patch
 
 from tools.checkpoint_manager import (
     CheckpointManager,
-    _shadow_repo_path,
     _init_store,
     _run_git,
     _git_env,
@@ -82,10 +81,9 @@ def disabled_mgr(checkpoint_base, monkeypatch):
 class TestStorePath:
     def test_store_is_single_shared_path(self, work_dir, checkpoint_base, monkeypatch):
         monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
-        # All projects resolve to the same store.
-        p1 = _shadow_repo_path(str(work_dir))
-        p2 = _shadow_repo_path(str(work_dir.parent / "other"))
-        assert p1 == p2 == _store_path(checkpoint_base)
+        # All projects resolve to the same store (only refs/indexes are per-project).
+        assert _store_path() == _store_path(checkpoint_base)
+        assert _project_hash(str(work_dir)) != _project_hash(str(work_dir.parent / "other"))
 
     def test_project_hash_identifies_dir_and_expands_tilde(self, fake_home):
         project = fake_home / "project"
@@ -315,6 +313,11 @@ class TestSafeRestore:
     changed, skipping any file whose contents no longer match what Copilot
     last wrote".
     """
+
+    @pytest.fixture(autouse=True)
+    def project_boundary(self, work_dir):
+        # Keep ledger discovery inside this fixture when pytest temp is in a Git checkout.
+        subprocess.run(["git", "init", "-q", str(work_dir)], check=True)
 
     def _checkpoint(self, mgr, work_dir):
         assert mgr.ensure_checkpoint(str(work_dir), "initial") is True

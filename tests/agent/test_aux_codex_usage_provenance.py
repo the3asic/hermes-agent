@@ -2,7 +2,7 @@
 import asyncio
 from types import SimpleNamespace as S
 import pytest
-from agent.auxiliary_client import _CodexCompletionsAdapter,_AsyncCodexCompletionsAdapter
+from agent.auxiliary_client import _CodexCompletionsAdapter, AsyncCodexAuxiliaryClient
 from agent.usage_pricing import normalize_usage
 
 @pytest.fixture(autouse=True)
@@ -24,7 +24,10 @@ def test_actual_adapter_keeps_live_compression_usage(as_dict,async_mode):
          'output_tokens_details':{'reasoning_tokens':7}}
     wrapped=adapter(raw if as_dict else S(**raw))
     kwargs={'messages':[{'role':'user','content':'Synthetic completed calibration.'}]}
-    response=asyncio.run(_AsyncCodexCompletionsAdapter(wrapped).create(**kwargs)) if async_mode else wrapped.create(**kwargs)
+    async_client = AsyncCodexAuxiliaryClient(
+        S(chat=S(completions=wrapped), api_key="synthetic", base_url=wrapped._client.base_url)
+    )
+    response=asyncio.run(async_client.chat.completions.create(**kwargs)) if async_mode else wrapped.create(**kwargs)
     usage=normalize_usage(response.usage)
     assert usage.cache_read_tokens==6144
     assert usage.input_tokens==214 and usage.output_tokens==23 and usage.reasoning_tokens==7

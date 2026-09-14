@@ -8,11 +8,46 @@ the only thing under test is the registry's cache decision.
 from __future__ import annotations
 
 import threading
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 
 from tools import browser_supervisor as bs
+
+
+@pytest.mark.parametrize("case", ["same_origin", "other_origin", "missing", "rejected"])
+def test_focus_page_never_adopts_an_unowned_target(monkeypatch, case):
+    supervisor = bs.CDPSupervisor(task_id="focus-pin", cdp_url="ws://fixture", target_id="A")
+    supervisor._loop = SimpleNamespace(is_running=lambda: True)
+    calls = []
+
+    async def cdp(method, params=None, **kwargs):
+        calls.append((method, params))
+        if method == "Target.getTargets":
+            targets = [{"targetId": "B", "type": "page", "url": "https://same.invalid/login"}]
+            if case != "missing":
+                targets.append({"targetId": "A", "type": "page", "url": "https://same.invalid/login"})
+            return {"result": {"targetInfos": targets}}
+        if method == "Target.attachToTarget":
+            assert params["targetId"] == "A"
+            return {"result": {"sessionId": "attached-A"}}
+        if method == "Runtime.evaluate":
+            return {"result": {"result": {"value": False}}}
+        return {"result": {}}
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(supervisor, "_cdp", cdp)
+    monkeypatch.setattr(supervisor, "_enable_page_domains", noop)
+    monkeypatch.setattr(supervisor, "_install_dialog_bridge", noop)
+    monkeypatch.setattr(bs, "_schedule", lambda coro, _loop, **_kwargs: asyncio.run(coro))
+    origin = "https://other.invalid" if case == "other_origin" else "https://same.invalid"
+    result = supervisor.focus_page(origin, accept="false" if case == "rejected" else None)
+    assert result["ok"] is (case == "same_origin")
+    attached = [params["targetId"] for method, params in calls if method == "Target.attachToTarget"]
+    assert attached == (["A"] if case in {"same_origin", "rejected"} else [])
 
 
 class _FakeLoop:

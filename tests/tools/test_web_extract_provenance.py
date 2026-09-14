@@ -11,6 +11,7 @@ import pytest
 
 from plugins.web import keyless_mcp
 from tools import web_tools
+from tools import web_tools_extract
 
 
 class _ExtractProvider:
@@ -75,12 +76,13 @@ def _install(
     monkeypatch.setattr(
         "agent.web_search_registry.get_provider", lambda name: provider
     )
-    monkeypatch.setattr(web_tools, "_rescue_eligible", lambda selected: rescue_eligible)
+    monkeypatch.setattr(web_tools_extract, "_rescue_eligible", lambda selected: rescue_eligible)
 
     async def _safe(_url):
         return True
 
     monkeypatch.setattr(web_tools, "async_is_safe_url", _safe)
+    monkeypatch.setattr(web_tools_extract, "async_is_safe_url", _safe)
     monkeypatch.setattr(
         "tools.website_policy.check_website_access", lambda url: None
     )
@@ -591,7 +593,7 @@ async def test_empty_provider_result_keeps_provenance_on_error(monkeypatch):
     assert provenance["returned_count"] == 1
     assert provenance["failure_count"] == 1
     assert result["results"][0]["url"] == url
-    assert web_tools._EXTRACT_RESULT_MISSING_ERROR in result["results"][0]["error"]
+    assert web_tools_extract._EXTRACT_RESULT_MISSING_ERROR in result["results"][0]["error"]
 
 
 @pytest.mark.asyncio
@@ -664,7 +666,7 @@ async def test_middle_missing_row_is_filled_without_cross_url_content(
 
     assert [row["url"] for row in result["results"]] == urls
     assert result["results"][0]["content"] == "body-a"
-    assert web_tools._EXTRACT_RESULT_MISSING_ERROR in result["results"][1]["error"]
+    assert web_tools_extract._EXTRACT_RESULT_MISSING_ERROR in result["results"][1]["error"]
     assert result["results"][2]["content"] == "body-c"
     assert result["provenance"]["success_count"] == 2
     assert result["provenance"]["failure_count"] == 1
@@ -703,7 +705,7 @@ async def test_duplicate_unexpected_or_ambiguous_rows_fail_closed(
 
     assert [row["url"] for row in result["results"]] == urls
     assert all(
-        web_tools._EXTRACT_RESULT_MAPPING_ERROR in row["error"]
+        web_tools_extract._EXTRACT_RESULT_MAPPING_ERROR in row["error"]
         for row in result["results"]
     )
     assert provenance["success_count"] == 0
@@ -728,7 +730,7 @@ async def test_fallback_only_second_row_maps_by_url_and_fills_missing(
     provenance = result["provenance"]
 
     assert [row["url"] for row in result["results"]] == urls
-    assert web_tools._EXTRACT_RESULT_MISSING_ERROR in result["results"][0]["error"]
+    assert web_tools_extract._EXTRACT_RESULT_MISSING_ERROR in result["results"][0]["error"]
     assert result["results"][1]["content"] == "fallback-b"
     assert provenance["served_by"] == "parallel"
     assert provenance["fallback_attempted"] is True

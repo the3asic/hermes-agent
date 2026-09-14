@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from plugins.web import keyless_mcp
 from plugins.web.firecrawl import provider as firecrawl
 from tools import interrupt, web_result_cache, web_tools, website_policy
+from tools import web_tools_extract, web_tools_rescue
 
 
 class SDKMetadata(BaseModel):
@@ -131,7 +132,7 @@ async def test_mismatched_source_is_rejected_without_poisoning_sibling(configure
         document(second, second),
     ]
     result = json.loads(await web_tools.web_extract_tool([first, second]))
-    assert result["results"][0]["error"] == web_tools._EXTRACT_RESULT_MAPPING_ERROR
+    assert result["results"][0]["error"] == web_tools_extract._EXTRACT_RESULT_MAPPING_ERROR
     assert result["results"][0]["content"] == ""
     assert result["results"][1]["content"] == "PAGE_BODY"
     assert result["provenance"]["success_count"] == 1
@@ -276,7 +277,7 @@ def test_rescue_preserves_security_refusals_and_completed_rows(monkeypatch):
     failed = {"url": urls[2], "error": "Backend unavailable"}
     rescue = Mock(return_value=[{"url": urls[2], "content": "RECOVERED"}])
     monkeypatch.setattr(keyless_mcp, "extract_with_failover", rescue)
-    rows = web_tools._rescue_extract("firecrawl", urls, [refused, completed, failed])
+    rows = web_tools_rescue._rescue_extract("firecrawl", urls, [refused, completed, failed])
     rescue.assert_called_once_with("firecrawl", [urls[2]])
     assert rows[0] == refused
     assert rows[1] == completed
@@ -288,7 +289,7 @@ def test_explicit_interrupted_row_stops_rescue_even_without_thread_signal(monkey
     rows = [{"url": urls[0], "error": "Interrupted"}, {"url": urls[1], "error": "429"}]
     rescue = Mock()
     monkeypatch.setattr(keyless_mcp, "extract_with_failover", rescue)
-    result = web_tools._rescue_extract("firecrawl", urls, rows)
+    result = web_tools_rescue._rescue_extract("firecrawl", urls, rows)
     assert result == rows
     assert result.fallback_attempted is False
     rescue.assert_not_called()
@@ -298,7 +299,7 @@ def test_rescue_failure_preserves_new_security_refusal(monkeypatch):
     url = "https://allowed.example/page"
     refusal = {"url": url, "error": "SSRF rejection", "blocked_by_security": True}
     monkeypatch.setattr(keyless_mcp, "extract_with_failover", lambda *args: [refusal])
-    result = web_tools._rescue_extract("firecrawl", [url], [{"url": url, "error": "500"}])
+    result = web_tools_rescue._rescue_extract("firecrawl", [url], [{"url": url, "error": "500"}])
     assert result[0] == refusal
     assert result.fallback_attempted is True
     assert result.fallback_used is False

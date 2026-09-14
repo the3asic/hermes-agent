@@ -907,7 +907,7 @@ def test_extract_cache_old_provider_entry_without_provenance_is_miss(
 
 
 def test_extract_cache_oversized_page_not_indexed(_isolated_cache):
-    import tools.web_tools as wt
+    from tools import web_tools_truncate as wt
     big = "x" * (wt.MAX_STORED_TEXT_CHARS + 1)
     extract_cache_put("https://big.com", big)
     assert extract_cache_get("https://big.com") is None

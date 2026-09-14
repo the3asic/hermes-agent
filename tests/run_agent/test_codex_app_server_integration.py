@@ -90,7 +90,7 @@ class TestRunConversationCodexPath:
         # must not be mistaken for a usage-bearing zero-token response.
         assert agent.session_api_calls == 1
         assert agent.session_usage_report_calls == 0
-        from gateway.run import _gateway_turn_runtime_metadata
+        from gateway.runtime_footer import _gateway_turn_runtime_metadata
 
         metadata = _gateway_turn_runtime_metadata(
             agent,

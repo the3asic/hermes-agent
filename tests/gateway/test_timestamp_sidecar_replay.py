@@ -187,14 +187,10 @@ def test_full_builder_to_responses_keeps_cross_turn_prefix(responses_agent, tmp_
         finally:
             reopened.close()
     elif resume == "json_fixture":
-        # Exercise the optional production JSON writer, then read the same
-        # message field accepted by the conversation-history entry point.
-        # This is a serialized fixture; the gateway's live restore uses DB.
-        agent._session_json_enabled = True
-        agent.logs_dir = tmp_path / "snapshots"
-        agent.logs_dir.mkdir()
-        agent._save_session_log(history)
-        path = agent.logs_dir / f"session_{sid}.json"
+        # Legacy serialized history is still an accepted input; the optional
+        # production JSON writer was removed upstream.
+        path = tmp_path / f"session_{sid}.json"
+        path.write_text(json.dumps({"messages": history}), encoding="utf-8")
         history = json.loads(path.read_text(encoding="utf-8"))["messages"]
     replay, observed = _build_gateway_agent_history(history, inject_timestamps=timestamps)
     assert observed is None

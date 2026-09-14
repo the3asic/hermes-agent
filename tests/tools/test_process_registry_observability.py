@@ -13,19 +13,19 @@ import time
 import pytest
 
 from tools import process_registry as process_registry_module
-from tools.process_registry import (
+from tools import process_registry_observability as observability_module
+from tools.process_registry_observability import (
     AGENT_RUNS_OBSERVABILITY_SCHEMA,
     MAX_OBSERVABILITY_RUNS,
-    ProcessRegistry,
-    ProcessSession,
 )
+from tools.process_registry import ProcessRegistry, ProcessSession
 
 
 @pytest.fixture()
 def snapshot_path(tmp_path, monkeypatch):
     path = tmp_path / "runtime" / "agent-runs-observability.json"
     monkeypatch.setattr(
-        process_registry_module,
+        observability_module,
         "AGENT_RUNS_OBSERVABILITY_PATH",
         path,
     )

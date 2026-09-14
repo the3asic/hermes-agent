@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 import sys
 
 import pytest
@@ -379,7 +379,7 @@ async def test_fetch_channel_context_skips_self_improvement_boundary_message(ada
         ],
         channel_id=123,
     )
-    adapter._nonconversational_messages.mark_many(["9"])
+    await adapter._nonconversational_messages.mark_many(["9"])
 
     result = await adapter._fetch_channel_context(channel, before=make_message(channel=channel, content="trigger"))
 
@@ -989,3 +989,59 @@ async def test_discord_voice_linked_channel_does_not_enable_history_backfill(
     adapter._fetch_channel_context.assert_not_awaited()
     event = adapter.handle_message.await_args.args[0]
     assert event.channel_context is None
+
+
+class TestNonConversationalTrackerOffload:
+    """atomic_json_write() calls os.fsync(), which blocks until the write
+    reaches stable storage. mark_many() runs on the event loop from both
+    DiscordAdapter.send() and send_update_prompt(), so the persist step
+    must be offloaded to a thread — mirrors
+    test_directory_write_runs_off_event_loop_thread in
+    test_channel_directory.py for the same #83906 bug class.
+    """
+
+    @pytest.mark.asyncio
+    async def test_mark_many_persist_runs_off_event_loop_thread(self):
+        import threading
+
+        tracker = discord_platform._DiscordNonConversationalMessageTracker()
+        loop_thread = threading.get_ident()
+        write_threads = []
+
+        def fake_write(path, data, *args, **kwargs):
+            write_threads.append(threading.get_ident())
+
+        with patch.object(discord_platform, "atomic_json_write", side_effect=fake_write):
+            await tracker.mark_many(["999"])
+
+        assert "999" in tracker
+        assert write_threads
+        assert all(tid != loop_thread for tid in write_threads)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_mark_many_persists_land_in_order(self):
+        """Two in-flight mark_many() calls (send() racing a history fetch) must
+        not let an older snapshot overwrite a newer one on disk."""
+        import asyncio as _asyncio
+        import time
+
+        tracker = discord_platform._DiscordNonConversationalMessageTracker()
+        tracker._ids = {}
+        writes = []
+        calls = [0]
+
+        def slow_first_write(path, data, *args, **kwargs):
+            idx = calls[0]
+            calls[0] += 1
+            if idx == 0:
+                time.sleep(0.05)
+            writes.append(list(data))
+
+        with patch.object(discord_platform, "atomic_json_write", side_effect=slow_first_write):
+            first = _asyncio.create_task(tracker.mark_many(["1"]))
+            await _asyncio.sleep(0.005)
+            second = _asyncio.create_task(tracker.mark_many(["2"]))
+            await _asyncio.gather(first, second)
+
+        assert sorted(writes[-1]) == ["1", "2"]
+

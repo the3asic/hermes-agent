@@ -142,7 +142,7 @@ def test_resolved_reasoning_effort(config, expected):
 
 
 def test_gateway_turn_metadata_uses_final_model_and_reported_turn_delta():
-    from gateway.run import _gateway_turn_runtime_metadata
+    from gateway.runtime_footer import _gateway_turn_runtime_metadata
 
     agent = SimpleNamespace(
         model="fallback-model",
@@ -199,7 +199,7 @@ def test_gateway_turn_metadata_uses_final_model_and_reported_turn_delta():
 
 
 def test_cache_heavy_turn_does_not_report_reused_context_as_new_input():
-    from gateway.run import _gateway_turn_runtime_metadata
+    from gateway.runtime_footer import _gateway_turn_runtime_metadata
 
     agent = SimpleNamespace(
         model="glm-5.3",
@@ -257,7 +257,7 @@ def test_cache_heavy_turn_does_not_report_reused_context_as_new_input():
 
 
 def test_reported_tokens_do_not_imply_exact_context_coverage():
-    from gateway.run import _gateway_turn_runtime_metadata
+    from gateway.runtime_footer import _gateway_turn_runtime_metadata
 
     agent = SimpleNamespace(
         model="MiniMax-M3",
@@ -308,7 +308,7 @@ def test_gateway_turn_metadata_labels_or_hides_incomplete_provider_usage(
     expected_tokens,
     expected_status,
 ):
-    from gateway.run import _gateway_turn_runtime_metadata
+    from gateway.runtime_footer import _gateway_turn_runtime_metadata
 
     agent = SimpleNamespace(
         model="glm-5.3",
@@ -352,7 +352,7 @@ def test_gateway_turn_metadata_labels_or_hides_incomplete_provider_usage(
 
 
 def test_gateway_reasoning_settles_cached_fallback_before_resolution():
-    from gateway.run import _install_gateway_turn_reasoning_resolver
+    from gateway.run_reasoning import _install_gateway_turn_reasoning_resolver
     from agent.turn_context import resolve_gateway_reasoning_after_runtime_restore
 
     resolved_models = []
@@ -401,6 +401,7 @@ def test_gateway_reasoning_settles_cached_fallback_before_resolution():
 
 def test_cached_fallback_uses_its_entry_effort_not_session_override(monkeypatch):
     import gateway.run as gateway_run
+    import gateway.run_reasoning as gateway_reasoning
     from agent.turn_context import resolve_gateway_reasoning_after_runtime_restore
 
     session_resolver_calls = []
@@ -427,7 +428,7 @@ def test_cached_fallback_uses_its_entry_effort_not_session_override(monkeypatch)
         lambda: {"agent": {"reasoning_effort": "high"}},
     )
 
-    gateway_run._install_gateway_turn_reasoning_resolver(
+    gateway_reasoning._install_gateway_turn_reasoning_resolver(
         runner,
         agent,
         source=SimpleNamespace(),
@@ -444,6 +445,7 @@ def test_cached_fallback_uses_its_entry_effort_not_session_override(monkeypatch)
 
 def test_fallback_reasoning_reload_failure_keeps_entry_pin(monkeypatch):
     import gateway.run as gateway_run
+    import gateway.run_reasoning as gateway_reasoning
 
     class Runner:
         def _resolve_session_reasoning_config(self, **_kwargs):
@@ -455,7 +457,7 @@ def test_fallback_reasoning_reload_failure_keeps_entry_pin(monkeypatch):
         lambda: (_ for _ in ()).throw(OSError("config unavailable")),
     )
 
-    resolved = gateway_run._resolve_gateway_reasoning_for_route(
+    resolved = gateway_reasoning._resolve_gateway_reasoning_for_route(
         Runner(),
         source=SimpleNamespace(),
         session_key="telegram:session",
@@ -470,6 +472,7 @@ def test_fallback_reasoning_resolution_failure_uses_provider_default(
     monkeypatch,
 ):
     import gateway.run as gateway_run
+    import gateway.run_reasoning as gateway_reasoning
 
     class Runner:
         def _resolve_session_reasoning_config(self, **_kwargs):
@@ -480,7 +483,7 @@ def test_fallback_reasoning_resolution_failure_uses_provider_default(
         lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("bad policy")),
     )
 
-    resolved = gateway_run._resolve_gateway_reasoning_for_route(
+    resolved = gateway_reasoning._resolve_gateway_reasoning_for_route(
         Runner(),
         source=SimpleNamespace(),
         session_key="telegram:session",
@@ -492,7 +495,7 @@ def test_fallback_reasoning_resolution_failure_uses_provider_default(
 
 
 def test_route_reasoning_policy_clears_stale_provenance_but_keeps_cooldown():
-    from gateway.run import _apply_route_reasoning_policy_to_agent
+    from gateway.run_reasoning import _apply_route_reasoning_policy_to_agent
 
     primary = SimpleNamespace(
         _fallback_activated=False,

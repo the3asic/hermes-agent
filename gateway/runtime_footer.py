@@ -63,11 +63,235 @@ piecemeal, the delivery path sends the footer as a separate trailing message.
 
 from __future__ import annotations
 
+import logging
 import os
-from typing import Any, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Optional
+
+if TYPE_CHECKING:
+    from gateway.session import SessionSource
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
+
+
+def _gateway_turn_runtime_metadata(
+    agent: Any,
+    *,
+    uncached_input_tokens_start: Any,
+    completion_tokens_start: Any,
+    cache_read_tokens_start: Any,
+    cache_write_tokens_start: Any,
+    usage_report_calls_start: Any,
+    cache_usage_report_calls_start: Any,
+    context_usage_report_calls_start: Any,
+    result_api_calls: Any,
+) -> dict[str, Any]:
+    """Snapshot honest per-turn runtime metadata from a gateway agent.
+
+    Agent token counters are cumulative for the lifetime of a cached agent, so
+    the visible turn usage is the delta from the snapshot taken immediately
+    before ``run_conversation()``.  Model and effort describe the *final* model
+    state after any fallback. Token deltas are explicitly provider-reported,
+    not a claim about unreported retries or advisor fan-out. When Hermes sees
+    logical calls without usable usage, the footer labels the known sum
+    ``reported,partial`` rather than presenting it as a complete turn total.
+    """
+    if agent is None:
+        return {}
+
+    compressor = getattr(agent, "context_compressor", None)
+    last_prompt_tokens = getattr(agent, "session_last_prompt_tokens", 0) or 0
+    context_length = getattr(compressor, "context_length", 0) or 0
+    input_tokens = getattr(agent, "session_prompt_tokens", 0) or 0
+    uncached_input_tokens = getattr(agent, "session_input_tokens", 0) or 0
+    output_tokens = getattr(agent, "session_completion_tokens", 0) or 0
+    cache_read_tokens = getattr(agent, "session_cache_read_tokens", 0) or 0
+    cache_write_tokens = getattr(agent, "session_cache_write_tokens", 0) or 0
+    usage_report_calls = (
+        getattr(agent, "session_usage_report_calls", 0) or 0
+    )
+    cache_usage_report_calls = (
+        getattr(agent, "session_cache_usage_report_calls", 0) or 0
+    )
+    context_usage_report_calls = (
+        getattr(agent, "session_context_usage_report_calls", 0) or 0
+    )
+
+    turn_input_tokens = turn_counter_delta(
+        uncached_input_tokens,
+        uncached_input_tokens_start,
+    )
+    turn_output_tokens = turn_counter_delta(
+        output_tokens, completion_tokens_start
+    )
+    turn_cache_read_tokens = turn_counter_delta(
+        cache_read_tokens, cache_read_tokens_start
+    )
+    turn_cache_write_tokens = turn_counter_delta(
+        cache_write_tokens, cache_write_tokens_start
+    )
+    input_counter_valid = turn_input_tokens is not None
+    output_counter_valid = turn_output_tokens is not None
+    cache_read_counter_valid = turn_cache_read_tokens is not None
+    cache_write_counter_valid = turn_cache_write_tokens is not None
+    turn_usage_report_calls = turn_counter_delta(
+        usage_report_calls, usage_report_calls_start
+    )
+    turn_cache_usage_report_calls = turn_counter_delta(
+        cache_usage_report_calls,
+        cache_usage_report_calls_start,
+    )
+    turn_context_usage_report_calls = turn_counter_delta(
+        context_usage_report_calls,
+        context_usage_report_calls_start,
+    )
+    try:
+        expected_api_calls = int(result_api_calls)
+    except (TypeError, ValueError):
+        expected_api_calls = None
+    token_usage_status = None
+    if (
+        isinstance(turn_usage_report_calls, int)
+        and turn_usage_report_calls > 0
+        and turn_input_tokens is not None
+        and turn_output_tokens is not None
+    ):
+        token_usage_status = "reported"
+        if (
+            expected_api_calls is None
+            or expected_api_calls < 0
+            or turn_usage_report_calls != expected_api_calls
+        ):
+            token_usage_status = "reported_partial"
+    else:
+        logger.info(
+            "Gateway runtime footer token usage unavailable: usable provider "
+            "usage observed for %r of %r logical turn API calls",
+            turn_usage_report_calls,
+            result_api_calls,
+        )
+        turn_input_tokens = None
+        turn_output_tokens = None
+    cache_usage_status = None
+    if (
+        isinstance(turn_cache_usage_report_calls, int)
+        and turn_cache_usage_report_calls > 0
+        and turn_cache_read_tokens is not None
+        and turn_cache_write_tokens is not None
+    ):
+        cache_usage_status = "reported"
+        if (
+            expected_api_calls is None
+            or expected_api_calls < 0
+            or turn_cache_usage_report_calls != expected_api_calls
+        ):
+            cache_usage_status = "reported_partial"
+    else:
+        turn_cache_read_tokens = None
+        turn_cache_write_tokens = None
+    context_usage_status = None
+    if (
+        isinstance(turn_context_usage_report_calls, int)
+        and turn_context_usage_report_calls > 0
+        and expected_api_calls is not None
+        and expected_api_calls >= 0
+        and turn_context_usage_report_calls == expected_api_calls
+        and last_prompt_tokens > 0
+    ):
+        context_usage_status = "reported"
+    if not input_counter_valid:
+        logger.warning(
+            "Gateway non-cached input-token counter moved backwards or became invalid "
+            "during a turn (start=%r current=%r); footer usage unavailable",
+            uncached_input_tokens_start,
+            uncached_input_tokens,
+        )
+    if not output_counter_valid:
+        logger.warning(
+            "Gateway completion-token counter moved backwards or became "
+            "invalid during a turn (start=%r current=%r); footer usage unavailable",
+            completion_tokens_start,
+            output_tokens,
+        )
+    if not cache_read_counter_valid:
+        logger.warning(
+            "Gateway cache-read-token counter moved backwards or became invalid "
+            "during a turn (start=%r current=%r); footer cache ratio unavailable",
+            cache_read_tokens_start,
+            cache_read_tokens,
+        )
+    if not cache_write_counter_valid:
+        logger.warning(
+            "Gateway cache-write-token counter moved backwards or became invalid "
+            "during a turn (start=%r current=%r); footer cache ratio unavailable",
+            cache_write_tokens_start,
+            cache_write_tokens,
+        )
+
+    model_last = getattr(agent, "model", None)
+    return {
+        "last_prompt_tokens": last_prompt_tokens,
+        "input_tokens": input_tokens,
+        "uncached_input_tokens": uncached_input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "usage_report_calls": usage_report_calls,
+        "cache_usage_report_calls": cache_usage_report_calls,
+        "context_usage_report_calls": context_usage_report_calls,
+        "turn_input_tokens": turn_input_tokens,
+        "turn_output_tokens": turn_output_tokens,
+        "turn_cache_read_tokens": turn_cache_read_tokens,
+        "turn_cache_write_tokens": turn_cache_write_tokens,
+        "token_usage_status": token_usage_status,
+        "cache_usage_status": cache_usage_status,
+        "context_usage_status": context_usage_status,
+        "reasoning_effort": resolved_reasoning_effort(
+            getattr(agent, "reasoning_config", None)
+        ),
+        # Keep the existing key for hooks/session consumers while exposing the
+        # explicit name to provenance-aware footer callers.
+        "model": model_last,
+        "model_last": model_last,
+        "context_length": context_length,
+    }
+
+
+def _gateway_runtime_footer_line(
+    agent_result: dict[str, Any],
+    source: "SessionSource",
+    *,
+    turn_seconds: Optional[float] = None,
+) -> str:
+    """Build one turn's configured footer from its finalized result shape."""
+    if not isinstance(agent_result, dict):
+        return ""
+    from gateway.run import _load_gateway_config, _platform_config_key, _terminal_scope_cwd
+
+    result_seconds = agent_result.get("turn_seconds")
+    if not isinstance(result_seconds, (int, float)) or isinstance(
+        result_seconds, bool
+    ):
+        result_seconds = turn_seconds
+    return build_footer_line(
+        user_config=_load_gateway_config(),
+        platform_key=_platform_config_key(source.platform),
+        model=agent_result.get("model_last") or agent_result.get("model"),
+        context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
+        context_length=agent_result.get("context_length") or None,
+        cwd=_terminal_scope_cwd(""),
+        turn_seconds=result_seconds,
+        tokens_in=agent_result.get("turn_input_tokens"),
+        tokens_out=agent_result.get("turn_output_tokens"),
+        cache_read_tokens=agent_result.get("turn_cache_read_tokens"),
+        cache_write_tokens=agent_result.get("turn_cache_write_tokens"),
+        token_usage_status=agent_result.get("token_usage_status"),
+        cache_usage_status=agent_result.get("cache_usage_status"),
+        context_usage_status=agent_result.get("context_usage_status"),
+        reasoning_effort=agent_result.get("reasoning_effort"),
+    )
 
 
 def _format_token_count(value: int) -> str:
@@ -128,44 +352,32 @@ def _home_relative_cwd(cwd: str) -> str:
 
 
 def _model_short(model: Optional[str]) -> str:
-    """Drop ``vendor/`` prefix for readability (``openai/gpt-5.4`` → ``gpt-5.4``)."""
-    if not model:
-        return ""
-    return model.rsplit("/", 1)[-1]
+    """Drop ``vendor/`` prefix (``openai/gpt-5.4`` → ``gpt-5.4``)."""
+    return model.rsplit("/", 1)[-1] if model else ""
 
 
-def resolve_footer_config(
-    user_config: dict[str, Any] | None,
-    platform_key: str | None = None,
-) -> dict[str, Any]:
-    """Resolve effective runtime-footer config for *platform_key*.
+def _env_cwd() -> str:
+    try:
+        from tools.terminal_scope import terminal_env
+    except ImportError:
+        return os.environ.get("TERMINAL_CWD", "")
+    return terminal_env("TERMINAL_CWD", "")
 
-    Merge order (later wins):
-        1. Built-in defaults (enabled=False)
-        2. ``display.runtime_footer``
-        3. ``display.platforms.<platform_key>.runtime_footer``
-    """
+
+def resolve_footer_config(user_config: dict[str, Any] | None, platform_key: str | None = None) -> dict[str, Any]:
+    """Resolve effective footer config: defaults (enabled=False) <
+    ``display.runtime_footer`` < ``display.platforms.<platform_key>.runtime_footer``."""
     resolved = {"enabled": False, "fields": list(_DEFAULT_FIELDS)}
     cfg = (user_config or {}).get("display") or {}
-
-    global_cfg = cfg.get("runtime_footer")
-    if isinstance(global_cfg, dict):
-        if "enabled" in global_cfg:
-            resolved["enabled"] = bool(global_cfg.get("enabled"))
-        if isinstance(global_cfg.get("fields"), list) and global_cfg["fields"]:
-            resolved["fields"] = [str(f) for f in global_cfg["fields"]]
-
-    if platform_key:
-        platforms = cfg.get("platforms") or {}
-        plat_cfg = platforms.get(platform_key)
-        if isinstance(plat_cfg, dict):
-            plat_footer = plat_cfg.get("runtime_footer")
-            if isinstance(plat_footer, dict):
-                if "enabled" in plat_footer:
-                    resolved["enabled"] = bool(plat_footer.get("enabled"))
-                if isinstance(plat_footer.get("fields"), list) and plat_footer["fields"]:
-                    resolved["fields"] = [str(f) for f in plat_footer["fields"]]
-
+    plat_cfg = (cfg.get("platforms") or {}).get(platform_key) if platform_key else None
+    sections = [cfg.get("runtime_footer"), plat_cfg.get("runtime_footer") if isinstance(plat_cfg, dict) else None]
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        if "enabled" in section:
+            resolved["enabled"] = bool(section.get("enabled"))
+        if isinstance(section.get("fields"), list) and section["fields"]:
+            resolved["fields"] = [str(f) for f in section["fields"]]
     return resolved
 
 
@@ -240,7 +452,7 @@ def format_runtime_footer(
             if turn_seconds is not None and turn_seconds >= 0:
                 parts.append(_format_latency(turn_seconds))
         elif field == "cwd":
-            rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
+            rel = _home_relative_cwd(cwd or _env_cwd())
             if rel:
                 parts.append(rel)
         elif field == "tokens_in":
@@ -310,6 +522,7 @@ def format_runtime_footer(
 
     if not parts:
         return ""
+
     return _SEP.join(parts)
 
 
