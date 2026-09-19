@@ -153,6 +153,29 @@ def _run_tool_loop(agent, n_tool_iterations: int):
 
 
 class TestPostToolCompressionAttemptCap:
+    @pytest.mark.parametrize("attempts", [0, 1, 2, 3])
+    def test_usage_wait_only_warns_when_attempt_cap_is_reached(self, agent, attempts):
+        from agent.turn_preflight import compress_after_tool_results
+
+        agent.context_compressor.awaiting_real_usage_after_compression = True
+        warnings = []
+        messages = [{"role": "user", "content": "Continue the task"}]
+        with patch.object(
+            agent, "_warn_context_overflow_blocked",
+            side_effect=lambda reason, *_args: warnings.append(reason),
+        ), patch.object(agent, "_compress_context") as compress:
+            verdict = compress_after_tool_results(
+                agent, messages=messages, system_message="Test",
+                user_message="Continue the task", active_system_prompt="Test",
+                conversation_history=[], compression_attempts=attempts,
+                max_compression_attempts=3, effective_task_id="usage-wait-test",
+                final_response=None, turn_exit_reason=None,
+            )
+
+        assert warnings == (["attempts_exhausted:3"] if attempts == 3 else [])
+        assert verdict.compression_attempts == attempts
+        compress.assert_not_called()
+
     def test_post_tool_gate_waits_for_usage_after_native_checkpoint(self, agent):
         agent.context_compressor.awaiting_real_usage_after_compression = True
         warnings = []
