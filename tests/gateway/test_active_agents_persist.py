@@ -270,3 +270,69 @@ def test_concurrent_status_writers_do_not_lose_each_others_updates(monkeypatch):
 
     platforms = _read_state()["platforms"]
     assert sorted(platforms) == sorted(writers)
+
+
+@pytest.mark.parametrize("lifecycle", [False, True])
+def test_count_snapshot_cannot_overwrite_a_later_completion(runner, monkeypatch, lifecycle):
+    """Serialize count collection too, not just the eventual JSON merge."""
+    import gateway.run as gateway_run
+
+    assert cron_scheduler.try_register_running_job("overlap")
+    runner._restart_requested = False
+    first_reached_write = threading.Event()
+    allow_first_write = threading.Event()
+    completion_mutated_count = threading.Event()
+    completion_finished = threading.Event()
+    failures = []
+    real_write = gateway_run._write_runtime_status_quiet
+    real_notify = cron_scheduler._notify_gateway_active_work_changed
+
+    def delayed_write(**kwargs):
+        if threading.current_thread().name == "earlier-count":
+            first_reached_write.set()
+            assert allow_first_write.wait(5)
+        real_write(**kwargs)
+
+    def observed_notify():
+        if threading.current_thread().name == "later-completion":
+            completion_mutated_count.set()
+        real_notify()
+
+    def persist_earlier():
+        try:
+            if lifecycle:
+                runner._update_runtime_status("running")
+            else:
+                runner._persist_active_agents()
+        except BaseException as exc:
+            failures.append(exc)
+
+    def finish_later():
+        try:
+            cron_scheduler.release_running_job("overlap")
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            completion_finished.set()
+
+    monkeypatch.setattr(gateway_run, "_write_runtime_status_quiet", delayed_write)
+    monkeypatch.setattr(cron_scheduler, "_notify_gateway_active_work_changed", observed_notify)
+    first = threading.Thread(target=persist_earlier, name="earlier-count")
+    second = threading.Thread(target=finish_later, name="later-completion")
+    first.start()
+    try:
+        assert first_reached_write.wait(5)
+        second.start()
+        assert completion_mutated_count.wait(5)
+        assert runner._active_work_count() == 0
+        # Without count+write serialization, the later completion publishes 0
+        # while the older captured 1 is held here, then gets overwritten.
+        completion_finished.wait(0.5)
+    finally:
+        allow_first_write.set()
+        first.join(5)
+        if second.ident is not None:
+            second.join(5)
+    assert not first.is_alive() and not second.is_alive()
+    assert not failures
+    assert _read_state()["active_agents"] == 0
