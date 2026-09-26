@@ -647,3 +647,45 @@ def finalize_turn(
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
     return result
+
+
+def apply_llm_output_transform(
+    agent, final_response, *, turn_id, platform=None, logger=None,
+) -> Tuple[Any, bool, Optional[Any]]:
+    """Fire ``transform_llm_output`` once per turn and return
+    ``(final_response, transformed, pre_transform_response)``.
+
+    Called BEFORE the final assistant row is first persisted — from ``finish_text_response``
+    ahead of its durable flush, and from ``finalize_turn._persist_step`` ahead of the
+    recovery-path tail close — so the text the user sees is the text stored in SQLite/JSON and
+    replayed next turn (#44239). SQLite treats a non-blank assistant row as settled (a re-flush
+    adopts the stored content rather than overwriting it), so transforming after that first
+    write can never reach the durable store. Idempotent per ``turn_id``: later callers in the
+    same turn get the recorded outcome instead of a second hook firing. Only the current
+    turn's not-yet-written text is touched — earlier turns and the system prompt are never
+    rewritten (prompt-cache invariant)."""
+    if logger is None:
+        from agent.conversation_loop import logger
+    recorded = getattr(agent, "_llm_output_transform", None)
+    if isinstance(recorded, tuple) and len(recorded) == 3 and recorded[0] == turn_id:
+        _, transformed, pre_transform = recorded
+        return final_response, transformed, pre_transform
+    if not final_response:
+        return final_response, False, None
+    if platform is None:
+        platform = getattr(agent, "platform", None) or ""
+    transformed, pre_transform = False, None
+    # First hook to return a string wins; None/empty leaves the text unchanged.
+    for _hook_result in _invoke_hook_safely(
+        "transform_llm_output", logger,
+        response_text=final_response,
+        session_id=agent.session_id or "",
+        model=agent.model,
+        platform=platform,
+        turn_id=turn_id,  # per-turn identity for the hook callback gate
+    ):
+        if isinstance(_hook_result, str) and _hook_result:
+            pre_transform, final_response, transformed = final_response, _hook_result, True
+            break
+    agent._llm_output_transform = (turn_id, transformed, pre_transform)
+    return final_response, transformed, pre_transform

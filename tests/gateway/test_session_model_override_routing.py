@@ -148,7 +148,8 @@ fallback_providers:
         "minimax-m2.7",
     )
     assert model == "minimax-m2.7"
-    assert runtime_kwargs["provider"] == "custom"
+    assert runtime_kwargs["provider"] == "opencode-go-bridge"
     assert runtime_kwargs["api_key"] == "fallback-key"
     assert runtime_kwargs["api_mode"] == "anthropic_messages"
     assert runtime_kwargs["base_url"] == "https://opencode.ai/zen/go"
+    # Upstream #98739: retain the configured provider identity, not bare "custom".

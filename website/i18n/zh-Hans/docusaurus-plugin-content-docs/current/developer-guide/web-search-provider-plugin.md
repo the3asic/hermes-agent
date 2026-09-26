@@ -9,7 +9,7 @@ description: "如何为 Hermes Agent 构建网页搜索/提取/爬取后端插�
 网页搜索提供商插件注册一个后端，用于处理 `web_search`、`web_extract` 以及（可选的）深度爬取工具调用。内置提供商——Firecrawl、SearXNG、Tavily、Exa、Parallel、Brave Search（免费层）和 DDGS——均以插件形式存放于 `plugins/web/<name>/` 目录下。你可以在该目录旁新建一个目录来添加新提供商，或覆盖已有的内置提供商。
 
 :::tip
-网页搜索是 Hermes 支持的多种**后端插件**之一。其他插件（各有其 ABC）包括：[图像生成提供商插件](/developer-guide/image-gen-provider-plugin)、[视频生成提供商插件](/developer-guide/video-gen-provider-plugin)、[记忆提供商插件](/developer-guide/memory-provider-plugin)、[上下文引擎插件](/developer-guide/context-engine-plugin)和[模型提供商插件](/developer-guide/model-provider-plugin)。通用工具/hook/CLI 插件请参阅[构建 Hermes 插件](/developer-guide/plugins)。
+网页搜索是 Hermes 支持的多种**后端插件**之一。其他插件（各有其 ABC）包括：[图像生成提供商插件](./image-gen-provider-plugin.md)、[视频生成提供商插件](./video-gen-provider-plugin.md)、[记忆提供商插件](./memory-provider-plugin.md)、[上下文引擎插件](./context-engine-plugin.md)和[模型提供商插件](./model-provider-plugin.md)。通用工具/hook/CLI 插件请参阅[构建 Hermes 插件](./plugins/index.md)。
 :::
 
 ## 发现机制
@@ -141,7 +141,7 @@ requires_env:
 |---|---|
 | `kind: backend` | 将插件路由至后端加载路径 |
 | `provides_web_providers` | 该插件注册的提供商 `name` 列表——在 `register()` 运行之前，加载器即可通过此字段在 `hermes tools` 中公示插件 |
-| `requires_env` | 在 `hermes plugins install` 期间进行交互式凭据提示（富格式说明参见[构建 Hermes 插件](/developer-guide/plugins#gate-on-environment-variables)） |
+| `requires_env` | 在 `hermes plugins install` 期间进行交互式凭据提示（富格式说明参见[构建 Hermes 插件](./plugins/index.md#gate-on-environment-variables)） |
 
 ## ABC 参考
 
@@ -202,7 +202,7 @@ requires_env:
 {"success": False, "error": "human-readable message"}
 ```
 
-`search()` 必须是同步方法：当前 `web_search` 工具会直接调用它。`extract()` 可以同步，也可以定义为 `async def`；extract dispatcher 会检测协程并 await。Hermes client-function wrapper 生成的每个格式正确的搜索 success 都带强制 provenance；`web_extract` 仍使用上面的 extract envelope。
+`search()` 和 `extract()` 均可定义为 `async def`——调度器通过 `inspect.iscoroutinefunction` 检测协程函数并相应地进行 await。对于小型后端，执行阻塞 I/O（HTTP、SDK 调用）的同步实现也完全可行；调度器会处理线程调度。
 
 ## 能力标志
 
@@ -224,18 +224,16 @@ web:
 `web_search` 和 `web_extract` 工具位于 `tools/web_tools.py`。调用时执行以下步骤：
 
 1. 读取相关配置键（`web_search` 对应 `web.search_backend`，`web_extract` 对应 `web.extract_backend`）
-2. 按 `name` 解析显式配置的 provider；只有没有适用 selection 的 fallback 路径才会用 `is_available()` 遍历可用 provider
-3. 检查对应的 `supports_*()` 标志。显式 provider 会保持选中并返回自身 credential/network failure，不会被静默跳过
-4. 直接调用同步 `search()`；或调用 `extract()`（deep crawl 是 extract mode），若它是协程则 await
-5. 严格验证 success/data/web envelope，只缓存格式正确的 success
-6. 为每个格式正确的 `web_search` success 加入强制 provenance contract
-7. 将 envelope 序列化；已配置的高权限 `tool_execution` middleware 或 `transform_tool_result` hook 仍可替换它；任一路径改写 wrapper success，或让 non-success/short-circuit 结果声称 success 时，Hermes 都会记录告警
+2. 向注册表查询具有该 `name` 的提供商
+3. 检查 `is_available()` 及对应的 `supports_*()` 标志
+4. 调度至 `search()` / `extract()` / `crawl()`，若方法为协程则进行 await
+5. 将响应信封 JSON 序列化后返回给 LLM
 
 错误以工具结果的形式呈现；LLM 决定如何解释。若没有提供商被注册（或所有可用提供商均未通过能力检查），工具将返回一条指向 `hermes tools` 的友好错误信息。
 
 ## 懒加载可选依赖
 
-如果你的提供商封装了第三方 SDK（如 DDGS 封装了 `ddgs` 包），请勿在模块顶层 `import`。在 `is_available()` 或 `search()` 内部使用 `tools.lazy_deps.ensure(...)` ——Hermes 将在首次使用时安装该包，并受 `security.allow_lazy_installs` 控制。安全模型详见[构建 Hermes 插件 → 懒加载](/developer-guide/plugins#lazy-install-optional-python-dependencies)。
+如果你的提供商封装了第三方 SDK（如 DDGS 封装了 `ddgs` 包），请勿在模块顶层 `import`。在 `is_available()` 或 `search()` 内部使用 `tools.lazy_deps.ensure(...)` ——Hermes 将在首次使用时安装该包，并受 `security.allow_lazy_installs` 控制。安全模型详见[构建 Hermes 插件 → 懒加载](./plugins/index.md#lazy-install-optional-python-dependencies)。
 
 ## 参考实现
 
@@ -253,10 +251,10 @@ web:
 my-backend-web = "my_backend_web_package"
 ```
 
-`my_backend_web_package` 必须暴露顶层 `register` 函数。完整配置说明参见通用插件指南中的[通过 pip 分发](/developer-guide/plugins#distribute-via-pip)。
+`my_backend_web_package` 必须暴露顶层 `register` 函数。完整配置说明参见通用插件指南中的[通过 pip 分发](./plugins/index.md#distribute-via-pip)。
 
 ## 相关页面
 
-- [网页搜索](/user-guide/features/web-search) — 面向用户的功能文档及各后端配置说明
-- [插件概览](/user-guide/features/plugins) — 所有插件类型一览
-- [构建 Hermes 插件](/developer-guide/plugins) — 通用工具/hook/斜杠命令指南
+- [网页搜索](../user-guide/features/web-search.md) — 面向用户的功能文档及各后端配置说明
+- [插件概览](../user-guide/features/plugins.md) — 所有插件类型一览
+- [构建 Hermes 插件](./plugins/index.md) — 通用工具/hook/斜杠命令指南

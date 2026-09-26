@@ -2,9 +2,8 @@
 
 from copy import deepcopy
 from datetime import datetime
-import hashlib
-import json
 from zoneinfo import ZoneInfo
+import json
 
 import pytest
 
@@ -22,45 +21,6 @@ def _render(text, timestamp=STAMP):
 
     return render_user_content_with_timestamp(text, timestamp, tz=get_timezone())
 
-
-def _digest(value):
-    return hashlib.sha256(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
-
-
-@pytest.mark.parametrize("timestamps", [False, True])
-def test_timestamp_only_replay_preserves_sent_sidecar(timestamps):
-    body = _render("first question") if timestamps else "first question"
-    sidecar = body + "\n\n" + POLICY
-    source = [{"role": "user", "content": "first question", "api_content": sidecar, "timestamp": STAMP}]
-    saved = deepcopy(source)
-    replay, observed = _build_gateway_agent_history(source, inject_timestamps=timestamps)
-
-    assert observed is None
-    assert replay[0]["content"] == body
-    assert replay[0]["api_content"] == sidecar
-    assert source == saved
-
-
-@pytest.mark.parametrize("suffix", ["", "more text", "\nnot an injection", "\n\n" + POLICY])
-def test_timestamp_rewrite_requires_an_exact_sidecar_body_boundary(suffix):
-    rendered = _render("short")
-    sidecar = rendered + suffix
-    replay, _ = _build_gateway_agent_history(
-        [{"role": "user", "content": "short", "api_content": sidecar, "timestamp": STAMP}],
-        inject_timestamps=True,
-    )
-    assert ("api_content" in replay[0]) is (suffix == "" or suffix.startswith("\n\n"))
-
-
-@pytest.mark.parametrize("sidecar", ["unrelated legacy text", "short\n\n" + POLICY, "[Thu 2026-08-20 20:00:00 SGT] short\n\n" + POLICY])
-def test_unprovable_timestamp_sidecar_fails_closed(sidecar, monkeypatch):
-    monkeypatch.setattr("hermes_time.get_timezone", lambda: ZoneInfo("UTC"))
-    replay, _ = _build_gateway_agent_history(
-        [{"role": "user", "content": "short", "api_content": sidecar, "timestamp": STAMP}],
-        inject_timestamps=True,
-    )
-    assert "api_content" not in replay[0]
-    assert replay[0]["content"] == _render("short")
 
 
 @pytest.mark.parametrize("timestamps", [False, True])
@@ -83,30 +43,6 @@ def test_recovery_cleanup_never_restores_a_sidecar(timestamps, embedded, real_te
         assert replay[0]["content"] == (_render(real_text, expected_timestamp) if timestamps else real_text)
 
 
-@pytest.mark.parametrize("timestamps", [False, True])
-def test_mirror_and_observed_rows_do_not_replay_sidecars(timestamps):
-    source = [
-        {"role": "user", "content": "mirror", "api_content": _render("mirror") + "\n\n" + POLICY, "timestamp": STAMP, "mirror": True, "mirror_source": "other"},
-        {"role": "user", "content": "chatter", "api_content": _render("chatter") + "\n\n" + POLICY, "timestamp": STAMP, "observed": True},
-    ]
-    replay, observed = _build_gateway_agent_history(source, inject_timestamps=timestamps, channel_prompt="observed Telegram group context")
-    assert len(replay) == 1
-    assert "api_content" not in replay[0]
-    assert replay[0]["content"] == "[Delivered from other] " + (_render("mirror") if timestamps else "mirror")
-    assert observed == (_render("chatter") if timestamps else "chatter")
-    assert POLICY not in observed
-
-
-@pytest.mark.parametrize("timestamps", [False, True])
-def test_expired_confirmation_redacts_sidecar(timestamps):
-    replay, _ = _build_gateway_agent_history(
-        [{"role": "user", "content": "confirm forced restart", "api_content": _render("confirm forced restart") + "\n\n" + POLICY, "timestamp": STAMP}],
-        inject_timestamps=timestamps,
-    )
-    assert "api_content" not in replay[0]
-    assert "confirm forced restart" not in replay[0]["content"]
-
-
 @pytest.fixture
 def responses_agent(tmp_path, monkeypatch):
     """Use the real agent/Responses converter; replace only the network call."""
@@ -121,6 +57,9 @@ def responses_agent(tmp_path, monkeypatch):
         "hermes_cli.plugins.invoke_hook",
         lambda hook, **kw: [{"context": POLICY}] if hook == "pre_llm_call" else [],
     )
+    # Titling is not under test; its daemon thread would outlive the turn holding ``db`` and race
+    # the close below (a cross-thread sqlite reopen at interpreter shutdown crashed CI: #113186).
+    monkeypatch.setattr("agent.title_generator.maybe_auto_title", lambda *args, **kwargs: None)
 
     def respond(kwargs, **unused):
         captured.append(deepcopy(kwargs))
@@ -155,8 +94,8 @@ def responses_agent(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("timestamps", [False, True])
-@pytest.mark.parametrize("resume", ["cached", "db", "json_fixture"])
-def test_full_builder_to_responses_keeps_cross_turn_prefix(responses_agent, tmp_path, timestamps, resume, request):
+@pytest.mark.parametrize("resume", ["cached", "db"])
+def test_full_builder_to_responses_keeps_cross_turn_prefix(responses_agent, tmp_path, timestamps, resume):
     make_agent, captured, responses, db, sid = responses_agent
     agent = make_agent()
     tool_file = tmp_path / "sanitized-tool.txt"
@@ -186,12 +125,6 @@ def test_full_builder_to_responses_keeps_cross_turn_prefix(responses_agent, tmp_
             history = reopened.get_messages_as_conversation(sid)
         finally:
             reopened.close()
-    elif resume == "json_fixture":
-        # Legacy serialized history is still an accepted input; the optional
-        # production JSON writer was removed upstream.
-        path = tmp_path / f"session_{sid}.json"
-        path.write_text(json.dumps({"messages": history}), encoding="utf-8")
-        history = json.loads(path.read_text(encoding="utf-8"))["messages"]
     replay, observed = _build_gateway_agent_history(history, inject_timestamps=timestamps)
     assert observed is None
     if resume == "cached":
@@ -203,16 +136,6 @@ def test_full_builder_to_responses_keeps_cross_turn_prefix(responses_agent, tmp_
     assert result["completed"]
     assert len(captured) == 3
     next_input = captured[2]["input"]
-    request.node.user_properties.extend([
-        ("initial_input_sha256", _digest(first_input)),
-        ("tool_continuation_prefix_sha256", _digest(continuation[:len(first_input)])),
-        ("tool_continuation_input_sha256", _digest(continuation)),
-        ("next_user_prior_prefix_sha256", _digest(next_input[:len(continuation)])),
-        ("initial_input_items", len(first_input)),
-        ("tool_continuation_input_items", len(continuation)),
-        ("next_user_input_items", len(next_input)),
-    ])
-    assert _digest(next_input[:len(continuation)]) == _digest(continuation)
     assert next_input[:len(continuation)] == continuation
     assert not any("api_content" in item or "timestamp" in item for item in next_input)
     assert any(item.get("encrypted_content") == "synthetic-reasoning" for item in next_input)

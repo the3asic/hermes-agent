@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.browser_tool_origin import origin as _bt
@@ -696,6 +696,106 @@ def _spawn_and_collect(
     return _interpret_browser_command_output(command, stdout, stderr, proc.returncode)
 
 
+def run_fenced(session_info: Dict[str, Any], fn: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
+    """Run ``fn`` under the Bot Desktop lease fence when ``session_info`` is the bot's LOCAL browser.
+
+    That browser lives on the Bot Desktop screen, in the same profile a human who took over is typing
+    into. While the human holds the lease every action AND read against it is refused (the page may show
+    their credential); the fence brackets the whole run so a takeover mid-command also voids the result.
+    Cloud / user-supplied CDP sessions are a different browser and run unfenced. This is THE fence: every
+    path that reaches the page (agent-browser subprocess, CDP supervisor fast path) goes through here.
+    """
+    if not _shares_bot_desktop_browser(session_info):
+        return fn()
+    from tools.bot_desktop import lease as _bd_lease
+    try:
+        admitted = _bd_lease.assert_agent_may_act()
+    except _bd_lease.HumanHasControl as e:
+        return {"success": False, "error": str(e), "code": "human_has_control"}
+    result = fn()
+    if _bd_lease.get().epoch != admitted.epoch:
+        return {"success": False, "code": "human_has_control",
+                "error": "A human took over the bot's screen while this browser command ran; its result was "
+                         "discarded. Tell the user what you need; retry once they hand back."}
+    return result
+
+
+def run_fenced_pair(session_info: Dict[str, Any], fn: Callable[[], "tuple[str, Dict[str, Any]]"]) -> "tuple[str, Dict[str, Any]]":
+    """``run_fenced`` for the dispatch shape ``(engine, result)``; a refusal carries no engine (never ran)."""
+    engine_box: list = []
+
+    def _call() -> Dict[str, Any]:
+        engine, result = fn()
+        engine_box.append(engine)
+        return result
+
+    result = run_fenced(session_info, _call)
+    return (engine_box[0] if engine_box else "auto"), result
+
+
+def _shares_bot_desktop_browser(session_info: Dict[str, Any]) -> bool:
+    """Decided by provenance, not transport: every LOCAL session (plain ``--session``, real-profile CDP
+    attach, Lightpanda) is a browser Hermes launched with this profile's Bot Desktop DISPLAY, so it is the
+    screen a human who took over is typing into. Cloud / user-supplied CDP sessions are another browser.
+    A human lease with the screen already gone (dead Xvnc) still fences — computer_use does the same."""
+    if not (session_info.get("features") or {}).get("local"):
+        return False
+    from tools.bot_desktop import lease as _bd_lease, runtime as _bd_runtime
+    return bool(_bd_runtime.published_env().get("DISPLAY")) or _bd_lease.human_holds()
+
+
+def _bot_desktop_attach_port(session_info: Dict[str, Any]) -> Optional[int]:
+    """DevTools port of a human-started Chromium on the Bot Desktop's shared profile, else ``None``."""
+    if not _shares_bot_desktop_browser(session_info):
+        return None
+    from tools.bot_desktop import browser as _bd_browser
+    return _bd_browser.running_instance_cdp_port(str(_bd_browser.profile_dir()),
+                                                 exclude_session=session_info["session_name"])
+
+
+def _dispatch_browser_command(
+    task_id: str, session_info: Dict[str, Any], browser_cmd: str, command: str, args: List[str],
+    timeout: int, _engine_override: Optional[str],
+) -> "tuple[str, Dict[str, Any]]":
+    """Build the agent-browser argv for ``session_info`` and run it once → ``(engine, result)``."""
+    # Cleanup stops the supervisor before closing the backend; keep it stopped.
+    if command != "close" and session_info.get("cdp_url"):
+        _cdp._ensure_cdp_supervisor(task_id)
+
+    # Cloud/CDP: ``--cdp <ws_url>`` (NEVER with --session: agent-browser >=0.13
+    # would create a local browser and silently ignore --cdp). Local: ``--session <name>``.
+    # Engine injection keys off the resolved session backend, not global provider
+    # state: hybrid routing can create a local sidecar while a cloud provider stays configured.
+    engine = _engine_override or _cloud._get_browser_engine()
+    if session_info.get("cdp_url"):
+        backend_args = ["--cdp", session_info["cdp_url"]]
+    else:
+        backend_args = ["--session", session_info["session_name"]]
+        if (bd_port := _bot_desktop_attach_port(session_info)) is not None:
+            # A Chromium already runs on the Bot Desktop's shared profile (the human clicked the dock's
+            # Browser first): a launch would be forwarded into it by Chromium's singleton and die without
+            # a DevTools endpoint, so the session's daemon attaches to the port it advertises instead.
+            # Same daemon (keyed by --session) either way, so snapshot refs stay valid across commands.
+            backend_args += ["--cdp", str(bd_port)]
+        if _cloud._is_headed_mode():
+            backend_args.append("--headed")
+        if engine != "auto" and not _bt._is_camofox_mode():
+            backend_args += ["--engine", engine]
+
+    argv = _agent_browser_argv(browser_cmd)
+    spawn_command, spawn_args, stdin_payload = _shim_safe_args(argv[0], command, args)
+    cmd_parts = argv + backend_args + ["--json", spawn_command] + spawn_args
+
+    try:
+        result = _unwrap_batch_result(
+            _spawn_and_collect(task_id, session_info, cmd_parts, command, engine, timeout, stdin_payload), command)
+    except Exception as e:
+        _bt.logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
+        result = {"success": False, "error": str(e)}
+    return engine, result
+
+
+
 @_serialize_browser_task_command
 def _run_browser_command(
     task_id: str,
@@ -778,3 +878,13 @@ def _run_browser_command(
         return _lp._annotate_lightpanda_fallback(fallback_result, fallback_reason)
 
     return result
+
+
+def human_holds_shared_browser(session_info: Dict[str, Any]) -> bool:
+    """True while a human holds the Bot Desktop lease over the browser ``session_info`` shares with them.
+    The janitor treats that as activity: reaping the browser mid-login is the human's session dying under
+    them, not an idle agent's cleanup (#110064)."""
+    if not _shares_bot_desktop_browser(session_info):
+        return False
+    from tools.bot_desktop import lease as _bd_lease
+    return _bd_lease.human_holds()

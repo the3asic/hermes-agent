@@ -22,8 +22,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home
 from hermes_startup_watchdog import report_startup_progress
+from hermes_state_holders import read_only_db_uri
 from hermes_state_common import (
-    FTS_STALE_KEY, FTS_STALE_HEALTH_REASON,
     _acquire_db_flock, _clear_lock_holder_record, _describe_lock_holder, _read_lock_holder_record,
     is_advisory_lock_contention,
 )
@@ -580,8 +580,16 @@ def _connect_repair_durable(db_path: Path, *, timeout: float = 5.0) -> sqlite3.C
     no ``checkpoint_fullfsync`` — on Darwin an interrupted ``REINDEX``/``VACUUM``/``writable_schema`` rewrite leaves
     half-written b-tree pages. Autocommit (``isolation_level=None``): DDL and ``VACUUM`` are illegal inside an
     implicit transaction. Barriers are best-effort: on a malformed schema even ``PRAGMA synchronous=FULL`` raises,
-    so whole-file rewrites call :func:`_reapply_durability_barriers` once the schema parses again."""
-    conn = sqlite3.connect(str(db_path), timeout=timeout, isolation_level=None)
+    so whole-file rewrites call :func:`_reapply_durability_barriers` once the schema parses again.
+
+    Tracked (:func:`hermes_cli.sqlite_safe_read.connect_tracked`) because repair connections hold the
+    strongest locks in the process (``locking_mode=EXCLUSIVE``, ``BEGIN IMMEDIATE``); an untracked fd let
+    the byte-level probes ``open()``/``close()`` the live file, which cancels every POSIX advisory lock this
+    process holds on it (sqlite.org/howtocorrupt §2.2) and lets an external writer commit mid-repair (#63386).
+    """
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    conn = connect_tracked(db_path, tracking_path=db_path, timeout=timeout, isolation_level=None)
     _reapply_durability_barriers(conn)
     return conn
 
@@ -728,7 +736,7 @@ def state_db_has_structural_damage(db_path: Path) -> bool:
     while ``messages``/``sessions`` read cleanly, and the FTS rebuild ladder cannot help.
     Cannot-open / locked stays False so the caller keeps the FTS path."""
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        conn = sqlite3.connect(read_only_db_uri(db_path), uri=True, timeout=1.0)
     except sqlite3.Error:
         return False
     try:
@@ -767,14 +775,6 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
             # tokenizer absence must never classify as corruption.
             load_fts5_cjk_extension(conn)
             conn.execute("PRAGMA journal_mode").fetchone()
-            # Detached indexes stay unhealthy until explicit repair; report the
-            # durable handoff before probing their known-broken shadow tables.
-            try:
-                if conn.execute("SELECT 1 FROM state_meta WHERE key = ? LIMIT 1", (FTS_STALE_KEY,)).fetchone():
-                    return FTS_STALE_HEALTH_REASON
-            except sqlite3.OperationalError as exc:
-                if "no such table" not in str(exc).lower():
-                    raise
             rows = conn.execute("PRAGMA integrity_check").fetchall()
             problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
             if problems:
@@ -833,15 +833,12 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
 
 
 def _live_writer_holds_db(db_path: Path) -> bool:
-    """True when a connection outside this call still holds ``db_path`` open.
+    """True when another process (or a connection outside this call) still holds ``db_path``.
 
-    Asks SQLite for what a repair needs and a live holder cannot grant: ``locking_mode=EXCLUSIVE`` then
-    ``BEGIN IMMEDIATE`` — in WAL mode that needs exclusive WAL-index locks, so any other open connection fails
-    it with SQLITE_BUSY; neither statement parses the schema, so it works on malformed DBs. Fails **open**
-    (False) on anything but a positive busy/locked signal: refusing to repair a DB nobody holds would strand
-    the self-heal path. In ``journal_mode=DELETE`` a held reader takes only SHARED and this returns False;
-    repair is then serialised only by the cross-process repairer lock. Before probing, the foreign-holder scan
-    (``hermes_state_holders``) fails closed on deleted-WAL-generation, uninspectable, or unknown holders."""
+    The foreign-holder scan (``hermes_state_holders``) is the authority: any other process with the DB or a
+    WAL sidecar open, a deleted WAL generation, or an unknown/uninspectable holder fails CLOSED. The SQLite
+    probe (``locking_mode=EXCLUSIVE`` + ``BEGIN IMMEDIATE``) is only an additional positive signal — it cannot
+    see a ``journal_mode=DELETE`` reader and cannot run on a malformed file, which is why the scan comes first."""
     import hermes_state_holders as _state_holders
     return _state_holders.live_writer_holds_db(db_path, connect_repair_durable=_connect_repair_durable)
 
@@ -995,8 +992,7 @@ def _repair_state_db_schema_locked(
         return _repair_skip(report, "aborted", f"could not remove a stale repair snapshot before probing state.db: {cleanup_error}")
     # Re-probe under the lock: a process we queued behind may have just repaired the file; redoing surgery
     # would undo it (the repair/re-corrupt cascade).
-    probe_reason = _db_opens_cleanly(db_path)
-    if probe_reason is None:
+    if _db_opens_cleanly(db_path) is None:
         report["repaired"], report["strategy"] = True, "already_healthy"
         return report
     if backup:
@@ -1025,17 +1021,7 @@ def _repair_state_db_schema_locked(
             # Private marker for the outer wrapper: a strategy failure consumes the persistent budget; a
             # promotion failure is classified separately.
             report["_repair_attempted"] = True
-            if probe_reason == FTS_STALE_HEALTH_REASON:
-                from hermes_state import SessionDB
-                try:
-                    repair_db = SessionDB(db_path=scratch, allow_fts_rebuild=True)
-                    repair_db.close()
-                    if _db_opens_cleanly(scratch) is None:
-                        report.update(repaired=True, strategy="rebuild_stale_fts_offline")
-                except sqlite3.DatabaseError:
-                    logger.warning("Explicit stale-FTS rebuild failed on repair snapshot.", exc_info=True)
-            if not report.get("repaired"):
-                _run_repair_strategies(scratch, report)
+            _run_repair_strategies(scratch, report)
             if report.get("repaired"):
                 # Never ``os.replace`` the live DB: Windows rejects replacement under open handles and POSIX would
                 # leave those handles on the old inode. The guard keeps writer exclusion throughout.
@@ -1128,7 +1114,7 @@ def _strategy_dedup_schema(conn: sqlite3.Connection) -> None:
 
 
 def _strategy_drop_fts_vacuum(conn: sqlite3.Connection) -> None:
-    """Drop all FTS schema and VACUUM; indexes remain offline until repair. The
+    """Drop all FTS schema and VACUUM; indexes rebuild on the next open. The
     destructive one, and why strategies run on a scratch copy: on a damaged
     schema b-tree VACUUM silently drops every table hanging off the unreadable part."""
     _edit_sqlite_master(conn, lambda: conn.execute("DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'") or True)
@@ -1147,8 +1133,8 @@ _REPAIR_STRATEGIES = (
     ("dedup_schema", _strategy_dedup_schema,
      "state.db schema repaired by de-duplicating sqlite_master (FTS index preserved): %s",
      "state.db dedup repair pass failed: %s"),
-    ("drop_fts_deferred", _strategy_drop_fts_vacuum,
-     "state.db canonical tables repaired; FTS indexes await explicit offline rebuild: %s", None),
+    ("drop_fts_rebuild", _strategy_drop_fts_vacuum,
+     "state.db schema repaired by dropping FTS schema; indexes will rebuild from messages on next open: %s", None),
 )
 
 
@@ -1166,20 +1152,7 @@ def _run_repair_strategies(db_path: Path, report: Dict[str, Any]) -> Dict[str, A
             if failure_msg is not None:
                 logger.warning(failure_msg, exc)
         if reason is None:
-            if name == "drop_fts_deferred":
-                try:
-                    with _repair_conn(db_path) as conn:
-                        conn.execute(
-                            "INSERT INTO state_meta (key, value) VALUES (?, '1') "
-                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (FTS_STALE_KEY,),
-                        )
-                        conn.commit()
-                except sqlite3.DatabaseError as exc:
-                    report["error"] = str(exc)
-                    logger.warning("Could not persist stale FTS marker after drop: %s", exc)
-                    return report
             report["repaired"], report["strategy"] = True, name
-            report["error"] = None
             logger.warning(success_msg, db_path)
             return report
         if failure_msg is None:

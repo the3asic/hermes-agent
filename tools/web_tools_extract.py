@@ -2,6 +2,8 @@
 
 Order of controls (each is a gate, never skipped by a cache hit): secret-URL
 refusal -> SSRF filter (in web_tools.web_extract_tool) -> provider resolution
+ (strict selection) -> per-URL website policy -> disk cache -> vendor call with
+ one-shot keyless rescue. Logs under the origin (tools.web_tools) logger.
 (strict selection) -> per-URL website policy -> disk cache -> vendor call with
 one-shot keyless rescue. Logs under the origin (tools.web_tools) logger.
 """
@@ -175,6 +177,7 @@ def _reconcile_extract_results(
     )
 
 _NO_RESULT_ERROR = "Extract backend returned no result for this URL"
+_DEFAULT_EXTRACT_TIMEOUT_S = 120.0
 _EXTRACT_BACKENDS_HINT = "firecrawl, tavily, keenable, exa, or parallel."
 _INVALID_ITEM_ERROR = (
     "Invalid URL item at index {}: expected a URL string or an object with a string 'url' or 'href' field"

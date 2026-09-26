@@ -6,6 +6,7 @@ import contextlib
 import os
 from typing import Optional, Tuple
 
+from agent.proxy_bypass import loopback_request_kwargs
 from tools.browser_tool_origin import origin_module as _origin
 from tools.browser_tool_origin import origin as _bt
 from tools import browser_tool_lifecycle as _lifecycle
@@ -50,7 +51,7 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     san = _bt._sanitize_url_for_logs
     try:
         import requests  # lazy — shared module object, test patches still apply
-        response = requests.get(version_url, timeout=10)
+        response = requests.get(version_url, timeout=10, **loopback_request_kwargs(version_url))
         response.raise_for_status()
         payload = response.json()
     except Exception as exc:

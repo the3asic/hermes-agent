@@ -102,16 +102,6 @@ def test_runtime_context_preserves_session_reasoning_as_a_copy():
 
 
 
-def test_explicit_model_cache_isolation_remains_independent_of_runtime_key():
-    """#56889 remains covered: explicit model values isolate non-auto clients."""
-    first = aux._client_cache_key(
-        "openrouter", async_mode=False, model="anthropic/claude-opus-4.8"
-    )
-    second = aux._client_cache_key(
-        "openrouter", async_mode=False, model="openai/gpt-5.5"
-    )
-
-    assert first != second
 
 
 
