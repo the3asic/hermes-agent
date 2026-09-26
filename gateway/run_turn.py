@@ -3766,7 +3766,7 @@ class GatewayTurnMixin:
             )
             try:
                 delivery_text = f"{first_response}\n\n{footer}" if footer and not _already_streamed else first_response
-                await self._deliver_queued_first_response(
+                _text_delivered = await self._deliver_queued_first_response(
                     delivery_text, source=turn_ctx.source, adapter=adapter,
                     metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
                     text_already_delivered=_already_streamed,
