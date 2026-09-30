@@ -20,7 +20,9 @@ import shutil
 import stat as stat_mod
 import subprocess
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import wraps
 from pathlib import Path
 from typing import Dict, Iterator, List, NamedTuple, Optional, Set, Tuple
 
@@ -284,7 +286,101 @@ def _git_out(args: List[str], store: Path, working_dir: str, rc: Optional[Set[in
 
 def _ref_tip(store: Path, working_dir: str, ref: str) -> Optional[str]:
     """Commit sha at ``ref``, or None when the ref does not exist yet."""
-    return _git_out(["rev-parse", "--verify", ref + "^{commit}"], store, working_dir, {128}) or None
+    tip = _git_out(["rev-parse", "--verify", ref + "^{commit}"], store, working_dir, {128})
+    if tip:
+        return tip
+    # A damaged ref is not a first checkpoint: creating a parentless commit would
+    # overwrite the only pointer to its older history.
+    exists, _, err = _run_git(["show-ref", "--verify", "--quiet", ref], store, working_dir,
+                              allowed_returncodes={1, 128})
+    if exists or err or (store / ref).exists():
+        raise RuntimeError(f"Cannot resolve checkpoint history for {ref}: {err}")
+    return None
+
+
+def _repair_invalid_loose_refs(store: Path) -> int:
+    """Expose an intact packed predecessor, preserving each damaged loose ref.
+
+    The caller holds the store fence; Git's own ref lock also excludes an
+    external ``update-ref`` while the loose file is moved. Never infer a fresh
+    project from corruption when Git cannot resolve a surviving packed commit.
+    """
+    if not _store_has_head(store):
+        return 0
+    ok, _, err = _run_git(["show-ref"], store, str(store.parent), allowed_returncodes={1, 128})
+    if (ok and "broken ref" not in err.lower()) or not err:
+        return 0
+    if not any(message in err.lower() for message in ("bad ref", "broken ref")):
+        raise RuntimeError(f"Cannot inspect checkpoint refs: {err}")
+
+    repaired = 0
+    for path in (store / _REFS_PREFIX).rglob("*"):
+        if not path.is_file() or path.is_symlink() or path.name.endswith(".lock"):
+            continue
+        ref = path.relative_to(store).as_posix()
+        lock_path = path.with_name(path.name + ".lock")
+        handle = lock_path.open("xb")  # An existing Git writer owns its lock; leave it untouched.
+        try:
+            with handle:
+                original = path.read_bytes()
+                oid = original.decode("ascii", errors="replace").strip()
+                if oid.startswith("ref: "):
+                    continue  # Symbolic refs are resolved by Git, never rewritten here.
+                if re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", oid):
+                    valid, _, object_err = _run_git(["cat-file", "-e", oid + "^{commit}"],
+                                                    store, str(store.parent), allowed_returncodes={128})
+                    if valid:
+                        continue
+                    if not any(message in object_err.lower() for message in
+                               ("not a valid object name", "expected commit type")):
+                        raise RuntimeError(f"Cannot inspect checkpoint object {oid}: {object_err}")
+                quarantine_root = store.parent / "corrupt-refs"
+                quarantine_root.mkdir(mode=0o700, exist_ok=True)
+                quarantine = quarantine_root / f"{time.time_ns()}-{os.getpid()}" / ref
+                quarantine.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(path, quarantine)
+                try:
+                    if _ref_tip(store, str(store.parent), ref) is None:
+                        raise RuntimeError(f"No intact packed checkpoint history for {ref}")
+                except Exception:
+                    os.replace(quarantine, path)
+                    # Failed recovery can be retried every turn; keep only the
+                    # original ref, rather than growing empty quarantine trees.
+                    for directory in quarantine.parents:
+                        if directory == quarantine_root:
+                            break
+                        directory.rmdir()
+                    raise
+                repaired += 1
+                logger.warning("Preserved damaged checkpoint ref %s in %s; reusing packed history", ref, quarantine)
+        finally:
+            lock_path.unlink(missing_ok=True)
+    return repaired
+
+
+@contextmanager
+def _checkpoint_store_lock(store: Path, *, repair_refs: bool = True):
+    """Use the existing reentrant process fence for snapshots and immediate-prune GC.
+
+    The sidecar lives beside the base so clearing/recreating the store cannot
+    unlink the locked inode and let a new writer bypass an already waiting one.
+    """
+    from tools.skill_usage import fcntl, msvcrt, skill_file_lock
+    if fcntl is None and msvcrt is None:
+        raise RuntimeError("Checkpoint store locking is unsupported on this platform")
+    base = store.parent
+    with skill_file_lock(base.with_name(base.name + ".lock")):
+        if repair_refs:
+            _repair_invalid_loose_refs(store)
+        yield
+
+
+def _serialized_store_write(func):
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        with _checkpoint_store_lock(_store_path()):
+            return func(*args, **kwargs)
+    return wrapped
 
 
 def _ref_commit_count(store: Path, working_dir: str, ref: str) -> int:
@@ -568,10 +664,11 @@ def _stage_all(p: _ProjectRefs) -> Tuple[bool, str, str]:
 def _diff_staged_tree(p: _ProjectRefs, *diff_args: List[str]) -> List[Tuple[bool, str, str]]:
     """Stage the working tree (so new files show), run each ``git diff`` variant,
     then point the index back at the ref so it doesn't drift."""
-    _stage_all(p)
-    results = [_run_git(args, p.store, p.abs_dir, index_file=p.index_file) for args in diff_args]
-    _run_git(["read-tree", p.ref], p.store, p.abs_dir, index_file=p.index_file, allowed_returncodes={128})
-    return results
+    with _checkpoint_store_lock(p.store):
+        _stage_all(p)
+        results = [_run_git(args, p.store, p.abs_dir, index_file=p.index_file) for args in diff_args]
+        _run_git(["read-tree", p.ref], p.store, p.abs_dir, index_file=p.index_file, allowed_returncodes={128})
+        return results
 
 
 def _commit_exists(p: _ProjectRefs, commit_hash: str) -> Tuple[bool, str]:
@@ -759,6 +856,7 @@ class CheckpointManager:
                 result["empty"] = True
         return result
 
+    @_serialized_store_write
     def restore(self, working_dir: str, commit_hash: str, file_path: str = None,
                 safe: bool = False) -> Dict:
         """Restore files to a checkpoint state.  ``safe=True`` (full-directory only) leaves files
@@ -853,6 +951,7 @@ class CheckpointManager:
 
     # --- internal ---
 
+    @_serialized_store_write
     def _take(self, working_dir: str, reason: str) -> bool:
         """Take a snapshot.  Returns True on success."""
         p = _project_refs(working_dir)
@@ -885,7 +984,7 @@ class CheckpointManager:
                                     p.store, working_dir, index_file=p.index_file)
         if not ok or not new_sha:
             return _step_failed("commit-tree", err)
-        update_args = ["update-ref", p.ref, new_sha] + ([ref_commit] if ref_commit else [])
+        update_args = ["update-ref", p.ref, new_sha, ref_commit or "0" * len(new_sha)]
         ok, _, err = _run_git(update_args, p.store, working_dir)
         if not ok:
             return _step_failed("update-ref", err)
@@ -1121,6 +1220,19 @@ def prune_checkpoints(retention_days: int = 7, delete_orphans: bool = True, chec
     result = _empty_prune_result()
     if not base.exists():
         return result
+    try:
+        with _checkpoint_store_lock(_store_path(base)):
+            return _prune_checkpoints_locked(base, retention_days, delete_orphans,
+                                             max_total_size_mb, orphan_allowlist)
+    except (OSError, RuntimeError) as exc:
+        result["errors"] += 1
+        logger.warning("Checkpoint pruning stopped: %s", exc)
+        return result
+
+
+def _prune_checkpoints_locked(base: Path, retention_days: int, delete_orphans: bool,
+                              max_total_size_mb: int, orphan_allowlist: Optional[set]) -> Dict[str, int]:
+    result = _empty_prune_result()
     size_before = _dir_size_bytes(base)
     cutoff = time.time() - retention_days * 86400 if retention_days > 0 else 0.0
     _prune_legacy_archives(base, cutoff, result)
@@ -1271,9 +1383,10 @@ def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
         return out
     size = _dir_size_bytes(base)
     try:
-        rmtree_readonly(base)
-        out.update(bytes_freed=size, deleted=True)
-    except OSError as exc:
+        with _checkpoint_store_lock(_store_path(base), repair_refs=False):
+            rmtree_readonly(base)
+            out.update(bytes_freed=size, deleted=True)
+    except (OSError, RuntimeError) as exc:
         logger.warning("Could not clear checkpoint base %s: %s", base, exc)
     return out
 

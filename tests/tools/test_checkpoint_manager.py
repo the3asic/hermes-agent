@@ -1439,8 +1439,9 @@ class TestCheckpointStoreSerialization:
         assert results == [True, True]
         assert peak == 1
 
+    @pytest.mark.parametrize("damaged_ref", ["0" * 40, "f" * 40, "not-a-ref"])
     def test_invalid_loose_ref_is_quarantined_and_packed_tip_survives(
-        self, work_dir, checkpoint_base, monkeypatch,
+        self, work_dir, checkpoint_base, monkeypatch, damaged_ref,
     ):
         monkeypatch.setattr(
             "tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base,
@@ -1452,13 +1453,17 @@ class TestCheckpointStoreSerialization:
 
         store = _store_path(checkpoint_base)
         ref = _ref_name(_project_hash(str(work_dir)))
+        old = subprocess.run(
+            ["git", "--git-dir", str(store), "rev-parse", "--verify", ref],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
         subprocess.run(
             ["git", "--git-dir", str(store), "pack-refs", "--all"],
             check=True, capture_output=True, text=True,
         )
         loose_ref = store / ref
         loose_ref.parent.mkdir(parents=True, exist_ok=True)
-        loose_ref.write_text("0" * 40 + "\n", encoding="ascii")
+        loose_ref.write_text(damaged_ref + "\n", encoding="ascii")
 
         manager.new_turn()
         (work_dir / "main.py").write_text("print('recovered')\n")
@@ -1475,7 +1480,118 @@ class TestCheckpointStoreSerialization:
             )
         )
         assert len(quarantined) == 1
+        assert quarantined[0].read_text(encoding="ascii") == damaged_ref + "\n"
+        # A healthy new tip alone would miss a reset to a parentless commit.
+        subprocess.run(
+            ["git", "--git-dir", str(store), "merge-base", "--is-ancestor", old, resolved],
+            check=True, capture_output=True, text=True,
+        )
         subprocess.run(
             ["git", "--git-dir", str(store), "fsck", "--no-reflogs"],
+            check=True, capture_output=True, text=True,
+        )
+
+    @pytest.mark.parametrize("damaged_ref", ["0" * 40, "not-a-ref"])
+    def test_corrupt_ref_without_packed_history_blocks_snapshot_and_gc(
+        self, mgr, work_dir, checkpoint_base, damaged_ref,
+    ):
+        assert mgr.ensure_checkpoint(str(work_dir), "before")
+        old = mgr.list_checkpoints(str(work_dir))[0]["hash"]
+        store = _store_path(checkpoint_base)
+        ref_path = store / _ref_name(_project_hash(str(work_dir)))
+        original = (damaged_ref + "\n").encode("ascii")
+        ref_path.write_bytes(original)
+
+        mgr.new_turn()
+        (work_dir / "main.py").write_text("print('after')\n")
+        assert mgr.ensure_checkpoint(str(work_dir), "blocked") is False
+        assert ref_path.read_bytes() == original
+        assert not ref_path.with_name(ref_path.name + ".lock").exists()
+
+        result = prune_checkpoints(retention_days=0, delete_orphans=False)
+        assert result["errors"] == 1
+        assert ref_path.read_bytes() == original
+        assert not list((checkpoint_base / "corrupt-refs").iterdir())
+        subprocess.run(
+            ["git", "--git-dir", str(store), "cat-file", "-e", old + "^{commit}"],
+            check=True, capture_output=True, text=True,
+        )
+
+    def test_repair_leaves_an_existing_git_writer_lock_untouched(
+        self, mgr, work_dir, checkpoint_base, tmp_path,
+    ):
+        from tools import checkpoint_manager as cm
+        assert mgr.ensure_checkpoint(str(work_dir), "valid history")
+        store = _store_path(checkpoint_base)
+        ref_path = store / _ref_name(_project_hash(str(work_dir)))
+        valid_ref = ref_path.read_bytes()
+        git_lock = ref_path.with_name(ref_path.name + ".lock")
+        git_lock.write_bytes(b"external-writer")
+
+        # Another broken ref forces the repair scan to inspect this valid one.
+        broken = store / "refs/hermes/broken-project"
+        broken.write_bytes(b"not-a-ref\n")
+        mgr.new_turn()
+        (work_dir / "main.py").write_text("print('after')\n")
+        assert mgr.ensure_checkpoint(str(work_dir), "blocked") is False
+        assert git_lock.read_bytes() == b"external-writer"
+        assert ref_path.read_bytes() == valid_ref
+        assert broken.read_bytes() == b"not-a-ref\n"
+
+    def test_snapshot_waits_until_actual_gc_finishes(
+        self, mgr, work_dir, checkpoint_base, monkeypatch,
+    ):
+        from contextlib import contextmanager
+        from tools import checkpoint_manager as cm
+
+        assert mgr.ensure_checkpoint(str(work_dir), "before")
+        old = mgr.list_checkpoints(str(work_dir))[0]["hash"]
+        store = _store_path(checkpoint_base)
+        (store / cm._GC_PENDING_NAME).touch()
+        gc_entered = threading.Event()
+        release_gc = threading.Event()
+        writer_attempted = threading.Event()
+        writer_finished = threading.Event()
+        real_gc = cm._gc_store
+        real_fence = cm._checkpoint_store_lock
+
+        def gated_gc(*args):
+            gc_entered.set()
+            assert release_gc.wait(10)
+            real_gc(*args)
+
+        @contextmanager
+        def observing_fence(*args, **kwargs):
+            if gc_entered.is_set():
+                writer_attempted.set()
+            with real_fence(*args, **kwargs):
+                yield
+
+        monkeypatch.setattr(cm, "_gc_store", gated_gc)
+        monkeypatch.setattr(cm, "_checkpoint_store_lock", observing_fence)
+        mgr.new_turn()
+        (work_dir / "main.py").write_text("print('after')\n")
+
+        def writer():
+            try:
+                return mgr.ensure_checkpoint(str(work_dir), "after gc")
+            finally:
+                writer_finished.set()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            pruning = pool.submit(prune_checkpoints, 0, False, checkpoint_base)
+            try:
+                assert gc_entered.wait(10)
+                taking = pool.submit(writer)
+                assert writer_attempted.wait(10)
+                assert not writer_finished.wait(2), "Snapshot bypassed an active store GC"
+            finally:
+                release_gc.set()
+            assert pruning.result(timeout=10)["errors"] == 0
+            assert taking.result(timeout=10) is True
+
+        new = mgr.list_checkpoints(str(work_dir))[0]["hash"]
+        subprocess.run(
+            ["git", "--git-dir", str(store), "merge-base", "--is-ancestor", old, new],
             check=True, capture_output=True, text=True,
         )
