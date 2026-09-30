@@ -312,10 +312,16 @@ def test_resolved_route_carries_entry_credentials_and_timeout():
     # Per-entry timeouts already govern aux-client fallback candidates
     # (#62452); the stall retry honours the same declaration.
     assert route["timeout"] == 45.0
-    assert route["reasoning_config"] == {
-        "enabled": True,
-        "effort": "medium",
-    }
+    # Stable's route helper carries the configured entry label; the auxiliary
+    # request resolves that entry's reasoning at dispatch, rather than adding
+    # a reasoning_config field to this route mapping.
+    from agent.auxiliary_client import _resolve_auxiliary_fallback_reasoning
+
+    with _patch_chain([CHAIN_ENTRY]):
+        reasoning = _resolve_auxiliary_fallback_reasoning(
+            "compression", route["label"], model=route["model"],
+        )
+    assert reasoning == {"enabled": True, "effort": "medium"}
 
 
 def test_incomplete_chain_entries_are_skipped():

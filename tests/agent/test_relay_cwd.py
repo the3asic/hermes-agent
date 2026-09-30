@@ -125,3 +125,39 @@ def test_cwd_lookup_failures_do_not_break_the_turn(monkeypatch):
     assert relay_cwd.resolve_relay_scope_cwds(
         object(), "task-1", "session-1", "gateway"
     ) == ("", "")
+
+
+def test_turn_facade_passes_scoped_cwds_to_the_coordinator(monkeypatch):
+    """A gateway turn must relay its logical workspace rather than the daemon's host cwd."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from agent import background_review, relay_runtime, review_idle_queue, turn_facade_lease
+    from agent.turn_facade import TurnFacadeMixin
+
+    task_id = "relay-cwd-facade"
+    token = runtime_cwd.set_session_cwd("/workspace/session")
+    record_session_cwd(task_id, "/workspace/current-turn")
+    coordinator = MagicMock()
+    coordinator.acquire_conversation.side_effect = RuntimeError("stop after coordinator admission")
+    cleanup = MagicMock()
+    monkeypatch.setattr(background_review, "cancel_background_review_for_live_turn", lambda _agent: None)
+    monkeypatch.setattr(turn_facade_lease, "admit_durable_turn_lease", lambda *a, **k: SimpleNamespace(
+        early_result=None, lease=None, conversation_history=[],
+    ))
+    monkeypatch.setattr(relay_runtime, "SESSION_COORDINATOR", coordinator)
+    monkeypatch.setattr(review_idle_queue, "QUEUE", MagicMock())
+    monkeypatch.setattr("tools.browser_tool_lifecycle.cleanup_browser_for_turn", cleanup)
+    try:
+        with pytest.raises(RuntimeError, match="stop after coordinator admission"):
+            TurnFacadeMixin.run_conversation(
+                SimpleNamespace(session_id="session-1", platform="gateway"),
+                "hello", task_id=task_id,
+            )
+        kwargs = coordinator.acquire_conversation.call_args.kwargs
+        assert kwargs["session_cwd"] == "/workspace/session"
+        assert kwargs["turn_cwd"] == "/workspace/current-turn"
+        cleanup.assert_called_once_with(task_id)
+    finally:
+        clear_session_cwd(task_id)
+        runtime_cwd.reset_session_cwd(token)

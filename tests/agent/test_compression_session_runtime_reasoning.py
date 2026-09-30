@@ -367,6 +367,35 @@ def test_pinned_fast_lane_uses_exact_fallback_entry_not_primary(monkeypatch):
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_stable_stall_route_resolves_target_reasoning_at_dispatch(monkeypatch, async_mode):
+    from agent.conversation_compression import resolve_compression_fallback_route
+
+    entry = {
+        "provider": "custom", "model": "gpt-5.6-sol",
+        "base_url": "https://same.test/v1", "reasoning_effort": "medium",
+    }
+    _, calls = _capture_calls(
+        monkeypatch,
+        {
+            "provider": entry["provider"], "model": entry["model"],
+            "reasoning_effort": "none", "fallback_chain": [entry],
+        },
+        provider=entry["provider"], model=entry["model"], base_url=entry["base_url"],
+    )
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"agent": {}})
+    route = resolve_compression_fallback_route()
+    assert route is not None
+    with pin_summary_route(route):
+        if async_mode:
+            await aux.async_call_llm(task="compression", messages=MESSAGES)
+        else:
+            aux.call_llm(task="compression", messages=MESSAGES)
+    assert calls[0]["reasoning_config"] == {"enabled": True, "effort": "medium"}
+    assert "reasoning" not in calls[0]["extra_body"]
+
+
 def test_failed_configured_candidate_does_not_leak_effort_to_next_fallback(
     monkeypatch,
 ):
