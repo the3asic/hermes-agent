@@ -134,10 +134,8 @@ def _telegram_command_menu_config() -> dict[str, Any]:
     raw_priority = menu_cfg.get("priority")
     if isinstance(raw_priority, list):
         priority = [str(item) for item in raw_priority if str(item).strip()]
-    elif isinstance(raw_priority, str):
-        priority = [item.strip() for item in raw_priority.split(",") if item.strip()]
     else:
-        priority = []
+        priority = [raw_priority] if isinstance(raw_priority, str) and raw_priority.strip() else []
     return {
         "max_commands": max(1, min(_TELEGRAM_BOT_API_MAX_COMMANDS, max_commands)),
         "priority_mode": priority_mode if priority_mode in _TELEGRAM_PRIORITY_TIERS else "prepend",
