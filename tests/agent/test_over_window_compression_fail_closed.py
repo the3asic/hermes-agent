@@ -32,12 +32,16 @@ def _agent(*, context_length):
     return agent
 
 
-def _preflight(agent, request_tokens):
+def _preflight(agent, request_tokens, *, after_tokens=None, messages=None):
     out = CompactionOutcome(
-        messages=[{"role": "user", "content": "hi"}], active_system_prompt="sys",
+        messages=messages if messages is not None else [{"role": "user", "content": "hi"}],
+        active_system_prompt="sys",
         conversation_history=None, current_turn_user_idx=0,
     )
-    with patch("agent.turn_context._preflight_request_tokens", return_value=request_tokens), patch(
+    with patch(
+        "agent.turn_context._preflight_request_tokens",
+        return_value=request_tokens if after_tokens is None else after_tokens,
+    ), patch(
         "agent.turn_context_compaction.automatic_compaction_status_message", return_value=""
     ):
         _run_preflight_passes(agent, out, agent.context_compressor, request_tokens, "sys", "t")
@@ -56,6 +60,31 @@ def test_no_progress_preflight_fails_closed_only_when_the_request_exceeds_the_wi
     cooling = _agent(context_length=131_072)
     cooling._compression_blocked_transient = "cooldown:42"
     assert _preflight(cooling, 356_113).blocked is True
+
+
+def test_nonprogress_preflight_within_the_live_model_window_stops_repeated_passes():
+    # The production incident had pressure above the threshold but below this window.
+    agent = _agent(context_length=272_000)
+    agent._compress_context = MagicMock(side_effect=agent._compress_context)
+
+    assert _preflight(agent, 121_776).blocked is True
+    agent._compress_context.assert_called_once()
+
+
+@pytest.mark.parametrize("context_length", [272_000, 131_072])
+def test_row_reduction_with_sub_five_percent_token_progress_obeys_the_actual_window(context_length):
+    agent = _agent(context_length=context_length)
+    agent._compress_context = MagicMock(side_effect=lambda msgs, system, **kw: (msgs[1:], system))
+    messages = [{"role": "user", "content": "old"}, {"role": "assistant", "content": "retained"}]
+
+    if context_length < 270_000:
+        with pytest.raises(PreflightCompressionTimedOut, match="Start a new session with /new"):
+            _preflight(agent, 280_000, after_tokens=270_000, messages=messages)
+    else:
+        out = _preflight(agent, 280_000, after_tokens=270_000, messages=messages)
+        assert out.blocked is True
+        assert out.messages == messages[1:]
+    agent._compress_context.assert_called_once()
 
 
 def test_over_window_wait_is_bounded_by_one_inactivity_budget():
