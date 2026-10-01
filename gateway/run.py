@@ -1128,6 +1128,10 @@ def _build_replay_entry(
     providers.
     """
     entry: Dict[str, Any] = {"role": role, "content": content}
+    # Keep persisted provenance for context-engine reconciliation. The API builder
+    # removes display metadata from wire copies, so it never becomes provider input.
+    if isinstance(msg.get("display_metadata"), dict):
+        entry["display_metadata"] = msg["display_metadata"]
     # api_content sidecar keeps the request prefix byte-stable — ONLY if this pipeline did not rewrite
     # content. The caller renders timestamps AFTER this check so a stamp alone never drops the sidecar.
     _sidecar = msg.get("api_content")
