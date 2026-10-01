@@ -153,4 +153,47 @@ class TestResolveSessionAgentRuntimePriority:
         assert model == "channel/model"
         assert runtime["provider"] == "openrouter"
 
+    def test_channel_model_override_clears_global_auth_fallback_provenance(self):
+        runner = object.__new__(GatewayRunner)
+        runner._session_model_overrides = {}
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "chan_1": ChannelOverride(model="channel/model"),
+                    },
+                ),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chan_1",
+            user_id="u1",
+        )
+        with (
+            patch("gateway.run._resolve_gateway_model", return_value="global/model"),
+            patch(
+                "gateway.run._resolve_runtime_agent_kwargs",
+                return_value={
+                    "provider": "zai",
+                    "api_key": "fallback-key",
+                    "base_url": "https://fallback.example/v1",
+                    "api_mode": "chat_completions",
+                    "model": "fallback/model",
+                    "_resolved_fallback_entry": {
+                        "provider": "zai",
+                        "model": "fallback/model",
+                        "reasoning_effort": "low",
+                    },
+                },
+            ),
+        ):
+            model, runtime = runner._resolve_session_agent_runtime(
+                source=source,
+                user_config={"model": {"default": "global/model"}},
+            )
+
+        assert model == "channel/model"
+        assert "_resolved_fallback_entry" not in runtime
 

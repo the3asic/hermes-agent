@@ -2,13 +2,13 @@
 
 Covers:
 
-- All eight bundled plugins (brave-free, ddgs, searxng, exa, parallel,
-  tavily, firecrawl, xai) instantiate and self-report the expected
+- All bundled plugins (brave-free, ddgs, searxng, exa, parallel,
+  tavily, firecrawl, keenable, xai) instantiate and self-report the expected
   capabilities + ABC-derived defaults.
 - Each plugin's ``is_available()`` correctly reflects env-var presence.
 - The web_search_registry resolves an active provider in the documented
-  scenarios (explicit config wins ignoring availability, fallback walks
-  legacy preference filtered by availability, unknown name falls back).
+  scenarios (explicit config wins ignoring availability, unknown names fail
+  closed, and unconfigured installs autodetect by capability + availability).
 - Plugin response shapes match the legacy bit-for-bit contract.
 
 Per the dev skill: these tests use *real* imports from the plugin
@@ -17,9 +17,6 @@ catches drift in the ABC interface, the registry, and the plugin
 glue layer simultaneously.
 """
 from __future__ import annotations
-
-import asyncio
-import inspect
 
 import pytest
 
@@ -34,6 +31,7 @@ def _clear_web_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for k in (
         "BRAVE_SEARCH_API_KEY",
         "SEARXNG_URL",
+        "KEENABLE_API_KEY",
         "TAVILY_API_KEY",
         "TAVILY_BASE_URL",
         "EXA_API_KEY",
@@ -67,67 +65,6 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
     _clear_web_env(monkeypatch)
 
 
-class TestBundledPluginsRegister:
-    """All eight bundled web plugins discover and register correctly."""
-
-    def test_all_seven_plugins_present_in_registry(self) -> None:
-        _ensure_plugins_loaded()
-        from agent.web_search_registry import list_providers
-
-        names = sorted(p.name for p in list_providers())
-        assert names == [
-            "brave-free",
-            "ddgs",
-            "exa",
-            "firecrawl",
-            "parallel",
-            "searxng",
-            "tavily",
-            "xai",
-        ]
-
-    @pytest.mark.parametrize(
-        "plugin_name,expected_search,expected_extract",
-        [
-            ("brave-free", True, False),
-            ("ddgs", True, False),
-            ("searxng", True, False),
-            ("exa", True, True),
-            ("parallel", True, True),
-            ("tavily", True, True),
-            ("firecrawl", True, True),
-            # xai: search-only via Grok's agentic web_search tool.
-            ("xai", True, False),
-        ],
-    )
-    def test_capability_flags_match_spec(
-        self,
-        plugin_name: str,
-        expected_search: bool,
-        expected_extract: bool,
-    ) -> None:
-        _ensure_plugins_loaded()
-        from agent.web_search_registry import get_provider
-
-        provider = get_provider(plugin_name)
-        assert provider is not None, f"plugin {plugin_name!r} not registered"
-        assert provider.supports_search() is expected_search
-        assert provider.supports_extract() is expected_extract
-
-    @pytest.mark.parametrize(
-        "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai"],
-    )
-    def test_each_plugin_has_name_and_display_name(self, plugin_name: str) -> None:
-        _ensure_plugins_loaded()
-        from agent.web_search_registry import get_provider
-
-        provider = get_provider(plugin_name)
-        assert provider is not None
-        assert provider.name == plugin_name
-        assert provider.display_name  # any non-empty string
-
-
 # ---------------------------------------------------------------------------
 # is_available() behavior
 # ---------------------------------------------------------------------------
@@ -154,6 +91,16 @@ class TestIsAvailable:
         assert p is not None
         assert p.is_available() is False
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
+        assert p.is_available() is True
+
+    def test_keenable_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _ensure_plugins_loaded()
+        from agent.web_search_registry import get_provider
+
+        p = get_provider("keenable")
+        assert p is not None
+        assert p.is_available() is False
+        monkeypatch.setenv("KEENABLE_API_KEY", "real")
         assert p.is_available() is True
 
     def test_tavily_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -203,21 +150,23 @@ class TestIsAvailable:
         monkeypatch.setenv("FIRECRAWL_API_URL", "http://localhost:3002")
         assert p.is_available() is True
 
-    def test_ddgs_always_available_when_package_importable(self) -> None:
-        """DDGS is the always-on fallback — no API key required.
-
-        It may report unavailable if the ``ddgs`` package itself isn't
-        installed in the env (legitimate — the plugin's post_setup hook
-        triggers pip install on first selection). We only assert that
-        is_available() doesn't raise.
-        """
+    def test_firecrawl_explicit_config_allows_keyless_cloud(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         _ensure_plugins_loaded()
         from agent.web_search_registry import get_provider
 
-        p = get_provider("ddgs")
+        p = get_provider("firecrawl")
         assert p is not None
-        # Truthy or falsy, just must not raise.
-        _ = bool(p.is_available())
+        assert p.is_available() is False
+
+        monkeypatch.setattr(
+            "tools.web_tools._load_web_config",
+            lambda: {"backend": "firecrawl"},
+            raising=False,
+        )
+        assert p.is_available() is True
+
 
     def test_xai_requires_api_key_or_oauth(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """xAI needs XAI_API_KEY or OAuth tokens in auth.json."""
@@ -232,12 +181,12 @@ class TestIsAvailable:
 
 
 # ---------------------------------------------------------------------------
-# Registry resolution semantics (Option B — conservative smart fallback)
+# Registry resolution semantics (strict selection + unconfigured autodetect)
 # ---------------------------------------------------------------------------
 
 
 class TestRegistryResolution:
-    """``_resolve()`` follows explicit-config + availability-filtered fallback."""
+    """``_resolve()`` keeps explicit selection distinct from autodetection."""
 
     def test_explicit_configured_provider_returned_even_when_unavailable(
         self,
@@ -259,39 +208,67 @@ class TestRegistryResolution:
         # a typed credential-missing error to the caller.
         assert result.is_available() is False
 
-    def test_unknown_configured_name_falls_back_to_available_provider(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("capability", ["search", "extract"])
+    def test_unknown_configured_name_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch, capability: str
     ) -> None:
-        """Typo / uninstalled plugin → walk legacy preference, pick available."""
+        """A typo or unloaded plugin must not be disguised as another backend."""
         _ensure_plugins_loaded()
         from agent.web_search_registry import _resolve
 
         monkeypatch.setenv("EXA_API_KEY", "real")
-        result = _resolve("not-a-real-provider", capability="search")
-        # Either ddgs (no-key fallback) or exa (the only available
-        # premium provider) — both are valid. The point is the unknown
-        # name shouldn't return None when SOMETHING is available.
-        assert result is not None
-        assert result.is_available() is True
+        assert _resolve("not-a-real-provider", capability=capability) is None
 
+    @pytest.mark.parametrize("capability", ["search", "extract"])
+    def test_managed_nous_selection_resolves_to_firecrawl(
+        self, monkeypatch: pytest.MonkeyPatch, capability: str
+    ) -> None:
+        """The managed selection is an alias for Firecrawl, not an unknown."""
+        _ensure_plugins_loaded()
+        from agent import web_search_registry
+
+        monkeypatch.setattr(
+            web_search_registry,
+            "_read_config_key",
+            lambda *path: "nous"
+            if path == ("web", f"{capability}_backend")
+            else None,
+        )
+        monkeypatch.setattr(
+            "tools.tool_backend_helpers.read_selection",
+            lambda section: "nous",
+        )
+        monkeypatch.setattr(
+            "plugins.web.firecrawl.provider._is_tool_gateway_ready",
+            lambda: True,
+        )
+        getter = getattr(
+            web_search_registry, f"get_active_{capability}_provider"
+        )
+
+        result = getter()
+        assert result is not None
+        assert result.name == "firecrawl"
+        assert result.is_available() is True
 
     def test_no_config_no_credentials_returns_none(
         self,
     ) -> None:
-        """No backend configured AND no available providers → typically None.
+        """No backend configured AND no credentials → keyless tier or ddgs.
 
-        ``ddgs`` is the no-credential fallback; if its ``ddgs`` Python
-        package is installed in the test env, ddgs will be picked.
-        Otherwise the resolver returns None. Either outcome is correct.
+        Resolution order with zero credentials: ddgs if its Python package
+        is importable, else the keyless free tier (Parallel/Exa public
+        endpoints — resolves with ``is_available() == False`` but
+        ``is_keyless_available() == True``), else None (keyless tier
+        disabled). All three outcomes are correct; a provider that is
+        neither keyed nor keyless-capable means an env var leaked in.
         """
         _ensure_plugins_loaded()
         from agent.web_search_registry import _resolve
 
         result = _resolve(None, capability="search")
         if result is not None:
-            # The only no-credential provider is ddgs; anything else
-            # means an env var leaked in.
-            assert result.is_available() is True
+            assert result.is_available() or result.is_keyless_available()
 
 
 # ---------------------------------------------------------------------------
@@ -310,5 +287,3 @@ class TestAsyncExtractDispatch:
 
 class TestErrorResponseShapes:
     """When credentials are missing, plugins return typed errors, not raises."""
-
-

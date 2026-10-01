@@ -162,7 +162,6 @@ def _test_page_url() -> str:
 
 def _fire_on_page(cdp_url: str, expression: str) -> None:
     """Navigate the first page target to a data URL and fire `expression`."""
-    import asyncio
     import websockets as _ws_mod
 
     async def run():
@@ -198,6 +197,66 @@ def _fire_on_page(cdp_url: str, expression: str) -> None:
             )
 
     asyncio.run(run())
+
+
+def _browser_level_call(cdp_url: str, method: str, params=None):
+    """Call one browser-level CDP method without listing or adopting targets."""
+    import websockets as _ws_mod
+
+    async def run():
+        async with _ws_mod.connect(cdp_url, max_size=50 * 1024 * 1024) as ws:
+            await ws.send(json.dumps({"id": 1, "method": method, "params": params or {}}))
+            async for raw in ws:
+                message = json.loads(raw)
+                if message.get("id") != 1:
+                    continue
+                if "error" in message:
+                    raise RuntimeError(f"CDP {method} failed: {message['error']}")
+                return message.get("result", {})
+        raise RuntimeError(f"CDP {method} connection closed without a response")
+
+    return asyncio.run(run())
+
+
+def _evaluate_exact_target(cdp_url: str, target_id: str, expression: str):
+    """Attach to exactly ``target_id`` and evaluate without target discovery."""
+    import websockets as _ws_mod
+
+    async def run():
+        async with _ws_mod.connect(cdp_url, max_size=50 * 1024 * 1024) as ws:
+            next_id = 1
+
+            async def call(method, params=None, session_id=None):
+                nonlocal next_id
+                call_id = next_id
+                next_id += 1
+                payload = {"id": call_id, "method": method}
+                if params:
+                    payload["params"] = params
+                if session_id:
+                    payload["sessionId"] = session_id
+                await ws.send(json.dumps(payload))
+                async for raw in ws:
+                    message = json.loads(raw)
+                    if message.get("id") != call_id:
+                        continue
+                    if "error" in message:
+                        raise RuntimeError(f"CDP {method} failed: {message['error']}")
+                    return message
+
+            attached = await call(
+                "Target.attachToTarget",
+                {"targetId": target_id, "flatten": True},
+            )
+            session_id = attached["result"]["sessionId"]
+            evaluated = await call(
+                "Runtime.evaluate",
+                {"expression": expression, "returnByValue": True},
+                session_id=session_id,
+            )
+            return evaluated["result"]["result"].get("value")
+
+    return asyncio.run(run())
 
 
 @pytest.fixture
@@ -309,35 +368,6 @@ def test_browser_dialog_tool_end_to_end(chrome_cdp, supervisor_registry):
     assert "PYTEST-TOOL-END2END" in r["dialog"]["message"]
 
 
-def test_browser_cdp_frame_id_real_oopif_smoke_documented():
-    """Document that real-OOPIF E2E was manually verified — see PR #14540.
-
-    A pytest version of this hits an asyncio version-quirk in the venv
-    (3.11) that doesn't show up in standalone scripts (3.13 + system
-    websockets). The mechanism IS verified end-to-end by two separate
-    smoke scripts in /tmp/dialog-iframe-test/:
-
-      * smoke_local_oopif.py   — local Chrome + 2 http servers on
-        different hostnames + --site-per-process. Outer page on
-        localhost:18905, iframe src=http://127.0.0.1:18906. Calls
-        browser_cdp(method='Runtime.evaluate', frame_id=<OOPIF>) and
-        verifies inner page's title comes back from the OOPIF session.
-        PASSED on 2026-04-23: iframe document.title = 'INNER-FRAME-XYZ'
-
-      * smoke_bb_iframe_agent_path.py — Browserbase + real cross-origin
-        iframe (src=https://example.com/). Same browser_cdp(frame_id=)
-        path. PASSED on 2026-04-23: iframe document.title =
-        'Example Domain'
-
-    The test_browser_cdp_frame_id_routes_via_supervisor pytest covers
-    the supervisor-routing plumbing with a fake injected OOPIF.
-    """
-    pytest.skip(
-        "Real-OOPIF E2E verified manually with smoke_local_oopif.py and "
-        "smoke_bb_iframe_agent_path.py — pytest version hits an asyncio "
-        "version quirk between venv (3.11) and standalone (3.13). "
-        "Smoke logs preserved in /tmp/dialog-iframe-test/."
-    )
 
 
 def test_evaluate_runtime_unserializable_value(chrome_cdp, supervisor_registry):
@@ -351,3 +381,59 @@ def test_evaluate_runtime_unserializable_value(chrome_cdp, supervisor_registry):
     out = supervisor.evaluate_runtime("Infinity")
     assert out["ok"] is True
     assert out["result"] == "Infinity"
+
+
+def test_supervisor_real_cdp_contract_pins_only_owned_target(
+    chrome_cdp, supervisor_registry
+):
+    """Opt-in contract: explicit pinning never adopts or closes another page."""
+    cdp_url, _port = chrome_cdp
+    owned_target_ids = []
+    task_id = "pytest-owned-target-contract"
+
+    try:
+        for title in ("HERMES-OWNED-A", "HERMES-OWNED-B"):
+            page_url = "data:text/html;base64," + base64.b64encode(
+                f"<!doctype html><title>{title}</title><body>{title}</body>".encode()
+            ).decode()
+            created = _browser_level_call(
+                cdp_url,
+                "Target.createTarget",
+                {"url": page_url},
+            )
+            owned_target_ids.append(created["targetId"])
+
+        supervisor = supervisor_registry.get_or_start(
+            task_id=task_id,
+            cdp_url=cdp_url,
+            target_id=owned_target_ids[0],
+        )
+
+        deadline = time.monotonic() + 5
+        evaluated = None
+        while time.monotonic() < deadline:
+            evaluated = supervisor.evaluate_runtime("document.title")
+            if evaluated.get("ok") and evaluated.get("result") == "HERMES-OWNED-A":
+                break
+            time.sleep(0.05)
+
+        assert evaluated == {
+            "ok": True,
+            "result": "HERMES-OWNED-A",
+            "result_type": "string",
+        }
+        assert (
+            _evaluate_exact_target(cdp_url, owned_target_ids[1], "document.title")
+            == "HERMES-OWNED-B"
+        )
+    finally:
+        supervisor_registry.stop(task_id)
+        for target_id in owned_target_ids:
+            try:
+                _browser_level_call(
+                    cdp_url,
+                    "Target.closeTarget",
+                    {"targetId": target_id},
+                )
+            except Exception:
+                pass

@@ -1,11 +1,19 @@
 """Regression tests for browser session cleanup and screenshot recovery."""
 
-from unittest.mock import patch
+import json
+import time
+
+from unittest.mock import MagicMock, patch
+from tools import browser_tool_lifecycle as bt_lifecycle
+
+from tools import browser_tool_cloud as bt_cloud
+from tools import browser_tool_install as bt_install
+from tools import browser_tool_session as bt_session
 
 
 class TestScreenshotPathRecovery:
     def test_extracts_standard_absolute_path(self):
-        from tools.browser_tool import _extract_screenshot_path_from_text
+        from tools.browser_tool_snapshot import _extract_screenshot_path_from_text
 
         assert (
             _extract_screenshot_path_from_text("Screenshot saved to /tmp/foo.png")
@@ -13,7 +21,7 @@ class TestScreenshotPathRecovery:
         )
 
     def test_extracts_quoted_absolute_path(self):
-        from tools.browser_tool import _extract_screenshot_path_from_text
+        from tools.browser_tool_snapshot import _extract_screenshot_path_from_text
 
         assert (
             _extract_screenshot_path_from_text(
@@ -30,6 +38,14 @@ class TestBrowserCleanup:
         self.browser_tool = browser_tool
         self.orig_active_sessions = browser_tool._active_sessions.copy()
         self.orig_session_last_activity = browser_tool._session_last_activity.copy()
+        self.orig_last_active_session_key = browser_tool._last_active_session_key.copy()
+        self.orig_retired_browser_tasks = getattr(
+            browser_tool, "_retired_browser_tasks", set()
+        ).copy()
+        self.orig_task_states = browser_tool._browser_task_states.copy()
+        self.orig_task_generations = browser_tool._browser_task_generations.copy()
+        self.orig_cleanup_reasons = browser_tool._browser_task_cleanup_reasons.copy()
+        self.orig_provider_cleanups = browser_tool._pending_provider_cleanups.copy()
         self.orig_recording_sessions = browser_tool._recording_sessions.copy()
         self.orig_cleanup_done = browser_tool._cleanup_done
 
@@ -38,6 +54,27 @@ class TestBrowserCleanup:
         self.browser_tool._active_sessions.update(self.orig_active_sessions)
         self.browser_tool._session_last_activity.clear()
         self.browser_tool._session_last_activity.update(self.orig_session_last_activity)
+        self.browser_tool._last_active_session_key.clear()
+        self.browser_tool._last_active_session_key.update(
+            self.orig_last_active_session_key
+        )
+        if hasattr(self.browser_tool, "_retired_browser_tasks"):
+            self.browser_tool._retired_browser_tasks.clear()
+            self.browser_tool._retired_browser_tasks.update(
+                self.orig_retired_browser_tasks
+            )
+        self.browser_tool._browser_task_states.clear()
+        self.browser_tool._browser_task_states.update(self.orig_task_states)
+        self.browser_tool._browser_task_generations.clear()
+        self.browser_tool._browser_task_generations.update(self.orig_task_generations)
+        self.browser_tool._browser_task_cleanup_reasons.clear()
+        self.browser_tool._browser_task_cleanup_reasons.update(
+            self.orig_cleanup_reasons
+        )
+        self.browser_tool._pending_provider_cleanups.clear()
+        self.browser_tool._pending_provider_cleanups.update(
+            self.orig_provider_cleanups
+        )
         self.browser_tool._recording_sessions.clear()
         self.browser_tool._recording_sessions.update(self.orig_recording_sessions)
         self.browser_tool._cleanup_done = self.orig_cleanup_done
@@ -53,17 +90,163 @@ class TestBrowserCleanup:
         with (
             patch("tools.browser_tool._maybe_stop_recording") as mock_stop,
             patch(
-                "tools.browser_tool._run_browser_command",
+                "tools.browser_tool_session._run_browser_command",
                 return_value={"success": True},
             ) as mock_run,
             patch("tools.browser_tool.os.path.exists", return_value=False),
         ):
-            browser_tool.cleanup_browser("task-1")
+            cleaned = bt_lifecycle.cleanup_browser("task-1")
 
+        assert cleaned is True
         assert "task-1" not in browser_tool._active_sessions
         assert "task-1" not in browser_tool._session_last_activity
         mock_stop.assert_called_once_with("task-1")
-        mock_run.assert_called_once_with("task-1", "close", [], timeout=10)
+        mock_run.assert_called_once_with(
+            "task-1", "close", [], timeout=10, _allow_cleanup=True
+        )
+
+    def test_cleanup_shared_cdp_closes_pinned_tab_before_session(self):
+        browser_tool = self.browser_tool
+        browser_tool._active_sessions["task-cdp"] = {
+            "session_name": "sess-cdp",
+            "bb_session_id": None,
+            "cdp_url": "ws://127.0.0.1:9222/devtools/browser/shared",
+        }
+
+        with (
+            patch("tools.browser_tool._maybe_stop_recording"),
+            patch(
+                'tools.browser_tool_session._run_browser_command',
+                return_value={"success": True},
+            ) as mock_run,
+            patch("tools.browser_tool.os.path.exists", return_value=False),
+        ):
+            cleaned = bt_lifecycle.cleanup_browser("task-cdp")
+
+        assert cleaned is True
+        assert "task-cdp" not in browser_tool._active_sessions
+        assert mock_run.call_args_list == [
+            (("task-cdp", "tab", ["close"]), {"timeout": 10, "_allow_cleanup": True}),
+            (("task-cdp", "close", []), {"timeout": 10, "_allow_cleanup": True}),
+        ]
+
+    def test_cleanup_shared_cdp_accepts_already_gone_tab(self):
+        browser_tool = self.browser_tool
+        browser_tool._active_sessions["task-gone"] = {
+            "session_name": "sess-gone",
+            "bb_session_id": None,
+            "cdp_url": "ws://shared",
+        }
+        browser_tool._session_last_activity["task-gone"] = 123.0
+
+        with (
+            patch("tools.browser_tool._maybe_stop_recording"),
+            patch(
+                'tools.browser_tool_session._run_browser_command',
+                side_effect=[
+                    {
+                        "success": False,
+                        "code": "tab_gone",
+                        "error": "Pinned tab is no longer available",
+                    },
+                    {"success": True},
+                ],
+            ) as mock_run,
+            patch("tools.browser_tool.os.path.exists", return_value=False),
+        ):
+            cleaned = bt_lifecycle.cleanup_browser("task-gone")
+
+        assert cleaned is True
+        assert "task-gone" not in browser_tool._active_sessions
+        assert "task-gone" not in browser_tool._session_last_activity
+        assert mock_run.call_args_list == [
+            (("task-gone", "tab", ["close"]), {"timeout": 10, "_allow_cleanup": True}),
+            (("task-gone", "close", []), {"timeout": 10, "_allow_cleanup": True}),
+        ]
+
+    def test_cleanup_shared_cdp_transient_failure_retains_ownership(self):
+        browser_tool = self.browser_tool
+        session = {
+            "session_name": "sess-retry",
+            "bb_session_id": None,
+            "cdp_url": "ws://shared",
+        }
+        browser_tool._active_sessions["task-retry"] = session
+        browser_tool._session_last_activity["task-retry"] = 123.0
+        browser_tool._last_active_session_key["task-retry"] = "task-retry"
+
+        with (
+            patch("tools.browser_tool._maybe_stop_recording"),
+            patch(
+                'tools.browser_tool_session._run_browser_command',
+                return_value={"success": False, "error": "temporary disconnect"},
+            ) as mock_run,
+        ):
+            cleaned = bt_lifecycle.cleanup_browser("task-retry")
+
+        assert cleaned is False
+        assert browser_tool._active_sessions["task-retry"] is session
+        assert browser_tool._session_last_activity["task-retry"] == 123.0
+        assert browser_tool._last_active_session_key["task-retry"] == "task-retry"
+        assert "task-retry" not in browser_tool._retired_browser_tasks
+        assert session["_cleanup_retry_pending"] is True
+        mock_run.assert_called_once_with(
+            "task-retry", "tab", ["close"], timeout=10, _allow_cleanup=True
+        )
+
+    def test_cleanup_shared_cdp_retries_then_becomes_idempotent(self):
+        browser_tool = self.browser_tool
+        browser_tool._active_sessions["task-repeat"] = {
+            "session_name": "sess-repeat",
+            "bb_session_id": None,
+            "cdp_url": "ws://shared",
+        }
+        browser_tool._session_last_activity["task-repeat"] = 123.0
+
+        with (
+            patch("tools.browser_tool._maybe_stop_recording"),
+            patch(
+                'tools.browser_tool_session._run_browser_command',
+                side_effect=[
+                    {"success": False, "error": "temporary disconnect"},
+                    {"success": True},
+                    {"success": True},
+                ],
+            ) as mock_run,
+            patch("tools.browser_tool.os.path.exists", return_value=False),
+        ):
+            assert bt_lifecycle.cleanup_browser("task-repeat") is False
+            assert "task-repeat" in browser_tool._active_sessions
+            assert bt_lifecycle.cleanup_browser("task-repeat") is True
+            assert bt_lifecycle.cleanup_browser("task-repeat") is True
+
+        assert "task-repeat" not in browser_tool._active_sessions
+        assert mock_run.call_args_list == [
+            (("task-repeat", "tab", ["close"]), {"timeout": 10, "_allow_cleanup": True}),
+            (("task-repeat", "tab", ["close"]), {"timeout": 10, "_allow_cleanup": True}),
+            (("task-repeat", "close", []), {"timeout": 10, "_allow_cleanup": True}),
+        ]
+
+    def test_successful_sidecar_cleanup_preserves_primary_binding(self):
+        browser_tool = self.browser_tool
+        sidecar = "task-sidecar::local"
+        browser_tool._active_sessions[sidecar] = {
+            "session_name": "sess-sidecar",
+            "bb_session_id": None,
+        }
+        browser_tool._last_active_session_key["task-sidecar"] = "task-sidecar"
+
+        with (
+            patch("tools.browser_tool._maybe_stop_recording"),
+            patch(
+                'tools.browser_tool_session._run_browser_command',
+                return_value={"success": True},
+            ),
+            patch("tools.browser_tool.os.path.exists", return_value=False),
+        ):
+            assert bt_lifecycle.cleanup_browser(sidecar) is True
+
+        assert browser_tool._last_active_session_key["task-sidecar"] == "task-sidecar"
 
 
     def test_emergency_cleanup_clears_all_tracking_state(self):
@@ -75,11 +258,303 @@ class TestBrowserCleanup:
         browser_tool._session_last_activity["task-2"] = 2.0
         browser_tool._recording_sessions.update({"task-1", "task-2"})
 
-        with patch("tools.browser_tool.cleanup_all_browsers") as mock_cleanup_all:
-            browser_tool._emergency_cleanup_all_sessions()
+        with patch("tools.browser_tool_lifecycle.cleanup_all_browsers") as mock_cleanup_all:
+            bt_lifecycle._emergency_cleanup_all_sessions()
 
         mock_cleanup_all.assert_called_once_with()
         assert browser_tool._active_sessions == {}
         assert browser_tool._session_last_activity == {}
         assert browser_tool._recording_sessions == set()
         assert browser_tool._cleanup_done is True
+
+
+def test_inactivity_reaper_spares_task_owned_shared_cdp(monkeypatch):
+    from tools import browser_tool
+
+    now = time.time()
+    task_id = "task-shared-cdp"
+    monkeypatch.setattr(
+        browser_tool,
+        "_active_sessions",
+        {
+            task_id: {
+                "session_name": "cdp_owned",
+                "bb_session_id": None,
+                "cdp_url": "ws://127.0.0.1:9222/devtools/browser/shared",
+                "features": {"cdp_override": True},
+            }
+        },
+    )
+    monkeypatch.setattr(
+        browser_tool,
+        "_session_last_activity",
+        {task_id: now - browser_tool.BROWSER_SESSION_INACTIVITY_TIMEOUT - 1},
+    )
+    cleanup = MagicMock(return_value=True)
+    monkeypatch.setattr(bt_lifecycle, "cleanup_browser", cleanup)
+    monkeypatch.setattr(browser_tool.time, "time", lambda: now)
+
+    bt_lifecycle._cleanup_inactive_browser_sessions()
+
+    cleanup.assert_not_called()
+    assert task_id in browser_tool._active_sessions
+    assert task_id in browser_tool._session_last_activity
+
+    # Once terminal cleanup has been requested and failed, the retained owner
+    # must remain eligible for a later background retry.
+    browser_tool._active_sessions[task_id]["_cleanup_retry_pending"] = True
+    cleanup.reset_mock()
+
+    bt_lifecycle._cleanup_inactive_browser_sessions()
+
+    cleanup.assert_called_once_with(
+        task_id,
+        reason=bt_lifecycle.BrowserCleanupReason.INACTIVITY,
+    )
+
+
+def test_inactivity_reaper_still_cleans_local_session(monkeypatch):
+    from tools import browser_tool
+
+    now = time.time()
+    task_id = "task-local"
+    monkeypatch.setattr(
+        browser_tool,
+        "_active_sessions",
+        {
+            task_id: {
+                "session_name": "local_owned",
+                "bb_session_id": None,
+                "cdp_url": None,
+                "features": {"local": True},
+            }
+        },
+    )
+    monkeypatch.setattr(
+        browser_tool,
+        "_session_last_activity",
+        {task_id: now - browser_tool.BROWSER_SESSION_INACTIVITY_TIMEOUT - 1},
+    )
+    cleanup = MagicMock(return_value=True)
+    monkeypatch.setattr(bt_lifecycle, "cleanup_browser", cleanup)
+    monkeypatch.setattr(browser_tool.time, "time", lambda: now)
+
+    bt_lifecycle._cleanup_inactive_browser_sessions()
+
+    cleanup.assert_called_once_with(
+        task_id,
+        reason=bt_lifecycle.BrowserCleanupReason.INACTIVITY,
+    )
+    assert task_id not in browser_tool._session_last_activity
+
+
+def test_successful_cleanup_tombstones_non_navigation_without_recreation(
+    monkeypatch,
+):
+    from tools import browser_tool
+
+    task_id = "task-terminal"
+    monkeypatch.setattr(
+        browser_tool,
+        "_active_sessions",
+        {
+            task_id: {
+                "session_name": "cdp_terminal",
+                "bb_session_id": None,
+                "cdp_url": "ws://shared",
+                "features": {"cdp_override": True},
+            }
+        },
+    )
+    monkeypatch.setattr(browser_tool, "_session_last_activity", {task_id: 1.0})
+    monkeypatch.setattr(browser_tool, "_last_active_session_key", {task_id: task_id})
+    monkeypatch.setattr(browser_tool, "_retired_browser_tasks", set(), raising=False)
+    monkeypatch.setattr(browser_tool, "_maybe_stop_recording", lambda _task: None)
+    monkeypatch.setattr(browser_tool.os.path, "exists", lambda _path: False)
+    with patch(
+        'tools.browser_tool_session._run_browser_command',
+        return_value={"success": True},
+    ):
+        assert bt_lifecycle.cleanup_browser(task_id) is True
+    assert task_id in browser_tool._retired_browser_tasks
+
+    get_session = MagicMock(
+        return_value={
+            "session_name": "replacement",
+            "bb_session_id": None,
+            "cdp_url": "ws://shared",
+        }
+    )
+    find_browser = MagicMock(return_value="/usr/bin/agent-browser")
+    popen = MagicMock()
+    monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+    monkeypatch.setattr(bt_cloud, "_is_local_mode", lambda: False)
+    monkeypatch.setattr(bt_session, "_get_session_info", get_session)
+    monkeypatch.setattr(bt_install, "_find_agent_browser", find_browser)
+    monkeypatch.setattr(browser_tool.subprocess, "Popen", popen)
+
+    result = json.loads(browser_tool.browser_snapshot(task_id=task_id))
+
+    assert result["success"] is False
+    assert result["code"] == "browser_session_retired"
+    assert result["data"]["terminal"] is True
+    get_session.assert_not_called()
+    find_browser.assert_not_called()
+    popen.assert_not_called()
+
+
+def test_retired_eval_does_not_use_stale_supervisor_or_subprocess(monkeypatch):
+    from tools import browser_tool
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+    task_id = "task-retired-eval"
+    monkeypatch.setattr(browser_tool, "_retired_browser_tasks", {task_id})
+    monkeypatch.setattr(browser_tool, "_last_active_session_key", {})
+    supervisor_get = MagicMock()
+    run_command = MagicMock()
+    monkeypatch.setattr(SUPERVISOR_REGISTRY, "get", supervisor_get)
+    monkeypatch.setattr(bt_session, "_run_browser_command", run_command)
+
+    result = json.loads(
+        browser_tool.browser_console(expression="1 + 1", task_id=task_id)
+    )
+
+    assert result["code"] == "browser_session_retired"
+    assert result["data"]["terminal"] is True
+    supervisor_get.assert_not_called()
+    run_command.assert_not_called()
+
+
+class TestInactivityJanitorMultiplex:
+    """#86402 / #100738: the process-global janitor thread has no profile scope."""
+
+    def setup_method(self):
+        from agent import secret_scope
+        from tools import browser_tool
+
+        self.bt = browser_tool
+        self.saved = {
+            name: getattr(browser_tool, name).copy()
+            for name in (
+                "_active_sessions", "_session_last_activity",
+                "_session_owner_homes", "_cleanup_failures", "_recording_sessions",
+            )
+        }
+        self.orig_timeout = browser_tool.BROWSER_SESSION_INACTIVITY_TIMEOUT
+        browser_tool.BROWSER_SESSION_INACTIVITY_TIMEOUT = 0
+        for name in self.saved:
+            getattr(browser_tool, name).clear()
+        secret_scope.set_multiplex_active(True)
+
+    def teardown_method(self):
+        from agent import secret_scope
+
+        secret_scope.set_multiplex_active(False)
+        self.bt.BROWSER_SESSION_INACTIVITY_TIMEOUT = self.orig_timeout
+        for name, saved in self.saved.items():
+            live = getattr(self.bt, name)
+            live.clear()
+            live.update(saved)
+
+    def test_janitor_tears_down_under_owner_profile_scope(self, tmp_path, monkeypatch):
+        from agent import secret_scope
+        from hermes_constants import (
+            get_hermes_home, reset_hermes_home_override, set_hermes_home_override,
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("CAMOFOX_URL", raising=False)
+        monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+        p1 = tmp_path / "profiles" / "p1"
+        p1.mkdir(parents=True)
+        (p1 / ".env").write_text("CAMOFOX_URL=http://127.0.0.1:1\n", encoding="utf-8")
+
+        # Profile p1's turn opens the session; the janitor later runs unscoped.
+        home_tok = set_hermes_home_override(str(p1))
+        scope_tok = secret_scope.set_secret_scope(secret_scope.build_profile_secret_scope(p1))
+        try:
+            bt_lifecycle._update_session_activity("t1")
+            self.bt._active_sessions["t1"] = {"session_name": "s1", "bb_session_id": None}
+        finally:
+            secret_scope.reset_secret_scope(scope_tok)
+            reset_hermes_home_override(home_tok)
+        self.bt._session_last_activity["t1"] -= 10
+
+        seen = {}
+
+        def fake_close(task_id, cmd, args, timeout=None, **_kwargs):
+            seen["home"] = str(get_hermes_home())
+            seen["url"] = secret_scope.get_secret("CAMOFOX_URL")
+            return {"success": True}
+
+        with (
+            patch("tools.browser_tool_session._run_browser_command", side_effect=fake_close),
+            patch("tools.browser_camofox._delete", return_value={}),
+            patch("tools.browser_tool.os.path.exists", return_value=False),
+        ):
+            bt_lifecycle._cleanup_inactive_browser_sessions()
+
+        assert seen == {"home": str(p1), "url": "http://127.0.0.1:1"}
+        assert "t1" not in self.bt._session_last_activity
+        assert "t1" not in self.bt._active_sessions
+        assert "t1" not in self.bt._session_owner_homes
+
+    def test_repeated_failures_force_reap_and_close_cloud_session(self):
+        from unittest.mock import MagicMock
+
+        self.bt._active_sessions["t1"] = {"session_name": "s1", "bb_session_id": "bb-1"}
+        self.bt._session_last_activity["t1"] = 1.0
+        provider = MagicMock()
+        provider.close_session.return_value = True
+
+        with (
+            patch("tools.browser_tool_lifecycle.cleanup_browser", side_effect=RuntimeError("boom")),
+            patch("tools.browser_tool_cloud._get_cloud_provider", return_value=provider),
+            patch("tools.browser_tool.os.path.exists", return_value=False),
+        ):
+            for _ in range(self.bt.MAX_INACTIVITY_CLEANUP_FAILURES - 1):
+                bt_lifecycle._cleanup_inactive_browser_sessions()
+            # An activity touch must NOT reset the failure budget.
+            bt_lifecycle._update_session_activity("t1")
+            self.bt._session_last_activity["t1"] = 1.0
+            assert self.bt._cleanup_failures["t1"] == self.bt.MAX_INACTIVITY_CLEANUP_FAILURES - 1
+            assert "t1" in self.bt._active_sessions
+            provider.close_session.assert_not_called()
+
+            bt_lifecycle._cleanup_inactive_browser_sessions()
+
+        provider.close_session.assert_called_once_with("bb-1")
+        assert "t1" not in self.bt._active_sessions
+        assert "t1" not in self.bt._session_last_activity
+        assert "t1" not in self.bt._cleanup_failures
+
+
+class TestAtexitStopSwallowsInterrupt:
+    def test_second_ctrl_c_during_join_does_not_propagate(self, monkeypatch):
+        """A second Ctrl+C while the atexit hook waits on the janitor must not escape as a
+        traceback (#10764): the thread is a daemon, the interpreter is already exiting."""
+        from tools import browser_tool
+
+        class _InterruptedJoin:
+            def join(self, timeout=None):
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(browser_tool, "_cleanup_thread", _InterruptedJoin())
+        monkeypatch.setattr(browser_tool, "_cleanup_running", True)
+        bt_lifecycle._stop_browser_cleanup_thread()  # must not raise
+        assert browser_tool._cleanup_running is False
+
+
+class TestAtexitOriginUnimportable:
+    def test_hooks_stay_silent_when_origin_fresh_import_fails(self, monkeypatch):
+        """Mid-`hermes update` the on-disk tree can be half-new (new config.py importing
+        a name the old utils.py lacks yet); the fresh import in origin_module then raises
+        and the atexit hooks must stay silent (#112437)."""
+        import tools.browser_tool_origin as origin_mod
+
+        def _boom(_depth=2):
+            raise ImportError("cannot import name 'file_signature' from 'utils'")
+
+        monkeypatch.setattr(origin_mod, "origin_module", _boom)
+        bt_lifecycle._emergency_cleanup_all_sessions()  # must not raise
+        bt_lifecycle._stop_browser_cleanup_thread()  # must not raise
