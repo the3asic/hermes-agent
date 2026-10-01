@@ -1132,6 +1132,11 @@ def _build_replay_entry(
     # removes display metadata from wire copies, so it never becomes provider input.
     if isinstance(msg.get("display_metadata"), dict):
         entry["display_metadata"] = msg["display_metadata"]
+    # A persisted row ID distinguishes repeated text during context-engine ingest.
+    # The API builder already removes this bookkeeping field from wire copies.
+    row_id = msg.get("_row_id")
+    if type(row_id) is int and row_id > 0:
+        entry["_row_id"] = row_id
     # api_content sidecar keeps the request prefix byte-stable — ONLY if this pipeline did not rewrite
     # content. The caller renders timestamps AFTER this check so a stamp alone never drops the sidecar.
     _sidecar = msg.get("api_content")
