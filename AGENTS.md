@@ -1,6 +1,11 @@
 # Hermes Agent - Development Guide
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
+For `the3asic/hermes-agent`, follow the
+[ABM fork release policy](CONTRIBUTING.md#abm-fork-release-policy): `main` is the
+official release line, and production acceptance records the exact Core/LCM
+pair and actual runtime identity. The upstream guide below still applies to
+code contributions; it does not authorize synchronizing production from upstream.
 This root file holds only what applies everywhere. Each area has its own `AGENTS.md` (aim for
 ~8k chars; `agent/subdirectory_hints.py` delivers up to 32k and truncates head/tail with a warning
 past that); see the **routing table** at the end and read the area file before editing in that area.
