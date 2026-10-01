@@ -1,5 +1,59 @@
 # Contributing to Hermes Agent
 
+## ABM fork release policy
+
+This section governs `the3asic/hermes-agent`; the upstream contribution guide
+below remains available for contributions to Nous Research. In this fork,
+`main` is the official production release line. `upstream/main` is an input for
+review, not an instruction to replace the released fork.
+
+### Change, merge, deploy, accept
+
+1. Create a focused branch from this fork's `main`, and open one PR per
+   independent change. Preserve original authorship when porting upstream work.
+2. Review the diff and run validation appropriate to the change. Runtime fixes
+   require relevant regression tests through `scripts/run_tests.sh`; pure prose
+   changes require a diff and link check. Record commands, results and concrete
+   limitations in the PR. A missing, skipped or cancelled check is not a test
+   pass; distinguish an independently verified baseline failure from a new
+   regression instead of suppressing it.
+3. Merge the reviewed PR to `main`, then deploy its exact merged commit using
+   the existing controlled deployment procedure. Inspect the real target first:
+   revision, ancestry, local changes, service activity, dependency/config changes
+   and rollback point. Never overwrite dirty work or update straight from the
+   upstream branch. Hotfixes use the same PR, validation and acceptance gates.
+4. Verify the affected behavior through the real entry point and record the
+   merged SHA, deployed checkout SHA, running process's startup SHA, compatible
+   LCM SHA and acceptance evidence. A merge, green check or successful startup
+   alone does not prove production acceptance. At release closeout, the
+   production checkout and this fork's `main` must agree.
+
+`main` can temporarily be ahead of production during a controlled deployment,
+and production may retain a known-good commit during rollback. Report that
+difference explicitly. A documentation-only or identical-source history merge
+does not require a service restart: prove all runtime files are unchanged and
+retain the actual process startup identity rather than claiming it loaded a
+new commit. Runtime changes use the existing idle/drain and restart procedure.
+
+### Recovery and enforcement
+
+Keep the prior release commit and verified recovery material before deployment.
+Normal rollback changes code only and preserves the live databases and newer
+messages; do not replace live history with an older database snapshot. Keep
+host-private credentials, config, databases and acceptance captures outside Git.
+
+GitHub protection requires a PR for `main`, including administrator updates, and
+forbids force pushes and branch deletion. It does not substitute for validation
+or a reviewer inspecting the diff. Read the actual enabled workflows and
+required-check configuration before claiming CI coverage; inherited Core CI
+has not been enabled by this policy. There is no automatic production deploy.
+
+For this maintained installation, release from the exact reviewed
+`origin/main` commit. `hermes update --check` can compare the official upstream
+remote, and the generic updater has an upstream-sync path; neither is proof of
+this fork's deployed release. Preserve the upstream remote for investigation
+and select upstream ports in separate reviewed PRs.
+
 Thank you for contributing to Hermes Agent! This guide covers everything you need: setting up your dev environment, understanding the architecture, deciding what to build, and getting your PR merged.
 
 ---

@@ -3,6 +3,14 @@
 </p>
 
 # Hermes Agent ☤
+
+**ABM production fork:** [`the3asic/hermes-agent`](https://github.com/the3asic/hermes-agent).
+`main` is our official release line. A merge and a live deployment are separate
+steps; acceptance records an exact Core/LCM commit pair. Follow the
+[fork release policy](CONTRIBUTING.md#abm-fork-release-policy) for this maintained
+installation. The upstream project and installation instructions below retain
+their original attribution and do not install this fork's validated release.
+
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>
 </p>
