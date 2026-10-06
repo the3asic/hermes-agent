@@ -441,6 +441,11 @@ cronjob(
 
 To keep fallback for a job, leave it unpinned and choose its model with `cron.model` / `cron.model_provider` instead. See [Scheduled Tasks (Cron)](./cron.md#provider-recovery) for details.
 
+Alternatively, explicitly declare `cron.fallback_providers` to authorize a
+cron-only backup chain while retaining pinned primary routes. It overrides the
+inherited chain for cron runs only; `null` preserves the default pin policy and
+`[]` disables cron fallback. See the [explicit cron fallback policy](./cron.md#explicit-cron-fallback-policy).
+
 ---
 
 ## Summary

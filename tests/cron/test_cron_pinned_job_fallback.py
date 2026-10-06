@@ -37,10 +37,10 @@ def _runtime(provider):
             "api_mode": "chat_completions"}
 
 
-def _run(tmp_path, job, *, primary_error=None):
+def _run(tmp_path, job, *, primary_error=None, config=_CONFIG):
     """Run *job*; the primary resolve raises *primary_error* (if any), fallback entries succeed.
     Returns ``(success, error, requested providers, AIAgent kwargs — {} when never built)``."""
-    (tmp_path / "config.yaml").write_text(_CONFIG, encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(config, encoding="utf-8")
     requested = []
 
     def resolve(**kwargs):
@@ -123,8 +123,9 @@ def test_resolve_job_runtime_walks_the_chain_for_an_unpinned_job():
         raise AuthError("No credentials stored")
 
     with patch("hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=resolve):
-        runtime, model = _resolve_job_runtime(_job(), "free-job", jc)
+        runtime, model, fallback_entry = _resolve_job_runtime(_job(), "free-job", jc)
     assert (runtime["provider"], model) == ("openrouter", "z-ai/glm-5.2")
+    assert fallback_entry == _CHAIN[0]
 
 
 @pytest.mark.parametrize("pin", PINS)
@@ -176,3 +177,37 @@ def test_pinned_job_failure_notice_does_not_promise_a_backup(monkeypatch):
     assert "pinned" in phrase and "--unpin" in phrase
     assert "succeeded" not in phrase
     assert scheduler._fallback_chain_phrase(_job()) == "No backup provider succeeded either."
+
+
+@pytest.mark.parametrize("primary_error", [None, AuthError("No credentials stored")])
+def test_explicit_cron_chain_preserves_primary_and_reaches_agent(tmp_path, primary_error):
+    config = _CONFIG + (
+        "cron:\n"
+        "  fallback_providers:\n"
+        "    - provider: openrouter\n"
+        "      model: gpt-6.1-sol\n"
+        "      reasoning_effort: max\n"
+    )
+    success, error, requested, kwargs = _run(
+        tmp_path, _job(provider="anthropic", model="claude-sonnet-5", reasoning_effort="low"),
+        primary_error=primary_error, config=config,
+    )
+    chain = [{"provider": "openrouter", "model": "gpt-6.1-sol", "reasoning_effort": "max"}]
+    assert (success, error) == (True, None)
+    assert kwargs["fallback_model"] == chain
+    if primary_error is None:
+        assert kwargs["model"] == "claude-sonnet-5"
+        assert kwargs["reasoning_config"]["effort"] == "low"
+        assert "openrouter" not in requested
+    else:
+        assert kwargs["model"] == "gpt-6.1-sol"
+        assert kwargs["reasoning_config"]["effort"] == "max"
+
+
+@pytest.mark.parametrize("declared", [[], [{"model": "missing-provider"}]])
+def test_empty_or_invalid_cron_chain_cannot_override_a_pin(monkeypatch, declared):
+    job = _job(provider="anthropic", model="claude-sonnet-5")
+    config = {"fallback_providers": list(_CHAIN), "cron": {"fallback_providers": declared}}
+    monkeypatch.setattr(scheduler, "load_config", lambda: config)
+    assert scheduler._job_fallback_chain(job, config) is None
+    assert "--unpin" in scheduler._fallback_chain_phrase(job)
