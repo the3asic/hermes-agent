@@ -2571,6 +2571,12 @@ def run_job(
             # Pre-agent provider switch (#74349) rides with the delivered report; silence and the
             # agent-declared failure marker keep their first-line/whole-response contract.
             final_response = f"{setup.fallback_notice}\n\n{final_response}"
+        if (final_response.strip() and not _is_cron_silence_response(final_response)
+                and _cron_failure_marker_error(final_response) is None):
+            from cron.scheduler_footer import append_runtime_footer
+            final_response = append_runtime_footer(
+                final_response, agent, result, _cfg,
+                seconds=time.monotonic() - _audit.t_start)
         # Keep final_response clean for delivery logic (empty = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
         output = _run_doc_header(job, job_name, job_id, prompt) + f"## Response\n\n{logged_response}\n"

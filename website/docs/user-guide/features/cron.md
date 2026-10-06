@@ -625,6 +625,23 @@ This applies only to cron deliveries. `TELEGRAM_HOME_CHANNEL_THREAD_ID` (used el
 
 ### Response wrapping
 
+AI-backed cron results can append the same runtime footer used by chat. Enable
+it specifically for cron without changing chat display settings:
+
+```yaml
+display:
+  platforms:
+    cron:
+      runtime_footer:
+        enabled: true
+        fields: [model_last, reasoning_effort, tokens_turn, cache_hit, context_window, latency]
+```
+
+The model and requested effort describe the final route, including a fallback.
+Token and cache values come from reported main-call usage; missing data is
+omitted and incomplete coverage is labelled partial. `[SILENT]`, empty output,
+failed turns and script-only jobs do not gain a model footer.
+
 By default, delivered cron output is wrapped with a header and footer so the recipient knows it came from a scheduled task:
 
 ```
