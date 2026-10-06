@@ -108,13 +108,15 @@ def _job_route_pinned(job: dict) -> bool:
 def _job_fallback_chain(job: dict, cfg: Any) -> Optional[list]:
     """The fallback chain this job may walk, at credential resolution AND mid-run (#100437).
 
-    A pinned job never borrows the global ``fallback_providers`` chain, the same rule a pinned
-    ``delegate_task`` child follows (``scoped_fallback_chain``): a chain entry is a different
-    provider and usually a different model, which is exactly what the pin ruled out. Same-provider
-    credential-pool rotation is not the chain and still applies. Unpinned jobs inherit the chain.
+    An explicit ``cron.fallback_providers`` chain authorizes cron failover without releasing a
+    job's primary pin. Absent that policy, pinned jobs never borrow the global chain; unpinned
+    jobs inherit it. An explicit empty list disables cron fallback. Same-provider credential-pool
+    rotation remains separate.
     """
+    cron_cfg = cfg.get("cron") if isinstance(cfg, dict) else None
+    declared = cron_cfg.get("fallback_providers") if isinstance(cron_cfg, dict) else None
     return scoped_fallback_chain(
-        get_fallback_chain(cfg), None, pinned=_job_route_pinned(job), owner="cron job")
+        get_fallback_chain(cfg), declared, pinned=_job_route_pinned(job), owner="cron job")
 
 
 def _fallback_chain_phrase(job: Optional[dict] = None) -> str:
@@ -122,19 +124,19 @@ def _fallback_chain_phrase(job: Optional[dict] = None) -> str:
     failed too" vs "none configured" (most installs). Fails open to "the backups failed too" if
     config can't be read — never crash delivery.
     """
+    try:
+        cfg = load_config() or {}
+        chain = _job_fallback_chain(job, cfg) if job is not None else get_fallback_chain(cfg)
+    except Exception:
+        return "No backup provider succeeded either."
+    if chain:
+        return "No backup provider succeeded either."
     if job is not None and _job_route_pinned(job):
         return (
             "This job is pinned to its own provider/model, so it does not fall back to "
             f"`fallback_providers`; `hermes cron edit {job.get('id')} --unpin` lets it follow the "
             "main model and its fallback chain."
         )
-    try:
-        cfg = load_config() or {}
-        chain = get_fallback_chain(cfg)
-    except Exception:
-        return "No backup provider succeeded either."
-    if chain:
-        return "No backup provider succeeded either."
     return (
         "No backup provider is configured — add one with `hermes fallback add`, "
         "or set a cron-wide default via `cron.model` + `cron.model_provider` in config.yaml."

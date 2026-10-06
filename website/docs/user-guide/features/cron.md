@@ -1020,6 +1020,27 @@ Before this rule, a pinned job whose provider failed could run on the first work
 
 A single rate-limited key therefore does not fail a run that has another credential for the same provider, and unpinned jobs still survive a provider outage when a chain is configured.
 
+### Explicit cron fallback policy
+
+To preserve each job's primary model while explicitly allowing failover, set
+`cron.fallback_providers`. This cron-only policy uses the same entry format as
+the global chain and applies both before agent construction and to provider
+errors during the run, including jobs with pinned primary routes:
+
+```yaml
+cron:
+  fallback_providers:
+    - provider: openrouter
+      model: openai/gpt-6.1-sol
+      reasoning_effort: max
+```
+
+This does not change the job's normal primary route or the chat fallback policy.
+Omit the setting (or use `null`) to retain the default pin behavior described
+above. An explicit `[]` disables cron model fallback. The fallback entry's
+reasoning effort belongs to its target; the primary job's effort does not
+override it. Script-only jobs do not use this policy.
+
 ## Run failures (`last_error`)
 
 A failed agent run records a concise `last_error`, visible in job listings and `/cron list`
