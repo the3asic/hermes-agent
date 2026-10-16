@@ -3592,6 +3592,7 @@ def _prepare_same_provider_retry(
         temperature=temperature, max_tokens=max_tokens, tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=retry_base or resolved_base_url, task=task,
+        api_mode=resolved_api_mode or ("codex_responses" if isinstance(retry_client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)) else None),
     )
     # Preserve per-request attribution headers (e.g. Copilot ``x-initiator``) so the retry keeps capability gating.
     if extra_headers:
@@ -3965,7 +3966,8 @@ def _fallback_request_kwargs(
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,
         temperature=temperature, max_tokens=fallback_max_tokens, tools=fallback_tools, timeout=effective_timeout,
-        extra_body=fallback_extra_body, reasoning_config=fallback_reasoning, base_url=destination.base_url, task=task)
+        extra_body=fallback_extra_body, reasoning_config=fallback_reasoning, base_url=destination.base_url,
+        task=task, api_mode=destination.api_mode)
     if fallback_max_tokens is not None and max_tokens is None:
         fb_kwargs.update(auxiliary_max_tokens_param(fallback_max_tokens, model=destination.model))
     return fb_kwargs
@@ -3991,6 +3993,8 @@ def _plan_fallback_candidate(
         )
         effective_timeout = fb_timeout
     destination = _fallback_destination(task, fb_client, fb_model, fb_label)
+    if isinstance(fb_client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)):
+        destination = destination._replace(api_mode="codex_responses")
     common = dict(
         task=task, effective_timeout=effective_timeout, fb_label=fb_label,
         fallback_route_ref=fallback_route_ref, apply_fast_lane=apply_fast_lane, **request,
@@ -6489,7 +6493,10 @@ def _is_gemini_native_route(provider_norm: str, effective_base: str) -> bool:
         return False
 
 
-def _forwards_max_tokens(provider: str, provider_norm: str, model: str, effective_base: str, task: Optional[str]) -> bool:
+def _forwards_max_tokens(
+    provider: str, provider_norm: str, model: str, effective_base: str, task: Optional[str],
+    api_mode: Optional[str] = None,
+) -> bool:
     """Whether an explicit max_tokens is forwarded on this route.
 
     No default cap elsewhere (omitted = provider default; avoids max_completion_tokens / ZAI-vision
@@ -6503,7 +6510,8 @@ def _forwards_max_tokens(provider: str, provider_norm: str, model: str, effectiv
         or _nous_on_messages_wire(provider_norm, model)
         or provider_norm in _NVIDIA_PROVIDER_NAMES
         or base_url_host_matches(effective_base, "integrate.api.nvidia.com")
-        or str(task) in {"moa_reference", "compression"}
+        or str(task) == "moa_reference"
+        or (task == "compression" and api_mode == "codex_responses")
         or _is_gemini_native_route(provider_norm, effective_base)
         or provider_norm == "openrouter"
         or base_url_host_matches(effective_base, "openrouter.ai")
@@ -6597,7 +6605,7 @@ def _build_call_kwargs(
     provider: str, model: str, messages: list, temperature: Optional[float] = None,
     max_tokens: Optional[int] = None, tools: Optional[list] = None, timeout: float = 30.0,
     extra_body: Optional[dict] = None, reasoning_config: Optional[dict] = None,
-    base_url: Optional[str] = None, task: Optional[str] = None,
+    base_url: Optional[str] = None, task: Optional[str] = None, api_mode: Optional[str] = None,
 ) -> dict:
     """Build kwargs for .chat.completions.create() with model/provider adjustments."""
     kwargs: Dict[str, Any] = {"model": model, "messages": messages, "timeout": timeout}
@@ -6614,7 +6622,7 @@ def _build_call_kwargs(
             kwargs["temperature"] = temperature
     effective_base = base_url or (_current_custom_base_url() if provider == "custom" else "")
     provider_norm = str(provider or "").strip().lower()
-    if max_tokens is not None and _forwards_max_tokens(provider, provider_norm, model, effective_base, task):
+    if max_tokens is not None and _forwards_max_tokens(provider, provider_norm, model, effective_base, task, api_mode):
         kwargs.update(auxiliary_max_tokens_param(max_tokens, model=model))  # picks max_completion_tokens where needed
     if tools:
         kwargs["tools"] = _dedupe_tool_names(tools, provider, model)
@@ -7301,7 +7309,8 @@ def _prepare_aux_request(
     kwargs = _build_call_kwargs(
         request_provider, final_model, messages, temperature=temperature, max_tokens=effective_call_max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
-        reasoning_config=reasoning_config, base_url=base_info or resolved_base_url, task=task)
+        reasoning_config=reasoning_config, base_url=base_info or resolved_base_url, task=task,
+        api_mode=resolved_api_mode or ("codex_responses" if isinstance(client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)) else None))
     if effective_call_max_tokens is not None and max_tokens is None:
         kwargs.update(auxiliary_max_tokens_param(effective_call_max_tokens, model=final_model))
     if extra_headers:
