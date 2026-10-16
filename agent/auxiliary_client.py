@@ -1488,15 +1488,8 @@ class _CodexCompletionsAdapter:
         # headers via the SDK kwarg — forward them.
         if isinstance(kwargs.get("extra_headers"), dict) and kwargs["extra_headers"]:
             resp_kwargs["extra_headers"] = dict(kwargs["extra_headers"])
-        # The OAuth Codex backend rejects max_output_tokens (400), while
-        # API-key Responses endpoints accept it. Preserve an explicit budget
-        # across this bridge only on routes that support that wire field.
-        from agent.codex_responses_adapter import classify_responses_route
-        is_codex_backend = classify_responses_route(SimpleNamespace(base_url=host)).is_codex_backend
-        output_limit = kwargs.get("max_completion_tokens", kwargs.get("max_tokens"))
-        if output_limit is not None and not is_codex_backend:
-            resp_kwargs["max_output_tokens"] = output_limit
-        # Temperature remains omitted for Codex model compatibility.
+        from agent.auxiliary_client_limits import responses_output_limits
+        resp_kwargs.update(responses_output_limits(kwargs, host))
         extra_body = kwargs.get("extra_body") or {}
         if isinstance(extra_body, dict):
             # service_tier (fast mode) is a top-level Responses field; xAI's endpoint rejects it.
@@ -6582,32 +6575,6 @@ def _is_gemini_native_route(provider_norm: str, effective_base: str) -> bool:
         return False
 
 
-def _forwards_max_tokens(
-    provider: str, provider_norm: str, model: str, effective_base: str, task: Optional[str],
-    api_mode: Optional[str] = None,
-) -> bool:
-    """Whether an explicit max_tokens is forwarded on this route.
-
-    No default cap elsewhere (omitted = provider default; avoids max_completion_tokens / ZAI-vision
-    quirks). Forward only where mandatory or honored: Anthropic Messages wire (400 without it);
-    NVIDIA NIM (empty choices[] when omitted); MoA reference slots; Gemini native (fixed 65,535
-    ceiling otherwise); OpenRouter (budgets the FULL window when omitted → 402 on low credit);
-    managed local llama-server (uncapped decode with no EOS burns the GPU to the context window).
-    """
-    return (
-        _is_anthropic_compat_endpoint(provider, effective_base)
-        or _nous_on_messages_wire(provider_norm, model)
-        or provider_norm in _NVIDIA_PROVIDER_NAMES
-        or base_url_host_matches(effective_base, "integrate.api.nvidia.com")
-        or str(task) == "moa_reference"
-        or (task == "compression" and api_mode == "codex_responses")
-        or _is_gemini_native_route(provider_norm, effective_base)
-        or provider_norm == "openrouter"
-        or base_url_host_matches(effective_base, "openrouter.ai")
-        or _is_managed_local_endpoint(effective_base)
-    )
-
-
 def _dedupe_tool_names(tools: list, provider: str, model: str) -> list:
     """Drop duplicate tool names (Vertex/Azure/Bedrock 400 on them) with a warning."""
     seen: set = set()
@@ -6763,7 +6730,8 @@ def _build_call_kwargs(
         if not _forbids_sampling_params(model):
             kwargs["temperature"] = temperature
     provider_norm = str(provider or "").strip().lower()
-    if max_tokens is not None and _forwards_max_tokens(provider, provider_norm, model, effective_base, task, api_mode):
+    from agent.auxiliary_client_limits import forwards_max_tokens
+    if max_tokens is not None and forwards_max_tokens(provider, provider_norm, model, effective_base, task, api_mode):
         kwargs.update(auxiliary_max_tokens_param(max_tokens, model=model))  # picks max_completion_tokens where needed
     if tools:
         kwargs["tools"] = _dedupe_tool_names(tools, provider, model)
