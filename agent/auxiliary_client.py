@@ -1488,7 +1488,15 @@ class _CodexCompletionsAdapter:
         # headers via the SDK kwarg — forward them.
         if isinstance(kwargs.get("extra_headers"), dict) and kwargs["extra_headers"]:
             resp_kwargs["extra_headers"] = dict(kwargs["extra_headers"])
-        # The Codex endpoint rejects max_output_tokens/temperature (400) — omit.
+        # The OAuth Codex backend rejects max_output_tokens (400), while
+        # API-key Responses endpoints accept it. Preserve an explicit budget
+        # across this bridge only on routes that support that wire field.
+        from agent.codex_responses_adapter import classify_responses_route
+        is_codex_backend = classify_responses_route(SimpleNamespace(base_url=host)).is_codex_backend
+        output_limit = kwargs.get("max_completion_tokens", kwargs.get("max_tokens"))
+        if output_limit is not None and not is_codex_backend:
+            resp_kwargs["max_output_tokens"] = output_limit
+        # Temperature remains omitted for Codex model compatibility.
         extra_body = kwargs.get("extra_body") or {}
         if isinstance(extra_body, dict):
             # service_tier (fast mode) is a top-level Responses field; xAI's endpoint rejects it.
@@ -6584,7 +6592,7 @@ def _forwards_max_tokens(provider: str, provider_norm: str, model: str, effectiv
         or _nous_on_messages_wire(provider_norm, model)
         or provider_norm in _NVIDIA_PROVIDER_NAMES
         or base_url_host_matches(effective_base, "integrate.api.nvidia.com")
-        or str(task) == "moa_reference"
+        or str(task) in {"moa_reference", "compression"}
         or _is_gemini_native_route(provider_norm, effective_base)
         or provider_norm == "openrouter"
         or base_url_host_matches(effective_base, "openrouter.ai")
