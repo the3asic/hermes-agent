@@ -3782,6 +3782,7 @@ def _prepare_same_provider_retry(
         temperature=temperature, max_tokens=max_tokens, tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=retry_base or resolved_base_url, task=task,
+        api_mode=resolved_api_mode or ("codex_responses" if isinstance(retry_client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)) else None),
     )
     # Preserve per-request attribution headers (e.g. Copilot ``x-initiator``) so the retry keeps capability gating.
     if extra_headers:
@@ -4039,7 +4040,8 @@ def _fallback_request_kwargs(
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,
         temperature=temperature, max_tokens=fallback_max_tokens, tools=fallback_tools, timeout=effective_timeout,
-        extra_body=fallback_extra_body, reasoning_config=reasoning_config, base_url=destination.base_url, task=task)
+        extra_body=fallback_extra_body, reasoning_config=reasoning_config, base_url=destination.base_url,
+        task=task, api_mode=destination.api_mode)
     return fb_kwargs
 
 
@@ -4064,6 +4066,8 @@ def _plan_fallback_candidate(
     destination = _fallback_destination(task, fb_client, fb_model, fb_label)
     task_config = _get_auxiliary_task_config(task) if task == "compression" else {}
     fallback_entry = _fallback_chain_entry(task, fb_label) or {}
+    if isinstance(fb_client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)):
+        destination = destination._replace(api_mode="codex_responses")
     common = dict(
         task=task, effective_timeout=effective_timeout, fallback_entry=fallback_entry,
         task_config=task_config, apply_fast_lane=apply_fast_lane, **request,
@@ -6578,7 +6582,10 @@ def _is_gemini_native_route(provider_norm: str, effective_base: str) -> bool:
         return False
 
 
-def _forwards_max_tokens(provider: str, provider_norm: str, model: str, effective_base: str, task: Optional[str]) -> bool:
+def _forwards_max_tokens(
+    provider: str, provider_norm: str, model: str, effective_base: str, task: Optional[str],
+    api_mode: Optional[str] = None,
+) -> bool:
     """Whether an explicit max_tokens is forwarded on this route.
 
     No default cap elsewhere (omitted = provider default; avoids max_completion_tokens / ZAI-vision
@@ -6592,7 +6599,8 @@ def _forwards_max_tokens(provider: str, provider_norm: str, model: str, effectiv
         or _nous_on_messages_wire(provider_norm, model)
         or provider_norm in _NVIDIA_PROVIDER_NAMES
         or base_url_host_matches(effective_base, "integrate.api.nvidia.com")
-        or str(task) in {"moa_reference", "compression"}
+        or str(task) == "moa_reference"
+        or (task == "compression" and api_mode == "codex_responses")
         or _is_gemini_native_route(provider_norm, effective_base)
         or provider_norm == "openrouter"
         or base_url_host_matches(effective_base, "openrouter.ai")
@@ -6732,7 +6740,7 @@ def _build_call_kwargs(
     max_tokens: Optional[int] = None, tools: Optional[list] = None, timeout: float = 30.0,
     extra_body: Optional[dict] = None, reasoning_config: Optional[dict] = None,
     base_url: Optional[str] = None, task: Optional[str] = None,
-    no_progress_timeout: Optional[float] = None,
+    no_progress_timeout: Optional[float] = None, api_mode: Optional[str] = None,
 ) -> dict:
     """Build kwargs for .chat.completions.create() with model/provider adjustments.
     ``no_progress_timeout`` is a Codex-Responses-only extra (consumed by
@@ -6755,7 +6763,7 @@ def _build_call_kwargs(
         if not _forbids_sampling_params(model):
             kwargs["temperature"] = temperature
     provider_norm = str(provider or "").strip().lower()
-    if max_tokens is not None and _forwards_max_tokens(provider, provider_norm, model, effective_base, task):
+    if max_tokens is not None and _forwards_max_tokens(provider, provider_norm, model, effective_base, task, api_mode):
         kwargs.update(auxiliary_max_tokens_param(max_tokens, model=model))  # picks max_completion_tokens where needed
     if tools:
         kwargs["tools"] = _dedupe_tool_names(tools, provider, model)
@@ -7538,7 +7546,8 @@ def _prepare_aux_request(
         request_provider, final_model, messages, temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config, base_url=base_info or resolved_base_url, task=task,
-        no_progress_timeout=no_progress_timeout)
+        no_progress_timeout=no_progress_timeout,
+        api_mode=resolved_api_mode or ("codex_responses" if isinstance(client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)) else None))
     if extra_headers:
         kwargs["extra_headers"] = dict(extra_headers)
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
