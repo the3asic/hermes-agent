@@ -58,5 +58,3 @@ def test_generic_chat_compression_preserves_route_quirks(api_mode):
     )
     assert "max_tokens" not in request
     assert "max_completion_tokens" not in request
-
-
