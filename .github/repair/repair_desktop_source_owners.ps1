@@ -1,4 +1,4 @@
-param([switch]$Write)
+param([switch]$Write, [Parameter(Mandatory=$true)][string]$OwnerScriptCommit, [Parameter(Mandatory=$true)][string]$OwnerScriptSha256)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $root = Join-Path $env:USERPROFILE 'Dev\hermes-health-repair-20261019'
@@ -8,12 +8,15 @@ Set-Location $work
 $out = Join-Path $work 'artifacts\hermes-repair-20261019'
 $export = Join-Path $out 'native-desktop-source-edits.json'
 if (Test-Path $export) { throw 'Read the existing native source edit receipt' }
-if ((git rev-parse HEAD).Trim() -ne '2a5f1a8bf7b6060ca0d3d70ce08d9ec91546c92a' -or (git status --porcelain --untracked-files=no)) { throw 'Preserve changed desktop source' }
+if ($OwnerScriptCommit -notmatch '^[a-f0-9]{40}$' -or $OwnerScriptSha256 -notmatch '^[a-f0-9]{64}$') { throw 'Invalid source helper identity' }
+if ((git rev-parse HEAD).Trim() -ne '2a5f1a8bf7b6060ca0d3d70ce08d9ec91546c92a') { throw 'Preserve changed desktop source' }
+$allowed = @('apps/desktop/src/i18n/en.ts','apps/desktop/src/i18n/ja.ts','apps/desktop/src/i18n/zh.ts','apps/desktop/src/i18n/types.ts','apps/desktop/src/app/cron/index.tsx')
+foreach ($changed in @(git diff --name-only)) { if ($changed -notin $allowed) { throw 'Preserve native edits outside the reviewed locale owner changes' } }
 $accepted = Get-Content (Join-Path $out 'desktop-acceptance\native-acceptance.json') -Raw | ConvertFrom-Json
 if ($accepted.test_exit -ne 0 -or $accepted.typecheck_exit -ne 0 -or $accepted.lint_exit -ne 0 -or $accepted.checks_exit -ne 1) { throw 'Inspect the actual desktop validation result' }
 $path = Join-Path $out 'native_desktop_source_owners.mjs'
-Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/the3asic/hermes-agent/0d8735563de7130e3722202c8a41495600b4d57b/.github/repair/native_desktop_source_owners.mjs' -OutFile $path
-if ((Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne '3d19efd940a7ef3a320e18b94d522f065eff15348ea8898b9fb2ec23575f2c1b') { throw 'Inspect the source editing helper' }
+Invoke-WebRequest -UseBasicParsing -Uri ('https://raw.githubusercontent.com/the3asic/hermes-agent/' + $OwnerScriptCommit + '/.github/repair/native_desktop_source_owners.mjs') -OutFile $path
+if ((Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $OwnerScriptSha256) { throw 'Inspect the source editing helper' }
 & node $path
 if ($LASTEXITCODE) { throw 'Desktop locale extraction failed' }
 $paths = (Get-Content (Join-Path $out 'desktop-source-owner-paths.json') -Raw | ConvertFrom-Json).files

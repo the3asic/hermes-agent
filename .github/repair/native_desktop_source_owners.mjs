@@ -2,20 +2,25 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { createRequire } from 'node:module'
+import { execFileSync } from 'node:child_process'
 
 const require = createRequire(path.join(process.cwd(), 'package.json'))
 const ts = require('typescript')
 const root = process.cwd()
 const i18n = 'apps/desktop/src/i18n'
 const written = []
+const planned = new Map()
+const original = new Map()
 
 function parsed(relative) {
-  const source = fs.readFileSync(path.join(root, relative), 'utf8')
+  const source = execFileSync('git', ['show', `HEAD:${relative}`], { cwd: root, encoding: 'utf8' })
+  original.set(relative, source)
   return { source, tree: ts.createSourceFile(relative, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS) }
 }
 
 function write(relative, source) {
-  fs.writeFileSync(path.join(root, relative), source)
+  if (planned.has(relative)) throw new Error(`Inspect duplicate output ${relative}`)
+  planned.set(relative, source)
   written.push(relative)
 }
 
@@ -27,14 +32,19 @@ for (const locale of ['en', 'ja', 'zh']) {
   const relative = `${i18n}/${locale}.ts`
   const { source, tree } = parsed(relative)
   const declaration = tree.statements.filter(ts.isVariableStatement).flatMap(statement => [...statement.declarationList.declarations])
-    .find(node => node.name.getText(tree) === locale)
-  if (!declaration || !ts.isObjectLiteralExpression(declaration.initializer)) throw new Error(`Inspect ${relative}`)
-  const property = declaration.initializer.properties.find(node => ts.isPropertyAssignment(node) && node.name.getText(tree) === 'cron')
+    .find(node => node.name.getText(tree) === (locale === 'en' ? locale : `${locale}Overrides`))
+  if (!declaration) throw new Error(`Inspect ${relative}`)
+  let object = declaration.initializer
+  while (ts.isSatisfiesExpression(object) || ts.isAsExpression(object) || ts.isParenthesizedExpression(object)) object = object.expression
+  if (!ts.isObjectLiteralExpression(object)) throw new Error(`Inspect ${relative}`)
+  const property = object.properties.find(node => ts.isPropertyAssignment(node) && node.name.getText(tree) === 'cron')
   if (!property || !ts.isObjectLiteralExpression(property.initializer)) throw new Error(`Inspect cron locale ${locale}`)
   const name = `${locale}Cron`
   const sibling = `${i18n}/${locale}_cron.ts`
-  if (fs.existsSync(path.join(root, sibling))) throw new Error(`Preserve ${sibling}`)
-  write(sibling, `import type { CronTranslations } from './types_cron'\n\nexport const ${name}: CronTranslations = ${property.initializer.getText(tree)}\n`)
+  const importType = locale === 'en' ? "import type { CronTranslations } from './types_cron'" : "import type { TranslationOverrides } from './define-locale'"
+  const declarationType = locale === 'en' ? ': CronTranslations' : ''
+  const satisfies = locale === 'en' ? '' : " satisfies NonNullable<TranslationOverrides['cron']>"
+  write(sibling, `${importType}\n\nexport const ${name}${declarationType} = ${property.initializer.getText(tree)}${satisfies}\n`)
   write(relative, `import { ${name} } from './${locale}_cron'\n` + replaceRange(source, property, `cron: ${name}`, tree))
 }
 
@@ -53,7 +63,6 @@ for (const locale of ['en', 'ja', 'zh']) {
   collect(property.type)
   if ([...references].some(name => !['Record', 'CronReasoningEffortOption'].includes(name))) throw new Error(`Inspect cron type dependencies: ${[...references]}`)
   const sibling = `${i18n}/types_cron.ts`
-  if (fs.existsSync(path.join(root, sibling))) throw new Error(`Preserve ${sibling}`)
   write(sibling, `import type { CronReasoningEffortOption } from '@/types/hermes'\n\nexport type CronTranslations = ${property.type.getText(tree)}\n`)
   const updated = replaceRange(source, property, 'cron: CronTranslations', tree)
     .replace("import type { CronReasoningEffortOption } from '@/types/hermes'\n", '')
@@ -62,12 +71,22 @@ for (const locale of ['en', 'ja', 'zh']) {
 
 {
   const relative = 'apps/desktop/src/app/cron/index.tsx'
-  const source = fs.readFileSync(path.join(root, relative), 'utf8')
+  const { source } = parsed(relative)
   const expression = '{c.reasoningLabels[value] ?? value}'
   if (source.split(expression).length !== 2) throw new Error('Inspect the typed reasoning label expression')
   write(relative, source.replace(expression, '{c.reasoningLabels[value]}'))
 }
 
+for (const [relative, source] of planned) {
+  const destination = path.join(root, relative)
+  if (!fs.existsSync(destination)) {
+    if (original.has(relative)) throw new Error(`Preserve the missing tracked file ${relative}`)
+    continue
+  }
+  const current = fs.readFileSync(destination, 'utf8')
+  if (current !== source && current !== original.get(relative)) throw new Error(`Preserve changed source ${relative}`)
+}
+for (const [relative, source] of planned) fs.writeFileSync(path.join(root, relative), source)
 const result = { files: written, completed: true }
 fs.writeFileSync(path.join(root, 'artifacts/hermes-repair-20261019/desktop-source-owner-paths.json'), JSON.stringify(result))
 process.stdout.write(JSON.stringify({ files: written, sha256: written.map(name => ({ path: name, sha256: crypto.createHash('sha256').update(fs.readFileSync(path.join(root, name))).digest('hex') })) }) + '\n')

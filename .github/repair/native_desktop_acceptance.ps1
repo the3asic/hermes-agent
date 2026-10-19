@@ -56,7 +56,8 @@ if ($installExit -eq 0) {
         }
     }
     $typecheckExit = Invoke-NpmStage 'typecheck' @('run','typecheck','--workspace','apps/desktop')
-    $lintPaths = @('src/app/cron/cron-job-model.ts','src/app/cron/cron-job-model.test.ts','src/app/cron/index.tsx','src/types/hermes.ts','src/i18n/en.ts','src/i18n/ja.ts','src/i18n/types.ts','src/i18n/zh-hant_command_center.ts','src/i18n/zh.ts')
+    $lintPaths = @(git diff --name-only $BaseCommit $Commit -- 'apps/desktop/src' | Where-Object { $_ -match '\.(ts|tsx)$' } | ForEach-Object { $_.Substring('apps/desktop/'.Length) })
+    if ($LASTEXITCODE -or -not $lintPaths.Count) { throw 'Inspect the changed desktop source paths' }
     $lintExit = Invoke-NpmStage 'lint' (@('exec','--workspace','apps/desktop','--','eslint') + $lintPaths)
 }
 $checksStdout = ''
