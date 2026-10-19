@@ -23,6 +23,9 @@ Set-Location $work
 if ((git rev-parse HEAD).Trim() -ne $Commit -or (git rev-parse 'HEAD^{tree}').Trim() -ne $ExpectedTree) { throw 'Preserve changed source' }
 if (git status --porcelain --untracked-files=no) { throw 'Preserve native source edits' }
 [IO.Directory]::CreateDirectory($out) | Out-Null
+$env:HERMES_HOME = Join-Path $out 'pm-home'
+$env:HERMES_RUNTIME_DIR = Join-Path $root 'core-upstream130122\artifacts\hermes-repair-20261019\pm-runtime'
+[IO.Directory]::CreateDirectory($env:HERMES_HOME) | Out-Null
 $node = (Get-Command node -ErrorAction Stop).Source
 $npm = Join-Path (Split-Path (Get-Command npm.cmd -ErrorAction Stop).Source -Parent) 'node_modules\npm\bin\npm-cli.js'
 if (-not (Test-Path $npm)) { throw 'Inspect the installed Node/npm pair' }
@@ -33,7 +36,7 @@ if (-not (($version.Major -eq 22 -and $version -ge [Version]'22.22.0') -or ($ver
 function Invoke-NpmStage([string]$Name, [string[]]$StageArguments) {
     $argv = @('"' + $npm + '"') + $StageArguments
     $process = Start-Process -FilePath $node -ArgumentList $argv -NoNewWindow -Wait -PassThru -RedirectStandardOutput (Join-Path $out ($Name + '.stdout')) -RedirectStandardError (Join-Path $out ($Name + '.stderr'))
-    Write-Output ('DESKTOP_STAGE ' + $Name + ' exit=' + $process.ExitCode)
+    [Console]::WriteLine('DESKTOP_STAGE ' + $Name + ' exit=' + $process.ExitCode)
     return [int]$process.ExitCode
 }
 $installExit = Invoke-NpmStage 'install' @('ci','--no-audit','--no-fund')
@@ -75,7 +78,7 @@ $result = [ordered]@{
     harness_file_sha256=(Get-FileHash $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant();
     completed_at=[DateTime]::UtcNow.ToString('o');
     junit_base64=if (Test-Path $junitPath) {[Convert]::ToBase64String([IO.File]::ReadAllBytes($junitPath))} else {$null};
-    stage_logs=@(foreach ($name in @('install','test','typecheck','lint')) { $p=Join-Path $out ($name + '.stderr'); if (Test-Path $p) { @{name=$name; stderr_tail=([IO.File]::ReadAllText($p) | Select-Object -Last 1)} } })
+    stage_logs=@(foreach ($name in @('install','test','typecheck','lint')) { $p=Join-Path $out ($name + '.stderr'); if (Test-Path $p) { @{name=$name; stderr_tail=(([IO.File]::ReadAllText($p)).Split("`n") | Select-Object -Last 20)} } })
 }
 $json = $result | ConvertTo-Json -Depth 6 -Compress
 [IO.File]::WriteAllText($receipt, $json, [Text.UTF8Encoding]::new($false))
