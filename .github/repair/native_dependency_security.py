@@ -85,7 +85,7 @@ def main():
                                 '--bash', bash, '--uv', args.uv, '--output', acceptance_out,
                                 '--expected-commit', plan['commit']])
     acceptance = json.loads((acceptance_out / 'acceptance.json').read_bytes())
-    assert acceptance['accepted'] and acceptance['actual_tests_passed'] == 5 and len(acceptance['checks']) == 9
+    assert acceptance['accepted'] and acceptance['actual_tests_passed'] == 6 and len(acceptance['checks']) == 9
     assert acceptance['commit'] == plan['commit'] and acceptance['tree'] == plan['tree']
     packages = execute('installed-packages', [fixed_python, '-m', 'pip', 'list', '--exclude-editable', '--format=freeze', '--disable-pip-version-check'])
     requirements = out / 'installed-requirements.txt'
@@ -98,7 +98,7 @@ def main():
     audit = json.loads(audit_path.read_bytes())
     assert audit['dependencies'] and all(not item['vulns'] and not item.get('skip_reason') for item in audit['dependencies'])
     xml = {name: (acceptance_out / (name + '.xml')).read_text(encoding='utf-8')
-           for name in ('test_mcp_http_transport.py', 'test_jwt_options.py', 'test_network_clients.py', 'test_auth_crypto.py')}
+           for name in ('test_mcp_http_transport.py', 'test_jwt_options.py', 'test_network_clients.py', 'test_auth_crypto.py', 'test_cache_diagnostic.py')}
     record = {'accepted': True, 'hostname': os.environ['COMPUTERNAME'], 'completed_at': datetime.now(timezone.utc).isoformat(),
               'helper_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               'plan_sha256': hashlib.sha256(args.plan.read_bytes()).hexdigest(), 'source': plan,
