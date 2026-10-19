@@ -8,57 +8,15 @@ jobs:
     timeout-minutes: 35
     strategy:
       fail-fast: false
-      max-parallel: 8
+      max-parallel: 1
       matrix:
         include:
-        - label: pr130111
-          phase: baseline
-          commit: 71da7dcd49f07e2d62b248b2e904963fef15a319
-          tree: 886d6faff71f56f5e4e932e473b9e18e3d0522eb
-          test_path: tests/plugins/live_discord/test_history_config.py
+        - label: pr50030
+          phase: fixed
+          commit: a20cbda03135fd31e958be0be87b905cf4d41ac2
+          tree: 4e277a34d027875cfa23d9124f6c3181d2100ee4
+          test_path: tests/tools/live_recall/test_native_scope_queries.py
           extras: '["messaging"]'
-        - label: pr130111
-          phase: fixed
-          commit: 7a254009d8803cd8cdc779165c84d2ae8d4fff05
-          tree: 6010af89ee89dad177a0fc300d1a0c3836deea93
-          test_path: tests/plugins/live_discord/test_history_config.py
-          extras: '["messaging"]'
-        - label: pr130114
-          phase: baseline
-          commit: 465fe4716893a8904877d37bcc0156062cc62b35
-          tree: 21b9e50e881790ef4ee41c22c8378155c2709f44
-          test_path: tests/plugins/live_discord/test_attachment_config.py
-          extras: '["messaging"]'
-        - label: pr130114
-          phase: fixed
-          commit: 1a7b1d66df6a273555d5e1b2aaf970b6575ea0c5
-          tree: 5f6054e717fe761e2bbdcacec92378a0f9eaa9fb
-          test_path: tests/plugins/live_discord/test_attachment_config.py
-          extras: '["messaging"]'
-        - label: pr130151
-          phase: fixed
-          commit: c2175b7fd35ac2e1411e9cd631cc01677ea83513
-          tree: 122242595c91a9b29c4a8674217f9caa4b499e8b
-          test_path: tests/tools/live_web/test_explicit_selection.py
-          extras: '[]'
-        - label: pr130158
-          phase: fixed
-          commit: c85e5f08bf5fa55fb04a1aff7bdbe1c84a06d52f
-          tree: dae2429d039862c04a2bcd35aa8ea4c3f7c14e98
-          test_path: tests/agent/live_restore/test_restore_state.py
-          extras: '[]'
-        - label: pr130122
-          phase: baseline
-          commit: 85a5cbb01a576b32d8d96559fc5a115b285277aa
-          tree: 6b623fdfb46347b8164856763640532726c1ba41
-          test_path: tests/tools/live_checkpoints/test_checkpoint_recovery.py
-          extras: '[]'
-        - label: pr130122
-          phase: fixed
-          commit: 2388bb5e8312ebaf14f618b586cdd4815c03c403
-          tree: 325e754f6d863e87591055f03c9d32b109be6126
-          test_path: tests/tools/live_checkpoints/test_checkpoint_recovery.py
-          extras: '[]'
     steps:
     - name: Checkout the exact candidate
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -79,7 +37,7 @@ jobs:
         if ((git rev-parse ''HEAD^{tree}'').Trim() -ne $env:EXPECTED_TREE) { throw
         ''Candidate tree mismatch'' }
 
-        git fetch --no-tags --depth=1 origin 5fc490e2b34123212d73ef316086f939567a725a
+        git fetch --no-tags --depth=1 origin ddabd3837862022a6053331fe3ba97cf9716b9e3
 
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
@@ -136,14 +94,16 @@ jobs:
         \ $env:TEST_PATH -Algorithm SHA256).Hash.ToLowerInvariant(); real_host=$env:RUNNER_OS;\
         \ python=$env:HERMES_PYTHON }\n$record | ConvertTo-Json -Depth 5 | Set-Content\
         \ -Encoding utf8 artifacts/hermes-repair-20261019/ci-acceptance/behavior.json\n\
-        exit $testExit\n"
+        if ($testExit -eq 0 -and ($counts.tests -ne 6 -or $counts.failures -ne 0 -or\
+        \ $counts.errors -ne 0 -or $counts.skipped -ne 0)) { throw 'Expected six passing\
+        \ real tests without skips' }\nexit $testExit\n"
     - name: Run the complete repository lint checks
       if: ${{ !cancelled() && matrix.phase == 'fixed' && steps.pm.outcome == 'success'
         }}
       shell: pwsh
       env:
         EXPECTED_COMMIT: ${{ matrix.commit }}
-      run: '& $env:HERMES_PYTHON scripts/check --base 5fc490e2b34123212d73ef316086f939567a725a
+      run: '& $env:HERMES_PYTHON scripts/check --base ddabd3837862022a6053331fe3ba97cf9716b9e3
         --commit $env:EXPECTED_COMMIT
 
         exit $LASTEXITCODE
@@ -166,7 +126,7 @@ jobs:
     - main
     paths:
     - .github/workflows/repair-native-acceptance.yml
-run-name: 'Hermes repairs: native Windows acceptance 20261019'
+run-name: Verify restored fork Actions with six real SQLite recall tests
 defaults:
   run:
     shell: pwsh
