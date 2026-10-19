@@ -14,6 +14,7 @@ parser.add_argument('--workdir', type=Path, required=True)
 parser.add_argument('--test-source', type=Path, required=True)
 parser.add_argument('--uv', type=Path, required=True)
 parser.add_argument('--python', type=Path, required=True)
+parser.add_argument('--resume-lock-sha')
 parser.add_argument('--write', action='store_true')
 args = parser.parse_args()
 base = 'ed063b312be2f1f50c470c70c8b96900ea4f3fc3'
@@ -24,13 +25,15 @@ def git(*values):
     return subprocess.run(['git', '-C', str(work), *values], check=True, capture_output=True, text=True).stdout.strip()
 
 
-assert git('rev-parse', 'HEAD') == base and not git('status', '--porcelain', '--untracked-files=no')
+assert git('rev-parse', 'HEAD') == base
 pyproject = work / 'pyproject.toml'
 lock = work / 'uv.lock'
-assert hashlib.sha256(pyproject.read_bytes()).hexdigest() == '6f969b9fdff95e7269ec808361e3ae8be5357036e6257e53a3306878cf8c41dd'
-assert hashlib.sha256(lock.read_bytes()).hexdigest() == '5b3798f326209475abca8ef7cbf7c9406f12e687c28c0b540dfe597466f48590'
-before_lock = tomllib.loads(lock.read_text(encoding='utf-8'))
-text = pyproject.read_text(encoding='utf-8')
+original_manifest = subprocess.run(['git', '-C', str(work), 'show', base + ':pyproject.toml'], check=True, capture_output=True).stdout
+original_lock = subprocess.run(['git', '-C', str(work), 'show', base + ':uv.lock'], check=True, capture_output=True).stdout
+assert hashlib.sha256(original_manifest).hexdigest() == '6f969b9fdff95e7269ec808361e3ae8be5357036e6257e53a3306878cf8c41dd'
+assert hashlib.sha256(original_lock).hexdigest() == '5b3798f326209475abca8ef7cbf7c9406f12e687c28c0b540dfe597466f48590'
+before_lock = tomllib.loads(original_lock.decode())
+text = original_manifest.decode()
 changes = [('"PyJWT[crypto]==2.13.0"', '"PyJWT[crypto]==2.15.0"', 1),
            ('"urllib3>=2.7.0,<3"', '"urllib3>=2.8.0,<3"', 1),
            ('"mcp==2.0.0"', '"mcp==2.2.0"', 3),
@@ -59,6 +62,13 @@ assert parsed['tool']['uv']['constraint-dependencies'] == constraints
 targets = {'aiohttp': '3.14.4', 'httpcore2': '2.12.0', 'httpx2': '2.12.0', 'mcp': '2.2.0',
            'multidict': '6.9.1', 'oauthlib': '4.0.0', 'pip': '26.2', 'pyjwt': '2.15.0',
            'pynacl': '1.6.2', 'setuptools': '83.0.0', 'tornado': '6.5.9', 'urllib3': '2.8.0'}
+if args.resume_lock_sha is None:
+    assert not git('status', '--porcelain', '--untracked-files=no')
+    assert pyproject.read_bytes() == original_manifest and lock.read_bytes() == original_lock
+else:
+    assert pyproject.read_text(encoding='utf-8') == text, 'Preserve changed native manifest edits'
+    assert hashlib.sha256(lock.read_bytes()).hexdigest() == args.resume_lock_sha, 'Preserve changed native lock edits'
+    assert set(git('diff', '--name-only', base).splitlines()) <= {'pyproject.toml', 'uv.lock'}
 if not args.write:
     print(json.dumps({'would_prepare': str(work), 'base': base, 'targets': targets}))
     raise SystemExit(0)
@@ -66,15 +76,17 @@ out = work / 'artifacts/hermes-dependency-security-20261020'
 out.mkdir(parents=True, exist_ok=True)
 pyproject.write_text(text, encoding='utf-8', newline='\n')
 test_path = work / 'tests/tools/live_dependencies/test_mcp_http_transport.py'
-assert not test_path.exists()
 test_path.parent.mkdir(parents=True, exist_ok=True)
-test_path.write_bytes(args.test_source.read_bytes())
+if test_path.exists():
+    assert test_path.read_bytes() == args.test_source.read_bytes(), 'Preserve changed native test source'
+else:
+    test_path.write_bytes(args.test_source.read_bytes())
 uv_version = subprocess.run([str(args.uv), '--version'], check=True, capture_output=True, text=True).stdout.strip()
 assert uv_version.startswith('uv 0.9.28 '), uv_version
 present = {row['name'] for row in before_lock['package']}
 command = [str(args.uv), 'lock', '--python', str(args.python)]
 for name in sorted(targets.keys() & present):
-    command += ['--upgrade-package', name]
+    command += ['--upgrade-package', name + '==' + targets[name]]
 with (out / 'lock.stdout').open('wb') as stdout, (out / 'lock.stderr').open('wb') as stderr:
     subprocess.run(command, cwd=work, stdout=stdout, stderr=stderr, check=True, timeout=900)
 with (out / 'lock-check.stdout').open('wb') as stdout, (out / 'lock-check.stderr').open('wb') as stderr:
