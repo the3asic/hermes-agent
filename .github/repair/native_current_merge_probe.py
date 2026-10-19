@@ -18,7 +18,7 @@ base = plan['base']
 assert len(base) == 40 and all(c in '0123456789abcdef' for c in base)
 root = Path.home() / 'Dev/hermes-health-repair-20261019'
 repo = root / 'core-review-base'
-out = root / 'artifacts' / ('core-current-base-' + base[:8])
+out = root / 'artifacts' / ('core-current-base-' + base[:8] + '-r3')
 if not args.write:
     print(json.dumps({'would_inspect_base': base, 'pull_requests': len(plan['prs'])}))
     raise SystemExit(0)
@@ -38,9 +38,16 @@ def git(*arguments, check=True):
 index = Path(os.fsdecode(git('rev-parse', '--git-path', 'index').stdout.strip()))
 if not index.is_absolute():
     index = repo / index
+
+
+def index_identity():
+    exists = index.exists()
+    return {'exists': exists, 'sha256': hashlib.sha256(index.read_bytes()).hexdigest() if exists else None}
+
+
 before = {'head': git('rev-parse', 'HEAD').stdout.decode().strip(),
           'status': git('status', '--porcelain', '--untracked-files=no').stdout.hex(),
-          'index': hashlib.sha256(index.read_bytes()).hexdigest()}
+          'index': index_identity()}
 refspecs = ['refs/pull/' + str(row['number']) + '/head:refs/hermes-current-base/' + base[:8] + '/pr-' + str(row['number']) for row in plan['prs']]
 git('fetch', '--no-tags', 'https://github.com/NousResearch/hermes-agent.git', base, *refspecs)
 assert git('rev-parse', base + '^{commit}').stdout.decode().strip() == base
@@ -97,7 +104,7 @@ for pr in plan['prs']:
     rows.append(row)
 after = {'head': git('rev-parse', 'HEAD').stdout.decode().strip(),
          'status': git('status', '--porcelain', '--untracked-files=no').stdout.hex(),
-         'index': hashlib.sha256(index.read_bytes()).hexdigest()}
+         'index': index_identity()}
 assert before == after
 dependencies = {}
 for name in ('pyproject.toml', 'uv.lock', 'pm/lock.json'):
