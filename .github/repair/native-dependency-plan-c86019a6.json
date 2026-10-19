@@ -1,0 +1,22 @@
+{
+  "base": "ed063b312be2f1f50c470c70c8b96900ea4f3fc3",
+  "commit": "c86019a6cc6032e328c61fe2c466c65f6ac31bc7",
+  "tree": "16ba7a1840c24552bd6ab120c3fbb1ff03d9c3f6",
+  "source_sha256": {
+    "pyproject.toml": "509d026eb346a1d2b8f219cc19dd2720f2f7feb1abeec937a85dbb8e53dbcf7d",
+    "uv.lock": "50550596ee88631907fe7a76da5183fa668149b8ba2d3d90ed8404e09de104da",
+    ".github/workflows/dependency-security.yml": "7022f08d8f54e7573ff5d200ebf7265e8d7579097f70c77817ad710553017567",
+    "scripts/ci/run_dependency_security_acceptance.py": "af36be09c41cfbb8379e19cadae44076ae716456be2bddc16c831c800b4bf4d0",
+    "tests/tools/live_dependencies/test_mcp_http_transport.py": "2dd256364602c347b8231abd796798e9a8027bb3c8ab96211a950ee93cd6f2cc",
+    "tests/tools/live_dependencies/test_jwt_options.py": "c20c033ef586deae80252a7e2ec69b34fb31a2c7b0ded2de6764322949ba4258",
+    "tests/tools/live_dependencies/test_network_clients.py": "393a213edf6fa30e60e216444db037d0c64e9fcb9bdb953f9a0cd48b976aabfc",
+    "tests/tools/live_dependencies/test_auth_crypto.py": "8a2852ee38cc5dea22af80e276cb7247939a0869f4c78a5cb5c7291a14099017",
+    "tools/lazy_deps.py": "ba6a9c94bc9a16bff4e0ea7237544bcb732d1ae6da27ae8031c20f9cca5be906",
+    "agent/cache_diagnostic.py": "21c4496dea7e805969219e4f93d1d7d556bb7cf1ca158e5b63c8ab40f65a6704",
+    "tests/tools/live_dependencies/test_cache_diagnostic.py": "0c7bf712db591e969ca223262170ca088bb829b7f2408e04af175e6a7e4d6dc7",
+    "tools/website_policy.py": "7316127e09d1958dd7c543a22328547176d9cfa38098762bf30354f8131decdf",
+    "compat_manifest.json": "96692612c86ad34b973b5bc559e2cd52e90ce1ff35c36933d7965b22942fc582",
+    "COMPAT_MANIFEST.md": "7b55341edc83007a2b33c31d8e4ef3d9a2053c1098e15b2b8afc61a4278bb708",
+    "tests/tools/test_browser_agent_version.py": "33babdc508800fe538ceb1e38c51c9c874e04e74526b89f7d5939faf861e3475"
+  }
+}
