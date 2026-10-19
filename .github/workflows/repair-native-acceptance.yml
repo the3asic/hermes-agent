@@ -71,14 +71,25 @@ jobs:
       env:
         EXPECTED_COMMIT: ${{ matrix.commit }}
         EXPECTED_TREE: ${{ matrix.tree }}
-      run: |
-        $ErrorActionPreference = 'Stop'
-        if ((git rev-parse HEAD).Trim() -ne $env:EXPECTED_COMMIT) { throw 'Candidate commit mismatch' }
-        if ((git rev-parse 'HEAD^{tree}').Trim() -ne $env:EXPECTED_TREE) { throw 'Candidate tree mismatch' }
+      run: '$ErrorActionPreference = ''Stop''
+
+        if ((git rev-parse HEAD).Trim() -ne $env:EXPECTED_COMMIT) { throw ''Candidate
+        commit mismatch'' }
+
+        if ((git rev-parse ''HEAD^{tree}'').Trim() -ne $env:EXPECTED_TREE) { throw
+        ''Candidate tree mismatch'' }
+
         git fetch --no-tags --depth=1 origin 5fc490e2b34123212d73ef316086f939567a725a
+
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
-        New-Item -ItemType Directory -Force artifacts/hermes-repair-20261019/ci-acceptance | Out-Null
-        @{ commit=$env:EXPECTED_COMMIT; tree=$env:EXPECTED_TREE; os=[System.Environment]::OSVersion.VersionString } | ConvertTo-Json | Set-Content -Encoding utf8 artifacts/hermes-repair-20261019/ci-acceptance/source.json
+
+        New-Item -ItemType Directory -Force artifacts/hermes-repair-20261019/ci-acceptance
+        | Out-Null
+
+        @{ commit=$env:EXPECTED_COMMIT; tree=$env:EXPECTED_TREE; os=[System.Environment]::OSVersion.VersionString
+        } | ConvertTo-Json | Set-Content -Encoding utf8 artifacts/hermes-repair-20261019/ci-acceptance/source.json
+
+        '
     - name: Build the locked native test environment
       id: pm
       uses: ./.github/actions/setup-pm
@@ -89,13 +100,19 @@ jobs:
     - name: Prepare the actual checkpoint tool store
       if: contains(matrix.test_path, 'live_checkpoints')
       shell: pwsh
-      run: |
-        $ErrorActionPreference = 'Stop'
-        $env:HERMES_RUNTIME_DIR = Join-Path $env:RUNNER_TEMP 'repair-acceptance/pm-runtime'
-        $env:HERMES_HOME = Join-Path $env:RUNNER_TEMP 'repair-acceptance/pm-home'
+      run: '$ErrorActionPreference = ''Stop''
+
+        $env:HERMES_RUNTIME_DIR = Join-Path $env:RUNNER_TEMP ''repair-acceptance/pm-runtime''
+
+        $env:HERMES_HOME = Join-Path $env:RUNNER_TEMP ''repair-acceptance/pm-home''
+
         New-Item -ItemType Directory -Force $env:HERMES_HOME | Out-Null
-        & $env:HERMES_PYTHON -c "import pm; pm.ensure('git', explicit=True)"
+
+        & $env:HERMES_PYTHON -c "import pm; pm.ensure(''git'', explicit=True)"
+
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+        '
     - name: Run real native behavior checks
       id: behavior
       shell: pwsh
@@ -105,30 +122,33 @@ jobs:
         CASE_PHASE: ${{ matrix.phase }}
         EXPECTED_COMMIT: ${{ matrix.commit }}
         EXPECTED_TREE: ${{ matrix.tree }}
-      run: |
-        $ErrorActionPreference = 'Stop'
-        $bash = Join-Path $env:ProgramFiles 'Git/bin/bash.exe'
-        $receipt = 'artifacts/hermes-repair-20261019/ci-acceptance/junit.xml'
-        $cases = (Join-Path $env:RUNNER_TEMP 'repair-acceptance/cases').Replace('\', '/')
-        & $bash scripts/run_tests.sh $env:TEST_PATH --file-timeout 300 -- --noconftest --basetemp=$cases --junitxml=$receipt -q
-        $testExit = $LASTEXITCODE
-        [xml]$junit = [IO.File]::ReadAllText((Join-Path (Get-Location) $receipt))
-        $counts = [ordered]@{ tests=0; failures=0; errors=0; skipped=0 }
-        foreach ($suite in $junit.SelectNodes('//testsuite')) {
-          foreach ($name in @('tests','failures','errors','skipped')) { $counts[$name] += [int]$suite.GetAttribute($name) }
-        }
-        $record = [ordered]@{ label=$env:CASE_LABEL; phase=$env:CASE_PHASE; commit=$env:EXPECTED_COMMIT; tree=$env:EXPECTED_TREE; actual_test_exit=$testExit; junit=$counts; test_file_sha256=(Get-FileHash $env:TEST_PATH -Algorithm SHA256).Hash.ToLowerInvariant(); real_host=$env:RUNNER_OS; python=$env:HERMES_PYTHON }
-        $record | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 artifacts/hermes-repair-20261019/ci-acceptance/behavior.json
-        exit $testExit
+      run: "$ErrorActionPreference = 'Stop'\n$bash = Join-Path $env:ProgramFiles 'Git/bin/bash.exe'\n\
+        $receipt = 'artifacts/hermes-repair-20261019/ci-acceptance/junit.xml'\n$cases\
+        \ = (Join-Path $env:RUNNER_TEMP 'repair-acceptance/cases').Replace('\\', '/')\n\
+        & $bash scripts/run_tests.sh $env:TEST_PATH --file-timeout 300 -- --noconftest\
+        \ --basetemp=$cases --junitxml=$receipt -q\n$testExit = $LASTEXITCODE\n[xml]$junit\
+        \ = [IO.File]::ReadAllText((Join-Path (Get-Location) $receipt))\n$counts =\
+        \ [ordered]@{ tests=0; failures=0; errors=0; skipped=0 }\nforeach ($suite\
+        \ in $junit.SelectNodes('//testsuite')) {\n  foreach ($name in @('tests','failures','errors','skipped'))\
+        \ { $counts[$name] += [int]$suite.GetAttribute($name) }\n}\n$record = [ordered]@{\
+        \ label=$env:CASE_LABEL; phase=$env:CASE_PHASE; commit=$env:EXPECTED_COMMIT;\
+        \ tree=$env:EXPECTED_TREE; actual_test_exit=$testExit; junit=$counts; test_file_sha256=(Get-FileHash\
+        \ $env:TEST_PATH -Algorithm SHA256).Hash.ToLowerInvariant(); real_host=$env:RUNNER_OS;\
+        \ python=$env:HERMES_PYTHON }\n$record | ConvertTo-Json -Depth 5 | Set-Content\
+        \ -Encoding utf8 artifacts/hermes-repair-20261019/ci-acceptance/behavior.json\n\
+        exit $testExit\n"
     - name: Run the complete repository lint checks
       if: ${{ !cancelled() && matrix.phase == 'fixed' && steps.pm.outcome == 'success'
         }}
       shell: pwsh
       env:
         EXPECTED_COMMIT: ${{ matrix.commit }}
-      run: |
-        & $env:HERMES_PYTHON scripts/check --base 5fc490e2b34123212d73ef316086f939567a725a --commit $env:EXPECTED_COMMIT
+      run: '& $env:HERMES_PYTHON scripts/check --base 5fc490e2b34123212d73ef316086f939567a725a
+        --commit $env:EXPECTED_COMMIT
+
         exit $LASTEXITCODE
+
+        '
     - name: Save actual acceptance receipts
       if: ${{ !cancelled() }}
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -150,3 +170,6 @@ run-name: 'Hermes repairs: native Windows acceptance 20261019'
 defaults:
   run:
     shell: pwsh
+concurrency:
+  group: repair-native-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
