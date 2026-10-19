@@ -433,7 +433,7 @@ hermes-agent = "agent.legacy_cli:main"
 hermes-acp = "acp_adapter.entry:main"
 
 [tool.uv]
-constraint-dependencies = ["multidict>=6.9.1,<7", "oauthlib>=4.0.0,<5", "pip>=26.2,<27", "setuptools>=83.0.0,<84", "tornado>=6.5.9,<7"]
+constraint-dependencies = ["anyio>=4.14.2,<5", "multidict>=6.9.1,<7", "oauthlib>=4.0.0,<5", "pip>=26.2,<27", "setuptools>=83.0.0,<84", "tornado>=6.5.9,<7"]
 override-dependencies = [
   # discord.py 2.7.1 excludes patched PyNaCl; retain the reviewed security floor.
   "pynacl>=1.6.2,<1.7",

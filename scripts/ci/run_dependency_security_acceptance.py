@@ -28,7 +28,7 @@ def main():
     tree = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=root, check=True, capture_output=True, text=True, encoding="utf-8").stdout.strip()
     assert head == args.expected_commit
     assert os.path.samefile(os.environ["HERMES_PYTHON"], sys.executable)
-    targets = {"aiohttp": "3.14.4", "httpcore2": "2.12.0", "httpx2": "2.12.0", "mcp": "2.2.0",
+    targets = {"aiohttp": "3.14.4", "anyio": "4.14.2", "httpcore2": "2.12.0", "httpx2": "2.12.0", "mcp": "2.2.0",
                "multidict": "6.9.1", "oauthlib": "4.0.0", "pip": "26.2", "pyjwt": "2.15.0",
                "pynacl": "1.6.2", "setuptools": "83.0.0", "tornado": "6.5.9", "urllib3": "2.8.0"}
     actual = {name: metadata.version(name) for name in targets}
