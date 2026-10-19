@@ -83,6 +83,7 @@ jobs:
       run: "$ErrorActionPreference = 'Stop'\n$bash = Join-Path $env:ProgramFiles 'Git/bin/bash.exe'\n\
         $receipt = 'artifacts/hermes-repair-20261019/ci-acceptance/junit.xml'\n$cases\
         \ = (Join-Path $env:RUNNER_TEMP 'repair-acceptance/cases').Replace('\\', '/')\n\
+        [IO.Directory]::CreateDirectory((Split-Path $cases -Parent)) | Out-Null\n\
         & $bash scripts/run_tests.sh $env:TEST_PATH --file-timeout 300 -- --noconftest\
         \ --basetemp=$cases --junitxml=$receipt -q\n$testExit = $LASTEXITCODE\n[xml]$junit\
         \ = [IO.File]::ReadAllText((Join-Path (Get-Location) $receipt))\n$counts =\
@@ -121,12 +122,9 @@ jobs:
   push:
     branches:
     - health-repair/native-validation-20261019
-  pull_request:
-    branches:
-    - main
     paths:
     - .github/workflows/repair-native-acceptance.yml
-run-name: Verify restored fork Actions with six real SQLite recall tests
+run-name: 'Native Windows: six SQLite recall regressions'
 defaults:
   run:
     shell: pwsh
