@@ -186,7 +186,7 @@ def prune_checkpoints(
     from tools.checkpoint_pruning import PruneError, store_lock
 
     try:
-        with store_lock(base):
+        with store_lock(base, repair_refs=True):
             return _prune_checkpoints(base, result, retention_days, delete_orphans, max_total_size_mb, orphan_allowlist)
     except (PruneError, OSError) as exc:
         result["errors"] += 1

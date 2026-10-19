@@ -473,20 +473,18 @@ def _repair_invalid_loose_refs(store: Path) -> None:
         handle = lock_path.open("xb")
         try:
             with handle:
-                original = path.read_bytes()
-                oid = original.decode("ascii", errors="replace").strip()
-                if oid.startswith("ref: "):
+                symbolic, _, _ = _run_git(
+                    ["symbolic-ref", "--quiet", ref], store, str(store.parent),
+                    allowed_returncodes={1, 128},
+                )
+                if symbolic:
                     continue
-                if re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", oid):
-                    valid, _, object_error = _run_git(
-                        ["cat-file", "-e", oid + "^{commit}"], store, str(store.parent),
-                        allowed_returncodes={128},
-                    )
-                    if valid:
-                        continue
-                    if not any(message in object_error.lower() for message in
-                               ("not a valid object name", "expected commit type")):
-                        raise PruneError(f"Cannot inspect checkpoint object {oid}: {object_error}")
+                valid, _, _ = _run_git(
+                    ["rev-parse", "--verify", ref + "^{commit}"], store, str(store.parent),
+                    allowed_returncodes={128},
+                )
+                if valid:
+                    continue
                 preserved_root = store.parent / "corrupt-refs"
                 preserved_root.mkdir(mode=0o700, exist_ok=True)
                 preserved = preserved_root / f"{time.time_ns()}-{os.getpid()}" / ref
@@ -497,10 +495,6 @@ def _repair_invalid_loose_refs(store: Path) -> None:
                         raise PruneError(f"No intact packed checkpoint history for {ref}")
                 except Exception:
                     os.replace(preserved, path)
-                    for directory in preserved.parents:
-                        if directory == preserved_root:
-                            break
-                        directory.rmdir()
                     raise
                 logger.warning("Preserved damaged checkpoint ref %s in %s; reusing packed history", ref, preserved)
         finally:
@@ -1006,7 +1000,7 @@ class CheckpointManager:
         try:
             from tools.checkpoint_pruning import store_lock
 
-            with store_lock(_resolve_checkpoint_base()):
+            with store_lock(_resolve_checkpoint_base(), repair_refs=True):
                 return self._take(abs_dir, reason)
         except Exception as e:
             logger.debug("Checkpoint failed (non-fatal): %s", e)
@@ -1094,7 +1088,7 @@ class CheckpointManager:
         from tools.checkpoint_pruning import PruneError, store_lock
 
         try:
-            with store_lock(_resolve_checkpoint_base()):
+            with store_lock(_resolve_checkpoint_base(), repair_refs=True):
                 return self._diff(working_dir, commit_hash)
         except (PruneError, OSError) as exc:
             return {"success": False, "error": str(exc)}
@@ -1200,7 +1194,7 @@ class CheckpointManager:
         from tools.checkpoint_pruning import PruneError, store_lock
 
         try:
-            with store_lock(_resolve_checkpoint_base()):
+            with store_lock(_resolve_checkpoint_base(), repair_refs=True):
                 return self._restore(working_dir, commit_hash, file_path, safe)
         except (PruneError, OSError) as exc:
             return {"success": False, "error": str(exc)}
