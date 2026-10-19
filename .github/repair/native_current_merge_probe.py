@@ -28,15 +28,19 @@ assert not result_path.exists(), 'Read the existing native inspection first'
 
 
 def git(*arguments, check=True):
-    result = subprocess.run(['git', '-C', str(repo), *arguments], capture_output=True, timeout=900)
+    environment = dict(os.environ, GIT_OPTIONAL_LOCKS='0', GIT_TERMINAL_PROMPT='0', GCM_INTERACTIVE='never')
+    result = subprocess.run(['git', '-C', str(repo), *arguments], env=environment, capture_output=True, timeout=900)
     if check and result.returncode:
         raise RuntimeError('Git failed: ' + result.stderr.decode('utf-8', errors='replace'))
     return result
 
 
+index = Path(os.fsdecode(git('rev-parse', '--git-path', 'index').stdout.strip()))
+if not index.is_absolute():
+    index = repo / index
 before = {'head': git('rev-parse', 'HEAD').stdout.decode().strip(),
           'status': git('status', '--porcelain', '--untracked-files=no').stdout.hex(),
-          'index': hashlib.sha256((repo / '.git/index').read_bytes()).hexdigest()}
+          'index': hashlib.sha256(index.read_bytes()).hexdigest()}
 refspecs = ['refs/pull/' + str(row['number']) + '/head:refs/hermes-current-base/' + base[:8] + '/pr-' + str(row['number']) for row in plan['prs']]
 git('fetch', '--no-tags', 'https://github.com/NousResearch/hermes-agent.git', base, *refspecs)
 assert git('rev-parse', base + '^{commit}').stdout.decode().strip() == base
@@ -93,7 +97,7 @@ for pr in plan['prs']:
     rows.append(row)
 after = {'head': git('rev-parse', 'HEAD').stdout.decode().strip(),
          'status': git('status', '--porcelain', '--untracked-files=no').stdout.hex(),
-         'index': hashlib.sha256((repo / '.git/index').read_bytes()).hexdigest()}
+         'index': hashlib.sha256(index.read_bytes()).hexdigest()}
 assert before == after
 dependencies = {}
 for name in ('pyproject.toml', 'uv.lock', 'pm/lock.json'):
