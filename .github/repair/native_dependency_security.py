@@ -85,7 +85,7 @@ def main():
                                 '--bash', bash, '--uv', args.uv, '--output', acceptance_out,
                                 '--expected-commit', plan['commit']])
     acceptance = json.loads((acceptance_out / 'acceptance.json').read_bytes())
-    assert acceptance['accepted'] and acceptance['actual_tests_passed'] == 6 and len(acceptance['checks']) == 9
+    assert acceptance['accepted'] and acceptance['actual_tests_passed'] == 7 and len(acceptance['checks']) == 9
     assert acceptance['commit'] == plan['commit'] and acceptance['tree'] == plan['tree']
     packages = execute('installed-packages', [fixed_python, '-m', 'pip', 'list', '--exclude-editable', '--format=freeze', '--disable-pip-version-check'])
     requirements = out / 'installed-requirements.txt'
