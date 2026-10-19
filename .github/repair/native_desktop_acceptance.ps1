@@ -1,16 +1,20 @@
 param(
     [Parameter(Mandatory=$true)][string]$Commit,
     [Parameter(Mandatory=$true)][string]$ExpectedTree,
-    [string]$BaseCommit = 'ddabd3837862022a6053331fe3ba97cf9716b9e3'
+    [string]$BaseCommit = 'ddabd3837862022a6053331fe3ba97cf9716b9e3',
+    [string]$RunId = 'acceptance',
+    [string]$NpmCli = ''
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 if ([Environment]::OSVersion.Platform -ne 'Win32NT') { throw 'Use the native Windows work machine' }
 if ($Commit -notmatch '^[a-f0-9]{40}$' -or $ExpectedTree -notmatch '^[a-f0-9]{40}$') { throw 'Invalid source identity' }
+if ($RunId -notmatch '^[a-zA-Z0-9-]+$') { throw 'Invalid acceptance run identity' }
 $root = Join-Path $env:USERPROFILE 'Dev\hermes-health-repair-20261019'
 $repo = Join-Path $root 'core-review-base'
 $work = Join-Path $root ('native-pr93004-fixed-' + $Commit.Substring(0,8))
 $out = Join-Path $work 'artifacts\hermes-repair-20261019\desktop-acceptance'
+if ($RunId -ne 'acceptance') { $out += '-' + $RunId }
 $receipt = Join-Path $out 'native-acceptance.json'
 if (Test-Path $receipt) { throw 'Read the existing desktop acceptance before repeating it' }
 if (-not (Test-Path $work)) {
@@ -27,7 +31,8 @@ $env:HERMES_HOME = Join-Path $out 'pm-home'
 $env:HERMES_RUNTIME_DIR = Join-Path $root 'core-upstream130122\artifacts\hermes-repair-20261019\pm-runtime'
 [IO.Directory]::CreateDirectory($env:HERMES_HOME) | Out-Null
 $node = (Get-Command node -ErrorAction Stop).Source
-$npm = Join-Path (Split-Path (Get-Command npm.cmd -ErrorAction Stop).Source -Parent) 'node_modules\npm\bin\npm-cli.js'
+$npm = if ($NpmCli) { $NpmCli } else { Join-Path (Split-Path (Get-Command npm.cmd -ErrorAction Stop).Source -Parent) 'node_modules\npm\bin\npm-cli.js' }
+if ($NpmCli -and -not [IO.Path]::GetFullPath($NpmCli).StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Use task-owned npm tooling' }
 if (-not (Test-Path $npm)) { throw 'Inspect the installed Node/npm pair' }
 $nodeVersion = (& $node --version | Out-String).Trim()
 $npmVersion = (& $node $npm --version | Out-String).Trim()
@@ -71,11 +76,11 @@ if ($testExit -eq 0 -and $typecheckExit -eq 0 -and $lintExit -eq 0) {
 }
 $status = @(git status --porcelain --untracked-files=no)
 $result = [ordered]@{
-    case='pr93004-fixed'; commit=$Commit; tree=(git rev-parse 'HEAD^{tree}').Trim(); base_commit=$BaseCommit;
+    case='pr93004-fixed'; commit=$Commit; tree=(git rev-parse 'HEAD^{tree}').Trim(); base_commit=$BaseCommit; run_id=$RunId;
     test_path=$testPath; test_file_sha256=(Get-FileHash $testPath -Algorithm SHA256).Hash.ToLowerInvariant();
     install_exit=$installExit; test_exit=$testExit; typecheck_exit=$typecheckExit; lint_exit=$lintExit;
     checks_exit=$checksExit; counts=$counts; checks_stdout=$checksStdout; checks_stderr=$checksStderr;
-    node=$nodeVersion; npm=$npmVersion; hostname=$env:COMPUTERNAME; tracked_status=$status;
+    node=$nodeVersion; npm=$npmVersion; npm_cli_sha256=(Get-FileHash $npm -Algorithm SHA256).Hash.ToLowerInvariant(); hostname=$env:COMPUTERNAME; tracked_status=$status;
     harness_file_sha256=(Get-FileHash $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant();
     completed_at=[DateTime]::UtcNow.ToString('o');
     junit_base64=if (Test-Path $junitPath) {[Convert]::ToBase64String([IO.File]::ReadAllBytes($junitPath))} else {$null};
