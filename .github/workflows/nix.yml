@@ -1,6 +1,6 @@
 name: Nix flake check
 
-# Builds every output of the flake: the package, the devShell, and the 21
+# Builds every output of the flake: the package, the devShell, and the
 # checks under nix/checks.nix — module evaluation, option parity, .env
 # assembly, service argv, and the rest.
 #
