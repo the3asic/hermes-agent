@@ -72,7 +72,7 @@ async def test_mcp_http_transport_reads_repository_document(tmp_path, transport)
                 tools = await task.session.list_tools()
                 assert "read_repository_readme" in {tool.name for tool in tools.tools}
                 result = await task.session.call_tool("read_repository_readme", {})
-                assert not result.isError
+                assert not result.is_error
                 text = "".join(block.text for block in result.content if isinstance(block, TextContent))
                 expected = readme.read_text(encoding="utf-8")
                 assert text == expected

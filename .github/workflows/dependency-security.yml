@@ -6,6 +6,7 @@ on:
     paths:
       - pyproject.toml
       - uv.lock
+      - tools/lazy_deps.py
       - tests/tools/live_dependencies/**
       - scripts/ci/run_dependency_security_acceptance.py
       - .github/workflows/dependency-security.yml
