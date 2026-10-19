@@ -12357,12 +12357,6 @@
    "target": "sys"
   },
   {
-   "facade": "tools.website_policy",
-   "name": "invalidate_cache",
-   "kind": "restored-def",
-   "target": "(deleted; BASE body restored)"
-  },
-  {
    "facade": "tools.write_approval",
    "name": "is_background",
    "kind": "restored-def",

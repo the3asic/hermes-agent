@@ -34,7 +34,7 @@ def main():
     actual = {name: metadata.version(name) for name in targets}
     assert actual == targets, actual
     files = {"test_mcp_http_transport.py": 2, "test_jwt_options.py": 1,
-             "test_network_clients.py": 1, "test_auth_crypto.py": 1, "test_cache_diagnostic.py": 1}
+             "test_network_clients.py": 1, "test_auth_crypto.py": 1, "test_cache_diagnostic.py": 2}
     results = []
     for name, expected in files.items():
         path = "tests/tools/live_dependencies/" + name

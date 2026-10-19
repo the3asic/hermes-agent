@@ -3784,12 +3784,6 @@ to the public equivalent or the new module. Test monkeypatch seams are likewise 
 | `sensitive_query_param_name` | moved-lazy | `tools.url_safety` |
 | `sys` | import | `sys` |
 
-### `tools.website_policy`
-
-| name | kind | new location |
-|---|---|---|
-| `invalidate_cache` | restored-def | `(deleted; BASE body restored)` |
-
 ### `tools.write_approval`
 
 | name | kind | new location |
