@@ -1,0 +1,56 @@
+name: Maintained dependency security checks
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - pyproject.toml
+      - uv.lock
+      - tests/tools/live_dependencies/**
+      - scripts/ci/run_dependency_security_acceptance.py
+      - .github/workflows/dependency-security.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  maintained-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+      - name: Build the locked Python 3.11 environment
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/hermes-dependency-security
+        run: |
+          uv sync --frozen --python 3.11.15 --extra dev --extra mcp --extra messaging --extra google
+          uv pip install --python "$UV_PROJECT_ENVIRONMENT/bin/python" 'pip==26.2' 'tornado==6.5.9'
+      - name: Run real transport, authentication and repository checks
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/hermes-dependency-security
+          HERMES_PYTHON: ${{ runner.temp }}/hermes-dependency-security/bin/python
+          EXPECTED_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: >-
+          "$HERMES_PYTHON" scripts/ci/run_dependency_security_acceptance.py
+          --bash /usr/bin/bash --uv "$(command -v uv)"
+          --output artifacts/hermes-dependency-security-acceptance
+          --expected-commit "$EXPECTED_COMMIT"
+      - name: Upload actual acceptance records
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dependency-security-acceptance
+          path: artifacts/hermes-dependency-security-acceptance
+          if-no-files-found: error
