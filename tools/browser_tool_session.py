@@ -13,6 +13,7 @@ import subprocess
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.browser_tool_origin import origin as _bt
@@ -248,7 +249,19 @@ def _local_backend_process_dead(session_info: Dict[str, Any]) -> bool:
 
 
 def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
-    """Session connecting to a user-supplied CDP endpoint."""
+    """Connect through a stable discovery root when the native CLI supports it."""
+    configured = _cdp._get_cdp_override_raw()
+    endpoint = urlsplit(configured)
+    # Chrome rotates its browser websocket UUID at every launch. Keep the
+    # explicit plain-HTTP discovery root for the pinned CLI to rediscover on
+    # reconnect; IPv6, TLS, authenticated/custom-path and websocket endpoints
+    # retain Hermes' existing resolution contract.
+    if (endpoint.scheme == "http" and endpoint.hostname and ":" not in endpoint.hostname
+            and endpoint.port is not None
+            and not endpoint.username and not endpoint.password
+            and endpoint.path in {"", "/", "/json/version"}
+            and not endpoint.query and not endpoint.fragment):
+        cdp_url = endpoint._replace(path="").geturl()
     info = _session_record("cdp", cdp_url, {"cdp_override": True})
     _bt.logger.info("Created CDP browser session %s → %s for task %s",
                 info["session_name"], _bt._sanitize_url_for_logs(cdp_url), task_id)
