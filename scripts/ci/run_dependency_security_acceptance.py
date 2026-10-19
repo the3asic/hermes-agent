@@ -24,8 +24,8 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     receipt = out / "acceptance.json"
     assert not receipt.exists(), "Read the existing acceptance before repeating it"
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True).stdout.strip()
-    tree = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=root, check=True, capture_output=True, text=True).stdout.strip()
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True, encoding="utf-8").stdout.strip()
+    tree = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=root, check=True, capture_output=True, text=True, encoding="utf-8").stdout.strip()
     assert head == args.expected_commit
     assert os.path.samefile(os.environ["HERMES_PYTHON"], sys.executable)
     targets = {"aiohttp": "3.14.4", "httpcore2": "2.12.0", "httpx2": "2.12.0", "mcp": "2.2.0",
@@ -34,7 +34,7 @@ def main():
     actual = {name: metadata.version(name) for name in targets}
     assert actual == targets, actual
     files = {"test_mcp_http_transport.py": 2, "test_jwt_options.py": 1,
-             "test_network_clients.py": 1, "test_auth_crypto.py": 1}
+             "test_network_clients.py": 1, "test_auth_crypto.py": 1, "test_cache_diagnostic.py": 1}
     results = []
     for name, expected in files.items():
         path = "tests/tools/live_dependencies/" + name
@@ -65,7 +65,7 @@ def main():
     for name, command in checks.items():
         with (out / (name + ".stdout")).open("wb") as stdout, (out / (name + ".stderr")).open("wb") as stderr:
             subprocess.run(command, cwd=root, stdout=stdout, stderr=stderr, timeout=300, check=True)
-    status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=root, check=True, capture_output=True, text=True).stdout.splitlines()
+    status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=root, check=True, capture_output=True, text=True, encoding="utf-8").stdout.splitlines()
     assert status == []
     record = {"commit": head, "tree": tree, "python": sys.executable, "python_version": sys.version,
               "versions": actual, "tests": results, "checks": list(checks), "tracked_status": status,

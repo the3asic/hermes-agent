@@ -142,7 +142,15 @@ def usage_fields(value):
     return result
 
 
+def _owner_uid():
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        raise OSError("Private cache diagnostics require POSIX file ownership")
+    return getuid()
+
+
 def _check_root(root, create=False):
+    owner_uid = _owner_uid()
     root = Path(root).absolute()
     # All ancestors must be physical. Artifact ancestors and descendants are private.
     private = False
@@ -155,25 +163,27 @@ def _check_root(root, create=False):
         st = current.lstat()
         if not stat.S_ISDIR(st.st_mode) or current.is_symlink():
             raise ValueError("nonphysical_directory")
-        if private and (stat.S_IMODE(st.st_mode) != 0o700 or st.st_uid != os.getuid()):
+        if private and (stat.S_IMODE(st.st_mode) != 0o700 or st.st_uid != owner_uid):
             raise PermissionError("private_directory_required")
     return root
 
 
 def _open(root, name, flags):
+    owner_uid = _owner_uid()
     directory = _directory_fd(root)
     try:
         fd = os.open(name, flags | os.O_NOFOLLOW, 0o600, dir_fd=directory)
     finally:
         os.close(directory)
     st = os.fstat(fd)
-    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o600 or st.st_nlink != 1:
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != owner_uid or stat.S_IMODE(st.st_mode) != 0o600 or st.st_nlink != 1:
         os.close(fd)
         raise PermissionError("private_regular_file_required")
     return fd
 
 
 def _directory_fd(root):
+    owner_uid = _owner_uid()
     # Walk from / with openat+NOFOLLOW so a replaced ancestor cannot redirect I/O.
     fd = os.open("/", os.O_DIRECTORY)
     private = False
@@ -185,7 +195,7 @@ def _directory_fd(root):
             fd = next_fd
             private = private or part == "artifacts" or index == len(parts) - 1
             st = os.fstat(fd)
-            if private and (stat.S_IMODE(st.st_mode) != 0o700 or st.st_uid != os.getuid()):
+            if private and (stat.S_IMODE(st.st_mode) != 0o700 or st.st_uid != owner_uid):
                 raise PermissionError("unsafe_directory")
         return fd
     except BaseException:
