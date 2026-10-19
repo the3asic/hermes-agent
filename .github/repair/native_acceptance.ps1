@@ -46,21 +46,33 @@ foreach ($suite in $junit.SelectNodes('//testsuite')) {
     foreach ($name in @('tests','failures','errors','skipped')) { $counts[$name] += [int]$suite.GetAttribute($name) }
 }
 $checkExit = $null
+$checkStdout = ''
+$checkStderr = ''
 if (-not $Baseline -and $testExit -eq 0) {
-    & $TestPython -u scripts/check --base 5fc490e2b34123212d73ef316086f939567a725a --commit $Commit
-    $checkExit = $LASTEXITCODE
+    $checkOutputPath = Join-Path $out 'checks.stdout'
+    $checkErrorPath = Join-Path $out 'checks.stderr'
+    $checkArguments = @('-u','scripts/check','--base','5fc490e2b34123212d73ef316086f939567a725a','--commit',$Commit)
+    $checkProcess = Start-Process -FilePath $TestPython -ArgumentList $checkArguments -NoNewWindow -Wait -PassThru -RedirectStandardOutput $checkOutputPath -RedirectStandardError $checkErrorPath
+    $checkExit = $checkProcess.ExitCode
+    $checkStdout = [IO.File]::ReadAllText($checkOutputPath)
+    $checkStderr = [IO.File]::ReadAllText($checkErrorPath)
+    Write-Output $checkStdout
+    if ($checkStderr) { [Console]::Error.WriteLine($checkStderr) }
 }
 $status = @(git status --porcelain --untracked-files=no)
 $result = [ordered]@{
     case=$CaseId; commit=$Commit; tree=(git rev-parse 'HEAD^{tree}').Trim();
     test_path=$TestPath; test_file_sha256=(Get-FileHash $TestPath -Algorithm SHA256).Hash.ToLowerInvariant();
     test_exit=$testExit; counts=$counts; checks_exit=$checkExit; baseline=[bool]$Baseline;
+    checks_stdout=$checkStdout; checks_stderr=$checkStderr;
+    harness_file_sha256=(Get-FileHash $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant();
+    completed_at=[DateTime]::UtcNow.ToString('o');
     python=$TestPython; hostname=$env:COMPUTERNAME; os=[Environment]::OSVersion.VersionString;
     tracked_status=$status; junit_base64=[Convert]::ToBase64String([IO.File]::ReadAllBytes($junitPath))
 }
 $json = $result | ConvertTo-Json -Depth 6 -Compress
 [IO.File]::WriteAllText($receipt, $json, [Text.UTF8Encoding]::new($false))
-Write-Output ('NATIVE_REPAIR_ACCEPTANCE_V1 ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)))
+Write-Output ('NATIVE_REPAIR_ACCEPTANCE_V2 ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)))
 if ($counts.tests -ne $ExpectedTests -or $counts.errors -or $counts.skipped -or $status.Count) { throw 'Native acceptance is incomplete' }
 if ($testExit -ne 0) { exit $testExit }
 if (-not $Baseline -and $checkExit -ne 0) { exit $checkExit }
