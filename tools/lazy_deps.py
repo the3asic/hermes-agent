@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 # Allowlist: "namespace.backend" -> pip specs matching the pyproject extra. Pins are exact
-# (security posture); bump here AND in pyproject. Shared patched floors (aiohttp==3.14.3,
+# (security posture); bump here AND in pyproject. Shared patched floors (aiohttp==3.14.4,
 # starlette==1.3.1) are literals in every feature: tests/test_packaging_metadata.py checks by AST.
 LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # ─── Inference providers ───────────────────────────────────────────────
@@ -126,19 +126,19 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "platform.discord": (
         "discord.py[voice]==2.7.1",
         "brotlicffi==1.2.0.2",
-        "aiohttp==3.14.3",
+        "aiohttp==3.14.4",
     ),
     "platform.slack": (
         "slack-bolt==1.30.0",
         "slack-sdk==3.44.1",
-        "aiohttp==3.14.3",
+        "aiohttp==3.14.4",
     ),
     "platform.matrix": (
         "mautrix[encryption]==0.21.1",
         "aiosqlite==0.22.1",
         "asyncpg==0.31.0",
         "aiohttp-socks==0.11.0",
-        "aiohttp==3.14.3",
+        "aiohttp==3.14.4",
     ),
     "platform.dingtalk": (
         "dingtalk-stream==0.24.3",
@@ -152,7 +152,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # WeCom callback adapter parses untrusted XML POST bodies -> defusedxml.
     "platform.wecom_callback": ("defusedxml==0.7.1",),
     # Teams pulls a heavy tree (msal, dependency-injector); also the `teams` extra.
-    "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.3"),
+    "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.4"),
     # Google Chat — Pub/Sub + Chat API. Not in [all]; Docker bakes `--extra google-chat`
     # so hosted/immutable images do not have to write the sealed venv.
     "platform.google_chat": (
@@ -200,8 +200,8 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "tool.doc_extract": ("firecrawl-anydoc==0.2.4",),  # imports as `anydoc`; lockstep with pyproject
     # MCP client SDK for the cua-driver, so computer_use never dead-ends on `No module named 'mcp'`.
     "tool.computer_use": (
-        "mcp==2.0.0",
-        "httpx2==2.7.0",  # mcp 2.x HTTP stack — sync with pyproject [computer-use]
+        "mcp==2.2.0",
+        "httpx2==2.12.0",  # mcp 2.x HTTP stack — sync with pyproject [computer-use]
         "starlette==1.3.1",
     ),
     # HF Agent Trace Viewer upload (hermes trace upload / /upload-trace). huggingface-hub is a SHARED

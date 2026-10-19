@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -120,7 +121,7 @@ def _configure_resolution(
 
     monkeypatch.setattr(bt, "_build_browser_env", lambda: {"PATH": ""})
     monkeypatch.setattr(bt_install, "_merge_browser_path", merge_path)
-    monkeypatch.setattr(bt.shutil, "which", which)
+    monkeypatch.setattr(shutil, "which", which)
 
 
 def test_runnable_033_remains_generic_but_is_rejected_for_pin(monkeypatch, tmp_path):
