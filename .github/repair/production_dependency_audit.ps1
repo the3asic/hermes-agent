@@ -5,7 +5,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $root = Join-Path $env:USERPROFILE 'Dev\hermes-health-repair-20261019'
-$out = Join-Path $root 'artifacts\production-dependency-audit-20261020-python311'
+$out = Join-Path $root 'artifacts\production-dependency-audit-20261020-registry'
 if (Test-Path (Join-Path $out 'audit-result.json')) { throw 'Read the existing audit before repeating it' }
 [IO.Directory]::CreateDirectory($out) | Out-Null
 $compressed = [IO.MemoryStream]::new([Convert]::FromBase64String($RequirementsBase64))
