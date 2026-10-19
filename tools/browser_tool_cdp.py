@@ -70,7 +70,7 @@ def _get_cdp_override() -> str:
     return _resolve_cdp_override(raw) if (raw := _get_cdp_override_raw()) else ""
 
 
-def _get_dialog_policy_config() -> Tuple[str, float]:
+def _get_dialog_policy_config() -> tuple[str, float]:
     """Read ``browser.dialog_policy`` + ``browser.dialog_timeout_s``; supervisor defaults when absent/invalid."""
     _bt = _origin()
     # Deferred so browser_tool imports in minimal environments.
@@ -131,10 +131,10 @@ def _ensure_cdp_supervisor(
             cdp_url = _resolve_cdp_override(maybe)
     if not cdp_url:
         return
-    try:
-        from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
-        from tools import browser_tool_lifecycle as _lifecycle
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+    from tools import browser_tool_lifecycle as _lifecycle
 
+    try:
         policy, timeout_s = _get_dialog_policy_config()
 
         def _publication_allowed() -> bool:
@@ -165,16 +165,13 @@ def _ensure_cdp_supervisor(
             publish_guard=_publication_allowed,
         )
     except Exception as exc:
-        _bt.logger.debug("CDP supervisor attach for task=%s failed (non-fatal): %s", task_id, exc)
+        _bt.logger.debug("CDP supervisor attach for task=%s failed: %s", task_id, exc, exc_info=True)
 
 
 def _stop_cdp_supervisor(task_id: str) -> None:
     """Stop the CDP supervisor for ``task_id`` if one exists. No-op otherwise."""
-    try:
-        from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
-        SUPERVISOR_REGISTRY.stop(task_id)
-    except Exception as exc:
-        _origin().logger.debug("CDP supervisor stop for task=%s failed (non-fatal): %s", task_id, exc)
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+    SUPERVISOR_REGISTRY.stop(task_id)
 
 
 def _pinned_cdp_target_id(task_id: str) -> Optional[str]:
