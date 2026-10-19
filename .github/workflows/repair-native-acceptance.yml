@@ -141,6 +141,11 @@ jobs:
   push:
     branches:
     - health-repair/native-validation-20261019
+  pull_request:
+    branches:
+    - main
+    paths:
+    - .github/workflows/repair-native-acceptance.yml
 run-name: 'Hermes repairs: native Windows acceptance 20261019'
 defaults:
   run:
