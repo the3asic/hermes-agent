@@ -1,0 +1,143 @@
+name: Hermes native repair acceptance
+permissions:
+  contents: read
+jobs:
+  native:
+    name: ${{ matrix.label }} (${{ matrix.phase }})
+    runs-on: windows-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        include:
+        - label: pr130111
+          phase: baseline
+          commit: 71da7dcd49f07e2d62b248b2e904963fef15a319
+          tree: 886d6faff71f56f5e4e932e473b9e18e3d0522eb
+          test_path: tests/plugins/live_discord/test_history_config.py
+          extras: '["messaging"]'
+        - label: pr130111
+          phase: fixed
+          commit: 7a254009d8803cd8cdc779165c84d2ae8d4fff05
+          tree: 6010af89ee89dad177a0fc300d1a0c3836deea93
+          test_path: tests/plugins/live_discord/test_history_config.py
+          extras: '["messaging"]'
+        - label: pr130114
+          phase: baseline
+          commit: 465fe4716893a8904877d37bcc0156062cc62b35
+          tree: 21b9e50e881790ef4ee41c22c8378155c2709f44
+          test_path: tests/plugins/live_discord/test_attachment_config.py
+          extras: '["messaging"]'
+        - label: pr130114
+          phase: fixed
+          commit: 1a7b1d66df6a273555d5e1b2aaf970b6575ea0c5
+          tree: 5f6054e717fe761e2bbdcacec92378a0f9eaa9fb
+          test_path: tests/plugins/live_discord/test_attachment_config.py
+          extras: '["messaging"]'
+        - label: pr130151
+          phase: fixed
+          commit: c2175b7fd35ac2e1411e9cd631cc01677ea83513
+          tree: 122242595c91a9b29c4a8674217f9caa4b499e8b
+          test_path: tests/tools/live_web/test_explicit_selection.py
+          extras: '[]'
+        - label: pr130158
+          phase: fixed
+          commit: c85e5f08bf5fa55fb04a1aff7bdbe1c84a06d52f
+          tree: dae2429d039862c04a2bcd35aa8ea4c3f7c14e98
+          test_path: tests/agent/live_restore/test_restore_state.py
+          extras: '[]'
+        - label: pr130122
+          phase: baseline
+          commit: 85a5cbb01a576b32d8d96559fc5a115b285277aa
+          tree: 6b623fdfb46347b8164856763640532726c1ba41
+          test_path: tests/tools/live_checkpoints/test_checkpoint_recovery.py
+          extras: '[]'
+        - label: pr130122
+          phase: fixed
+          commit: 2388bb5e8312ebaf14f618b586cdd4815c03c403
+          tree: 325e754f6d863e87591055f03c9d32b109be6126
+          test_path: tests/tools/live_checkpoints/test_checkpoint_recovery.py
+          extras: '[]'
+    steps:
+    - name: Checkout the exact candidate
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ matrix.commit }}
+        fetch-depth: 2
+        persist-credentials: false
+    - name: Verify source identity
+      shell: pwsh
+      env:
+        EXPECTED_COMMIT: ${{ matrix.commit }}
+        EXPECTED_TREE: ${{ matrix.tree }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        if ((git rev-parse HEAD).Trim() -ne $env:EXPECTED_COMMIT) { throw 'Candidate commit mismatch' }
+        if ((git rev-parse 'HEAD^{tree}').Trim() -ne $env:EXPECTED_TREE) { throw 'Candidate tree mismatch' }
+        git fetch --no-tags --depth=1 origin 5fc490e2b34123212d73ef316086f939567a725a
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        New-Item -ItemType Directory -Force artifacts/hermes-repair-20261019/ci-acceptance | Out-Null
+        @{ commit=$env:EXPECTED_COMMIT; tree=$env:EXPECTED_TREE; os=[System.Environment]::OSVersion.VersionString } | ConvertTo-Json | Set-Content -Encoding utf8 artifacts/hermes-repair-20261019/ci-acceptance/source.json
+    - name: Build the locked native test environment
+      id: pm
+      uses: ./.github/actions/setup-pm
+      with:
+        extras: ${{ matrix.extras }}
+        test-environment: 'true'
+        cache-suffix: hermes-repair-20261019
+    - name: Prepare the actual checkpoint tool store
+      if: contains(matrix.test_path, 'live_checkpoints')
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $env:HERMES_RUNTIME_DIR = Join-Path $env:RUNNER_TEMP 'repair-acceptance/pm-runtime'
+        $env:HERMES_HOME = Join-Path $env:RUNNER_TEMP 'repair-acceptance/pm-home'
+        New-Item -ItemType Directory -Force $env:HERMES_HOME | Out-Null
+        & $env:HERMES_PYTHON -c "import pm; pm.ensure('git', explicit=True)"
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    - name: Run real native behavior checks
+      id: behavior
+      shell: pwsh
+      env:
+        TEST_PATH: ${{ matrix.test_path }}
+        CASE_LABEL: ${{ matrix.label }}
+        CASE_PHASE: ${{ matrix.phase }}
+        EXPECTED_COMMIT: ${{ matrix.commit }}
+        EXPECTED_TREE: ${{ matrix.tree }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $bash = Join-Path $env:ProgramFiles 'Git/bin/bash.exe'
+        $receipt = 'artifacts/hermes-repair-20261019/ci-acceptance/junit.xml'
+        $cases = (Join-Path $env:RUNNER_TEMP 'repair-acceptance/cases').Replace('\', '/')
+        & $bash scripts/run_tests.sh $env:TEST_PATH --file-timeout 300 -- --noconftest --basetemp=$cases --junitxml=$receipt -q
+        $testExit = $LASTEXITCODE
+        [xml]$junit = [IO.File]::ReadAllText((Join-Path (Get-Location) $receipt))
+        $counts = [ordered]@{ tests=0; failures=0; errors=0; skipped=0 }
+        foreach ($suite in $junit.SelectNodes('//testsuite')) {
+          foreach ($name in @('tests','failures','errors','skipped')) { $counts[$name] += [int]$suite.GetAttribute($name) }
+        }
+        $record = [ordered]@{ label=$env:CASE_LABEL; phase=$env:CASE_PHASE; commit=$env:EXPECTED_COMMIT; tree=$env:EXPECTED_TREE; actual_test_exit=$testExit; junit=$counts; test_file_sha256=(Get-FileHash $env:TEST_PATH -Algorithm SHA256).Hash.ToLowerInvariant(); real_host=$env:RUNNER_OS; python=$env:HERMES_PYTHON }
+        $record | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 artifacts/hermes-repair-20261019/ci-acceptance/behavior.json
+        exit $testExit
+    - name: Run the complete repository lint checks
+      if: ${{ !cancelled() && matrix.phase == 'fixed' && steps.pm.outcome == 'success'
+        }}
+      shell: pwsh
+      env:
+        EXPECTED_COMMIT: ${{ matrix.commit }}
+      run: |
+        & $env:HERMES_PYTHON scripts/check --base 5fc490e2b34123212d73ef316086f939567a725a --commit $env:EXPECTED_COMMIT
+        exit $LASTEXITCODE
+    - name: Save actual acceptance receipts
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: repair-${{ matrix.label }}-${{ matrix.phase }}
+        path: artifacts/hermes-repair-20261019/ci-acceptance/
+        if-no-files-found: error
+        retention-days: 7
+'on':
+  push:
+    branches:
+    - health-repair/native-validation-20261019
