@@ -1,0 +1,15 @@
+{
+  "base": "ed063b312be2f1f50c470c70c8b96900ea4f3fc3",
+  "commit": "beda0b0f1a95e2f1bd6c7d788ec769b70416c156",
+  "tree": "9342e5eb8c673f804c8444f60d9ba92dfb92ebfc",
+  "source_sha256": {
+    "pyproject.toml": "0eb41d84e826df84214cb4024927040ec34090791716d20404a4cd08d5b1c8ef",
+    "uv.lock": "04f3d8f564cf86b3412db7573dd9791842f9a8f44b160c9736743c0860aa1561",
+    ".github/workflows/dependency-security.yml": "1d6678b800d01ebe2defd8bd7e040114768af4d2223d7b691df05547a2ddc923",
+    "scripts/ci/run_dependency_security_acceptance.py": "39f2fb60cd9105f8074d733c1d71ac29d8154fce854e174876f1869a4dccf9c8",
+    "tests/tools/live_dependencies/test_mcp_http_transport.py": "21c209160572d2dbb31b9daec359e64b943f24e4180d9840563d8655b91779e3",
+    "tests/tools/live_dependencies/test_jwt_options.py": "c20c033ef586deae80252a7e2ec69b34fb31a2c7b0ded2de6764322949ba4258",
+    "tests/tools/live_dependencies/test_network_clients.py": "393a213edf6fa30e60e216444db037d0c64e9fcb9bdb953f9a0cd48b976aabfc",
+    "tests/tools/live_dependencies/test_auth_crypto.py": "8a2852ee38cc5dea22af80e276cb7247939a0869f4c78a5cb5c7291a14099017"
+  }
+}
