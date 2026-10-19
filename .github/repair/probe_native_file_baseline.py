@@ -18,7 +18,16 @@ target = tools._capture_mutation_targets(['project-document.md'], task)['project
 written = json.loads(tools.write_file_tool('project-document.md', content, task_id=task))
 assert not written.get('error'), written
 known = tracking._known_full_content_sha256([target], task)
-print(json.dumps({'stage': 'written', 'has_baseline': tracking._has_full_write_baseline(target, task), 'known': list(known.values()), 'disk': hashlib.sha256(Path(target).read_bytes()).hexdigest()}))
+fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
+import os
+
+with open(target, 'rb') as stream:
+    handle_stat = os.fstat(stream.fileno())
+    path_stat = os.stat(target)
+    stat_details = {name: [getattr(handle_stat, name), getattr(path_stat, name)] for name in fields}
+version = tracking._file_version(target)
+baseline = tracking._read_tracker.get(task, {}).get('full_write_baselines', {}).get(target)
+print(json.dumps({'stage': 'written', 'has_baseline': tracking._has_full_write_baseline(target, task), 'known': list(known.values()), 'disk': hashlib.sha256(Path(target).read_bytes()).hexdigest(), 'input': hashlib.sha256(content.encode()).hexdigest(), 'stat_details': stat_details, 'version_available': version is not None, 'baseline_available': baseline is not None}))
 original = next(line for line in content.splitlines() if line and line.upper() != line and content.count(line) == 1)
 result = operations.patch_replace(target, original, original.upper())
 assert not result.error, result.error
