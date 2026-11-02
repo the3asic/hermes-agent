@@ -25,13 +25,16 @@ with fork's session persistence layer.
   extras neutts/kittentts/piper/google-meet), kept fork homeassistant extra at aiohttp 3.14.5,
   kept constraint-dependencies + upstream default-groups=[] + environments 3.14-only (only
   setting that lets `uv lock` resolve all-extras; prod installs via `uv pip install -e` which
-  ignores environments), kept fork exclude-newer "14 days" + full exemption table, ADDED
-  exemptions: kittentts, misaki, neutts, piper-tts, playwright, urllib3.
-- UD modify/delete list (upstream deleted, fork modified): COMPAT_MANIFEST.md,
-  compat_manifest.json, tests/tools/test_browser_homebrew_paths.py, test_browser_npx_warmup.py,
-  test_browser_suspect_recycle.py, tools/browser_tool_cdp.py, browser_tool_lifecycle.py,
-  browser_tool_lightpanda_fallback.py, browser_tool_session.py — need to find where upstream
-  moved the logic (browser supervisor refactor family) before deciding keep-vs-port.
+  ignores environments). Fork's 14-day exclude-newer + exemption table superseded by upstream's
+  exclude-newer "3 days" — upstream pm resolves the same bricking via _without_release_age and
+  a test asserts P3D, so the fork table was retired. uv.lock regenerated via `python -m pm.lock`.
+- UD modify/delete list (upstream deleted, fork modified): all 9 deleted per upstream —
+  COMPAT_MANIFEST.md, compat_manifest.json, tests/tools/test_browser_homebrew_paths.py,
+  test_browser_npx_warmup.py, test_browser_suspect_recycle.py, tools/browser_tool_cdp.py,
+  browser_tool_lifecycle.py, browser_tool_lightpanda_fallback.py, browser_tool_session.py.
+  Upstream's supervisor refactor relocated their logic; the fork's boundary guard was ported
+  into the new cleanup_browser path in agent/turn_facade.py (marked after cleanup completes so
+  a failing cleanup keeps the guard armed for retry).
 
 ## Local commits to preserve (74, grouped)
 - Compression family: stall fallback bounds, output limits, route capability filter, in-place

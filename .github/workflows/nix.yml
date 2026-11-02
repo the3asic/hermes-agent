@@ -1,6 +1,6 @@
 name: Nix flake check
 
-# Builds every output of the flake: the package, the devShell, and the 21
+# Builds every output of the flake: the package, the devShell, and the
 # checks under nix/checks.nix — module evaluation, option parity, .env
 # assembly, service argv, and the rest.
 #
@@ -81,9 +81,10 @@ jobs:
     if: needs.detect.outputs.nix == 'true' || inputs.release == true
     # The build compiles the package and its whole dependency closure, so this
     # takes minutes and not seconds when the cache misses. `nix flake check`
-    # builds 21 checks, and --max-jobs defaults to the core count. It uses the
-    # wider runner with no more configuration.
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    # builds 21 checks. The canonical organization uses its larger worker;
+    # personal forks use the standard hosted worker with explicit build
+    # concurrency below.
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'blacksmith-32vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:
       - name: Checkout code
@@ -161,7 +162,9 @@ jobs:
         # A path: flake has no git metadata, so the release source names its
         # commit with ?rev=: without it self.rev is null, the install stamp
         # carries no commit, and the packaged CLI reports "unknown".
-        run: nix flake check "${{ inputs.release == true && format('path:{0}/release-source?rev={1}', runner.temp, env.CANDIDATE_COMMIT) || '.' }}" --print-build-logs
+        env:
+          NIX_BUILD_JOBS: ${{ github.repository == 'NousResearch/hermes-agent' && '32' || '2' }}
+        run: nix flake check "${{ inputs.release == true && format('path:{0}/release-source?rev={1}', runner.temp, env.CANDIDATE_COMMIT) || '.' }}" --print-build-logs --max-jobs "$NIX_BUILD_JOBS" --cores "$NIX_BUILD_JOBS"
 
       - name: Verify release package runtime identity
         if: inputs.release == true
