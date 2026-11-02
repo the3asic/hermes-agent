@@ -18,6 +18,8 @@ glue layer simultaneously.
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 
@@ -219,11 +221,14 @@ class TestRegistryResolution:
         monkeypatch.setenv("EXA_API_KEY", "real")
         assert _resolve("not-a-real-provider", capability=capability) is None
 
-    @pytest.mark.parametrize("capability", ["search", "extract"])
+    @pytest.mark.parametrize(
+        "capability,provider_name",
+        [("search", "perplexity"), ("extract", "firecrawl")],
+    )
     def test_managed_nous_selection_resolves_to_firecrawl(
-        self, monkeypatch: pytest.MonkeyPatch, capability: str
+        self, monkeypatch: pytest.MonkeyPatch, capability: str, provider_name: str
     ) -> None:
-        """The managed selection is an alias for Firecrawl, not an unknown."""
+        """The managed selection resolves to the provider implementing that capability."""
         _ensure_plugins_loaded()
         from agent import web_search_registry
 
@@ -242,13 +247,17 @@ class TestRegistryResolution:
             "plugins.web.firecrawl.provider._is_tool_gateway_ready",
             lambda: True,
         )
+        monkeypatch.setattr(
+            "plugins.web.perplexity.provider._managed_gateway",
+            lambda *args, **kwargs: object(),
+        )
         getter = getattr(
             web_search_registry, f"get_active_{capability}_provider"
         )
 
         result = getter()
         assert result is not None
-        assert result.name == "firecrawl"
+        assert result.name == provider_name
         assert result.is_available() is True
 
     def test_no_config_no_credentials_returns_none(
@@ -272,18 +281,51 @@ class TestRegistryResolution:
 
 
 # ---------------------------------------------------------------------------
-# Sync-vs-async extract detection
+# Firecrawl timeout alignment (#43272)
 # ---------------------------------------------------------------------------
 
 
-class TestAsyncExtractDispatch:
-    """The dispatcher detects async vs sync extract methods correctly."""
+class TestFirecrawlScrapeTimeout:
+    """Verify the server-side scrape timeout matches the asyncio deadline."""
 
+    def test_extract_passes_timeout_ms_to_scrape(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """scrape() must receive timeout=60000 (ms) so the server-side
+        deadline matches the 60 s asyncio.wait_for deadline.  Without this
+        the API uses its 30 s default, causing SCRAPE_TIMEOUT."""
+        from unittest.mock import MagicMock, patch
+        from plugins.web.firecrawl import provider as firecrawl_provider
 
-# ---------------------------------------------------------------------------
-# Error response shape (preserved bit-for-bit from legacy)
-# ---------------------------------------------------------------------------
+        # Direct-credential mode: with no FIRECRAWL_API_KEY extract() routes
+        # to the keyless ring instead of the direct scrape path under test.
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "test-key")
 
+        # Set up a fake client whose scrape() returns a minimal response
+        fake_client = MagicMock()
+        fake_client.scrape.return_value = {
+            "metadata": {"title": "Test", "sourceURL": "https://example.com"},
+            "markdown": "content",
+        }
 
-class TestErrorResponseShapes:
-    """When credentials are missing, plugins return typed errors, not raises."""
+        # Patch _get_firecrawl_client to return our fake client
+        monkeypatch.setattr(
+            firecrawl_provider, "_get_firecrawl_client", lambda capability=None: fake_client
+        )
+        # Patch check_website_access to allow the URL
+        monkeypatch.setattr(
+            firecrawl_provider, "check_website_access", lambda url: None
+        )
+
+        p = firecrawl_provider.FirecrawlWebSearchProvider()
+        results = asyncio.run(p.extract(["https://example.com"]))
+
+        # Verify scrape was called with timeout=60000
+        fake_client.scrape.assert_called_once()
+        call_kwargs = fake_client.scrape.call_args
+        assert call_kwargs.kwargs.get("timeout") == 60_000, (
+            f"Expected timeout=60000, got {call_kwargs.kwargs.get('timeout')}"
+        )
+
+        # Verify the result was processed correctly
+        assert len(results) == 1
+        assert results[0]["url"] == "https://example.com"
+        assert results[0]["content"] == "content"

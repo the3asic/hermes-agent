@@ -4,7 +4,7 @@ One ``CDPSupervisor`` per Hermes ``task_id`` with a reachable CDP endpoint: one
 persistent WebSocket, ``Page`` / ``Runtime`` / ``Target`` events on every attached
 session (top page + auto-attached OOPIF / worker targets), pending dialogs + frame
 tree exposed via a thread-safe snapshot. Not in the tool schema — output reaches the
-agent via ``browser_snapshot`` / ``browser_dialog``. Dialog capture and frame tracking
+agent via ``browser_dialog``. Dialog capture and frame tracking
 are mixins (``browser_supervisor_dialogs`` / ``browser_supervisor_frames``).
 Design spec: ``website/docs/developer-guide/browser-supervisor.md``.
 """
@@ -29,6 +29,8 @@ from tools.browser_supervisor_frames import FrameInfo, FrameTrackingMixin
 # ``websockets`` costs ~22 ms at import and is only needed once a supervisor connects.
 if TYPE_CHECKING:
     from websockets.asyncio.client import ClientConnection
+
+    from tools.browser_supervisor_capture import CapturedCDP
 
 logger = logging.getLogger(__name__)
 
@@ -56,71 +58,9 @@ class _LoopUnavailable(RuntimeError):
     """The supervisor loop refused new work (closed / shutting down)."""
 
 
-class CDPProtocolError(RuntimeError):
-    """A structured error response returned by the CDP endpoint."""
-
-    def __init__(self, call_id: int, error: Dict[str, Any]) -> None:
-        self.call_id = call_id
-        self.data = dict(error)
-        super().__init__(f"CDP error on id={call_id}: {self.data}")
-
-
-_STALE_SESSION_ERROR_MARKERS = (
-    "session with given id not found",
-    "no session with given id",
-    "target closed",
-    "target is closing",
-)
-
-
-def _is_stale_session_protocol_error(error: Dict[str, Any]) -> bool:
-    """Return whether a CDP protocol error proves the attached session is stale."""
-    message = str(error.get("message") or "").lower()
-    return any(marker in message for marker in _STALE_SESSION_ERROR_MARKERS)
-
-
-def _is_reference_chain_protocol_error(exc: BaseException) -> bool:
-    """Return whether Chrome rejected only result serialization depth."""
-    if not isinstance(exc, CDPProtocolError):
-        return False
-    message = str(exc.data.get("message") or "").lower()
-    return "reference chain is too long" in message
-
-
-def _runtime_failure(exc: BaseException) -> Dict[str, Any]:
-    """Shape Runtime.evaluate transport/protocol failures without text guessing."""
-    if isinstance(exc, _LoopUnavailable):
-        return {
-            "ok": False,
-            "kind": "supervisor_unavailable",
-            "error": str(exc),
-            "data": {"reason": "scheduler_unavailable"},
-        }
-    if isinstance(exc, CDPProtocolError):
-        protocol_error = dict(exc.data)
-        return {
-            "ok": False,
-            "kind": "cdp_protocol",
-            "error": str(exc),
-            "data": {
-                "protocol_error": protocol_error,
-                "session_lost": _is_stale_session_protocol_error(protocol_error),
-            },
-        }
-    return {
-        "ok": False,
-        "kind": "cdp_transport",
-        "error": f"{type(exc).__name__}: {exc}",
-        "data": {"exception_type": type(exc).__name__},
-    }
-
 def _schedule(coro, loop, *, timeout: float):
     """Run ``coro`` on the supervisor loop from a sync caller and wait for its result."""
-    try:
-        from agent.async_utils import safe_schedule_threadsafe
-    except Exception as exc:
-        coro.close()
-        raise _LoopUnavailable(f"Browser supervisor scheduler unavailable: {type(exc).__name__}: {exc}") from exc
+    from agent.async_utils import safe_schedule_threadsafe
 
     fut = safe_schedule_threadsafe(coro, loop)
     if fut is None:
@@ -128,11 +68,11 @@ def _schedule(coro, loop, *, timeout: float):
     return fut.result(timeout=timeout)
 
 
-def _fail(error: str) -> Dict[str, Any]:
+def _fail(error: str) -> dict[str, Any]:
     return {"ok": False, "error": error}
 
 
-def _err(exc: BaseException) -> Dict[str, Any]:
+def _err(exc: BaseException) -> dict[str, Any]:
     return _fail(f"{type(exc).__name__}: {exc}")
 
 
@@ -140,42 +80,41 @@ def _err(exc: BaseException) -> Dict[str, Any]:
 class SupervisorSnapshot:
     """Read-only snapshot of supervisor state for tool handlers."""
 
-    pending_dialogs: Tuple[PendingDialog, ...]
-    recent_dialogs: Tuple[DialogRecord, ...]
-    frame_tree: Dict[str, Any]
+    pending_dialogs: tuple[PendingDialog, ...]
+    recent_dialogs: tuple[DialogRecord, ...]
+    frame_tree: dict[str, Any]
     active: bool  # False if supervisor is detached/stopped
     cdp_url: str
     task_id: str
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Serialize for inclusion in ``browser_snapshot`` output."""
-        out: Dict[str, Any] = {"pending_dialogs": [d.to_dict() for d in self.pending_dialogs], "frame_tree": self.frame_tree}
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize for inclusion in tool output."""
+        out: dict[str, Any] = {"pending_dialogs": [d.to_dict() for d in self.pending_dialogs], "frame_tree": self.frame_tree}
         if self.recent_dialogs:
             out["recent_dialogs"] = [d.to_dict() for d in self.recent_dialogs]
         return out
 
 
 class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
-    """One supervisor per (task_id, cdp_url, target_id). ``start()`` spawns a daemon thread
-    running its own asyncio loop, connects, attaches to the selected page target, enables
+    """One supervisor per (task_id, cdp_url) pair. ``start()`` spawns a daemon thread
+    running its own asyncio loop, connects, attaches to the first page target, enables
     domains and auto-attach. ``snapshot()`` / ``respond_to_dialog()`` / ``evaluate_runtime()``
     are sync, thread-safe bridges onto that loop; all CDP I/O lives on the loop."""
 
-    def __init__(self, task_id: str, cdp_url: str, *, target_id: Optional[str] = None, dialog_policy: str = DEFAULT_DIALOG_POLICY,
+    def __init__(self, task_id: str, cdp_url: str, *, dialog_policy: str = DEFAULT_DIALOG_POLICY,
                  dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S) -> None:
         if dialog_policy not in _VALID_POLICIES:
             raise ValueError(f"Invalid dialog_policy {dialog_policy!r}; must be one of {sorted(_VALID_POLICIES)}")
         self.task_id = task_id
         self.cdp_url = cdp_url
-        self.target_id = target_id
         self.dialog_policy = dialog_policy
         self.dialog_timeout_s = float(dialog_timeout_s)
 
         # State protected by ``_state_lock`` for cross-thread reads.
         self._state_lock = threading.Lock()
-        self._pending_dialogs: Dict[str, PendingDialog] = {}
-        self._recent_dialogs: List[DialogRecord] = []
-        self._frames: Dict[str, FrameInfo] = {}
+        self._pending_dialogs: dict[str, PendingDialog] = {}
+        self._recent_dialogs: list[DialogRecord] = []
+        self._frames: dict[str, FrameInfo] = {}
         self._active = False
         # Supervisor loop machinery — populated in start().
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -185,11 +124,11 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         self._stop_requested = False
         # CDP call tracking (runs on supervisor loop only).
         self._next_call_id = 1
-        self._pending_calls: Dict[int, asyncio.Future] = {}
+        self._pending_calls: dict[int, asyncio.Future] = {}
         self._ws: Optional[ClientConnection] = None
         self._page_session_id: Optional[str] = None
         # Dialog auto-dismiss watchdog handles (per dialog id) + id generator.
-        self._dialog_watchdogs: Dict[str, asyncio.TimerHandle] = {}
+        self._dialog_watchdogs: dict[str, asyncio.TimerHandle] = {}
         self._dialog_seq = 0
 
     # ── Public sync API ──────────────────────────────────────────────────────
@@ -240,7 +179,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             )
 
     def respond_to_dialog(self, action: str, *, prompt_text: Optional[str] = None,
-                          dialog_id: Optional[str] = None, timeout: float = 10.0) -> Dict[str, Any]:
+                          dialog_id: Optional[str] = None, timeout: float = 10.0) -> dict[str, Any]:
         """Accept/dismiss a pending dialog (sync bridge onto the supervisor loop). Returns
         ``{"ok": True, "dialog"}`` or ``{"ok": False, "error"}`` for recoverable errors."""
         if action not in {"accept", "dismiss"}:
@@ -272,22 +211,22 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         return {"ok": True, "dialog": dialog.to_dict()}
 
     def evaluate_runtime(self, expression: str, *, return_by_value: bool = True,
-                         await_promise: bool = True, timeout: float = 10.0) -> Dict[str, Any]:
+                         await_promise: bool = True, timeout: float = 10.0) -> dict[str, Any]:
         """Evaluate ``expression`` in the page's Runtime context over the live WS.
         Returns ``{"ok": True, "result", "result_type"}`` or ``{"ok": False, "error"}``.
         ``return_by_value=True`` JSON-serializes the result (DevTools-console
         semantics); non-serializable objects come back as a description string."""
         loop = self._loop
         if loop is None or not loop.is_running():
-            return {**_fail("supervisor loop is not running"), "kind": "supervisor_unavailable", "data": {"reason": "loop_not_running"}}
+            return _fail("supervisor loop is not running")
         with self._state_lock:
             active, session_id = self._active, self._page_session_id
         if not active:
-            return {**_fail("supervisor is not active"), "kind": "supervisor_unavailable", "data": {"reason": "inactive"}}
+            return _fail("supervisor is not active")
         if not session_id:
-            return {**_fail("supervisor has no attached page session"), "kind": "supervisor_unavailable", "data": {"reason": "no_page_session"}}
+            return _fail("supervisor has no attached page session")
 
-        def _run_eval(by_value: bool) -> Dict[str, Any]:
+        def _run_eval(by_value: bool) -> dict[str, Any]:
             # userGesture: clipboard / fullscreen APIs need user activation.
             params = {"expression": expression, "returnByValue": by_value,
                       "awaitPromise": await_promise, "userGesture": True}
@@ -297,14 +236,15 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         try:
             response = _run_eval(return_by_value)
         except Exception as exc:
-            if return_by_value and _is_reference_chain_protocol_error(exc):
-                failure = _runtime_failure(exc)
-                return {
-                    "ok": False, "kind": "result_serialization_failed",
-                    "error": "JavaScript executed once, but its result could not be serialized. Return a primitive value, use JSON.stringify(), or inspect the page with a snapshot.",
-                    "data": {**failure.get("data", {}), "expression_executed": True, "replayed": False},
-                }
-            return _runtime_failure(exc)
+            # Deep-serializing live DOM nodes / NodeLists / Window can blow past
+            # CDP's recursion guard (``Object reference chain is too long``).
+            # Retry once with returnByValue=False so Chrome returns the description.
+            if not (return_by_value and "reference chain is too long" in str(exc).lower()):
+                return _err(exc)
+            try:
+                response = _run_eval(False)
+            except Exception as exc2:
+                return _err(exc2)
 
         # Response: {"result": {"result": {"type", "value", ...}, "exceptionDetails"?}}
         result_payload = response.get("result", {}) if isinstance(response, dict) else {}
@@ -312,10 +252,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         if exception_details:
             exc_text = exception_details.get("text") or "JavaScript exception"
             description = (exception_details.get("exception") or {}).get("description")
-            return {
-                **_fail(f"{exc_text}: {description}" if description else exc_text),
-                "kind": "js_exception", "data": {"exception_details": exception_details},
-            }
+            return _fail(f"{exc_text}: {description}" if description else exc_text)
 
         result_obj = result_payload.get("result", {})
         result_type = result_obj.get("type", "undefined")
@@ -328,7 +265,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             value = result_obj.get("description") or result_obj.get("unserializableValue")
         return {"ok": True, "result": value, "result_type": result_type}
 
-    def focus_page(self, origin: str, *, accept: Optional[str] = None, timeout: float = 10.0) -> Dict[str, Any]:
+    def focus_page(self, origin: str, *, accept: Optional[str] = None, timeout: float = 10.0) -> dict[str, Any]:
         """Re-attach the supervisor's page session to an open page target on ``origin``
         (``scheme://host[:port]``). The initial attach picks the FIRST page target, but tools
         that open their own tabs (browser_exec) put the login form somewhere else. With
@@ -346,7 +283,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             await self._install_dialog_bridge(sid)
             return sid
 
-        async def _focus() -> Dict[str, Any]:
+        async def _focus() -> dict[str, Any]:
             from agent.vault_store import normalize_origin
             targets = (await self._cdp("Target.getTargets", timeout=timeout)).get("result", {}).get("targetInfos", [])
             candidates = []
@@ -354,7 +291,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                 url = str(t.get("url") or "")
                 try:
                     # origin="" = any http(s) page (used to FIND the login tab before its origin is known)
-                    if t.get("type") == "page" and (self.target_id is None or t.get("targetId") == self.target_id) and url.startswith(("http://", "https://")) \
+                    if t.get("type") == "page" and url.startswith(("http://", "https://")) \
                             and (not origin or normalize_origin(url) == origin):
                         candidates.append((t["targetId"], url))
                 except Exception:
@@ -386,7 +323,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         try:
             asyncio.set_event_loop(loop)
             loop.run_until_complete(self._run())
-        except BaseException as e:  # noqa: BLE001 — propagate via _start_error
+        except BaseException as e:
             if not self._fail_start(e):
                 logger.warning("CDP supervisor %s crashed: %s", self.task_id, e)
         finally:
@@ -432,7 +369,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
 
     async def _run(self) -> None:
         """Top-level reconnecting supervisor coroutine. Browserbase tears down the CDP
-        socket whenever a short-lived client (agent-browser's per-command CDP client)
+        socket whenever a short-lived client (a per-call browser_cdp or harness CDP connection)
         disconnects, so on drop we reset per-session ids, re-attach, and keep going.
         A failure before the first successful attach is fatal for ``start()``."""
         reconnect_failures, last_success_at, backoff = 0, 0.0, 0.5
@@ -487,6 +424,12 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                     handle.cancel()
                 self._dialog_watchdogs.clear()
                 await self._close_ws()
+                # Replies to calls still in flight died with the socket: fail them now
+                # instead of letting each caller sit out its full timeout.
+                for fut in self._pending_calls.values():
+                    if not fut.done():
+                        fut.set_exception(ConnectionError("CDP connection closed before reply"))
+                self._pending_calls.clear()
 
             if self._stop_requested:
                 return
@@ -497,10 +440,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
     async def _attach_initial_page(self) -> None:
         """Find (or create) a page target, attach flattened, enable domains, install dialog bridge."""
         targets = (await self._cdp("Target.getTargets")).get("result", {}).get("targetInfos", [])
-        page_target = next((t for t in targets if t.get("type") == "page"
-                            and (self.target_id is None or t.get("targetId") == self.target_id)), None)
-        if self.target_id is not None and page_target is None:
-            raise RuntimeError(f"Requested CDP page target is unavailable: {self.target_id}")
+        page_target = next((t for t in targets if t.get("type") == "page"), None)
         if page_target is None:
             page_target = (await self._cdp("Target.createTarget", {"url": "about:blank"}))["result"]
         attach = await self._cdp("Target.attachToTarget", {"targetId": page_target["targetId"], "flatten": True})
@@ -508,13 +448,13 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         await self._enable_page_domains(sid, timeout=10.0)
         await self._install_dialog_bridge(sid)
 
-    async def _cdp(self, method: str, params: Optional[Dict[str, Any]] = None, *,
-                   session_id: Optional[str] = None, timeout: float = 10.0) -> Dict[str, Any]:
+    async def _cdp(self, method: str, params: Optional[dict[str, Any]] = None, *,
+                   session_id: Optional[str] = None, timeout: Optional[float] = 10.0) -> dict[str, Any]:
         """Send a CDP command and await its response."""
         if self._ws is None:
             raise RuntimeError("supervisor WebSocket is not connected")
         call_id, self._next_call_id = self._next_call_id, self._next_call_id + 1
-        payload: Dict[str, Any] = {"id": call_id, "method": method}
+        payload: dict[str, Any] = {"id": call_id, "method": method}
         payload.update({k: v for k, v in (("params", params), ("sessionId", session_id)) if v})
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending_calls[call_id] = fut
@@ -541,7 +481,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                     if fut is None or fut.done():
                         continue
                     if "error" in msg:
-                        fut.set_exception(CDPProtocolError(msg["id"], msg["error"]))
+                        fut.set_exception(RuntimeError(f"CDP error on id={msg['id']}: {msg['error']}"))
                     else:
                         fut.set_result(msg)
                 elif handler := self._EVENT_HANDLERS.get(msg.get("method")):
@@ -553,207 +493,88 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
 
     # CDP event → handler(self, params, session_id). Async handlers return an
     # awaitable that ``_read_loop`` awaits; sync handlers return None.
-    _EVENT_HANDLERS: Dict[str, Callable[..., Any]] = {
+    _EVENT_HANDLERS: dict[str, Callable[..., Any]] = {
         **DialogSupervisionMixin.EVENT_HANDLERS, **FrameTrackingMixin.EVENT_HANDLERS
     }
 
 
 class _SupervisorRegistry:
-    """Process-global (task_id → supervisor) map with idempotent start/stop.
-
-    One instance, exposed as ``SUPERVISOR_REGISTRY``. Safe to call from any
-    thread — mutations go through ``_lock``.
-    """
+    """Process-global (task_id → supervisor) map with idempotent start/stop (``SUPERVISOR_REGISTRY``)."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._by_task: Dict[str, CDPSupervisor] = {}
-        self._generation: Dict[str, int] = {}
-        self._starting: Dict[str, List[CDPSupervisor]] = {}
+        self._by_task: dict[str, CDPSupervisor] = {}
+        self._home_by_task: dict[str, str] = {}  # profile home that started it (``stop_home``)
 
     def get(self, task_id: str) -> Optional[CDPSupervisor]:
-        """Return the supervisor for ``task_id`` if running, else ``None``."""
         with self._lock:
             return self._by_task.get(task_id)
 
-    def get_or_start(
-        self,
-        task_id: str,
-        cdp_url: str,
-        *,
-        target_id: Optional[str] = None,
-        dialog_policy: str = DEFAULT_DIALOG_POLICY,
-        dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S,
-        start_timeout: float = 15.0,
-        publish_guard: Optional[Callable[[], bool]] = None,
-    ) -> CDPSupervisor:
-        """Ensure a supervisor runs for ``(task_id, cdp_url, target_id)``.
+    def _pop(self, task_id: str) -> Optional[CDPSupervisor]:
+        with self._lock:
+            self._home_by_task.pop(task_id, None)
+            return self._by_task.pop(task_id, None)
 
-        If a supervisor exists for this task but was bound to a different
-        ``cdp_url`` or ``target_id``, the old one is stopped and a fresh one
-        is started. An evaluation already in flight on the displaced binding
-        may fail with a structured ``supervisor_unavailable`` or
-        ``cdp_evaluate_failed`` result; it is never replayed on the new target.
-        """
-        supervisor: CDPSupervisor
+    def capture(self, task_id: str, *, timeout: float = 10.0) -> CapturedCDP:
+        """Public CDP seam for trusted in-process plugins: a handle pinned to this task's
+        current connection and default page session (``tools.browser_supervisor_capture``)."""
+        from tools.browser_supervisor_capture import capture
+
+        return capture(self, task_id, timeout=timeout)
+
+    def get_or_start(self, task_id: str, cdp_url: str, *, dialog_policy: str = DEFAULT_DIALOG_POLICY,
+                     dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S, start_timeout: float = 15.0) -> CDPSupervisor:
+        """Idempotently ensure a supervisor runs for ``(task_id, cdp_url)``; one bound to a
+        different ``cdp_url`` or unhealthy (dead thread / stopped loop) is stopped and replaced."""
+        from hermes_constants import hermes_home_key
+        home = hermes_home_key()
         with self._lock:
             existing = self._by_task.get(task_id)
             if existing is not None:
-                if existing.cdp_url == cdp_url and existing.target_id == target_id:
-                    thread_ok = existing._thread is not None and existing._thread.is_alive()
-                    loop_ok = existing._loop is not None and existing._loop.is_running()
-                    guard_ok = publish_guard is None or publish_guard()
-                    if thread_ok and loop_ok and guard_ok:
-                        return existing
-                    # Unhealthy — tear down and recreate.
-                # URL changed or unhealthy — tear down, fall through to re-create.
-            # Construct and register the starter before releasing the same
-            # lock that observed/displaced the old entry. Otherwise stop()
-            # can pass through the gap and a later starter can publish after
-            # that stop already returned.
-            supervisor = CDPSupervisor(
-                task_id=task_id,
-                cdp_url=cdp_url,
-                target_id=target_id,
-                dialog_policy=dialog_policy,
-                dialog_timeout_s=dialog_timeout_s,
-            )
-            self._by_task.pop(task_id, None)
-            start_generation = self._generation.get(task_id, 0)
-            self._starting.setdefault(task_id, []).append(supervisor)
+                thread, loop = existing._thread, existing._loop
+                healthy = thread is not None and thread.is_alive() and loop is not None and loop.is_running()
+                if existing.cdp_url == cdp_url and healthy:
+                    return existing
+                self._by_task.pop(task_id, None)
+        if existing is not None:
+            existing.stop()
 
-        try:
-            if existing is not None:
-                existing.stop()
-            supervisor.start(timeout=start_timeout)
-        except BaseException:
-            with self._lock:
-                starters = self._starting.get(task_id, [])
-                if supervisor in starters:
-                    starters.remove(supervisor)
-                if not starters:
-                    self._starting.pop(task_id, None)
-            supervisor.stop()
-            raise
-
-        duplicate: Optional[CDPSupervisor] = None
-        displaced: Optional[CDPSupervisor] = None
-        stale_start = False
+        supervisor = CDPSupervisor(task_id=task_id, cdp_url=cdp_url,
+                                   dialog_policy=dialog_policy, dialog_timeout_s=dialog_timeout_s)
+        supervisor.start(timeout=start_timeout)
         with self._lock:
-            starters = self._starting.get(task_id, [])
-            if supervisor in starters:
-                starters.remove(supervisor)
-            if not starters:
-                self._starting.pop(task_id, None)
-
-            stale_start = self._generation.get(task_id, 0) != start_generation
-            if not stale_start and publish_guard is not None:
-                stale_start = not publish_guard()
-
             # Guard against a concurrent get_or_start from another thread.
             already = self._by_task.get(task_id)
-            if stale_start:
-                pass
-            elif (
-                already is not None
-                and already.cdp_url == cdp_url
-                and already.target_id == target_id
-            ):
-                duplicate = already
-            else:
-                displaced = already
-                self._by_task[task_id] = supervisor
-
-        # Never block in stop() while holding the registry lock. With different
-        # targets racing for one task, the last publisher owns the registry and
-        # explicitly stops the instance it displaced; no untracked supervisor
-        # remains live.
-        if stale_start:
-            supervisor.stop()
-            return supervisor
-        if duplicate is not None:
-            supervisor.stop()
-            return duplicate
-        if displaced is not None:
-            displaced.stop()
+            if already is not None and already.cdp_url == cdp_url:
+                supervisor.stop()
+                return already
+            self._by_task[task_id] = supervisor
+            self._home_by_task[task_id] = home
         return supervisor
 
     def stop(self, task_id: str) -> None:
-        """Fence, stop, and discard published or in-flight supervisors."""
+        supervisor = self._pop(task_id)
+        if supervisor is not None:
+            supervisor.stop()
+
+    def stop_home(self, home_key: str) -> None:
+        """Stop the supervisors one profile home started (``/browser connect`` on a multiplexed gateway)."""
         with self._lock:
-            self._generation[task_id] = self._generation.get(task_id, 0) + 1
-            supervisor = self._by_task.pop(task_id, None)
-            starters = list(self._starting.get(task_id, ()))
-        to_stop = ([supervisor] if supervisor is not None else []) + starters
-        seen: set[int] = set()
-        for item in to_stop:
-            if id(item) in seen:
-                continue
-            seen.add(id(item))
-            item.stop()
+            tasks = [task for task, home in self._home_by_task.items() if home == home_key]
+        for task_id in tasks:
+            self.stop(task_id)
 
     def stop_all(self) -> None:
         """Stop every running supervisor. For shutdown / test teardown."""
         with self._lock:
-            items = list(self._by_task.items())
+            items = list(self._by_task.values())
             self._by_task.clear()
-            starters = [
-                (task_id, supervisor)
-                for task_id, supervisors in self._starting.items()
-                for supervisor in supervisors
-            ]
-            for task_id in set(self._generation) | set(self._starting) | {
-                task_id for task_id, _ in items
-            }:
-                self._generation[task_id] = self._generation.get(task_id, 0) + 1
-        seen: set[int] = set()
-        for _, supervisor in items + starters:
-            if id(supervisor) in seen:
-                continue
-            seen.add(id(supervisor))
+            self._home_by_task.clear()
+        for supervisor in items:
             supervisor.stop()
 
 
 SUPERVISOR_REGISTRY = _SupervisorRegistry()
 
 
-__all__ = ["CDPSupervisor", "CDPProtocolError", "SUPERVISOR_REGISTRY", "SupervisorSnapshot", "_SupervisorRegistry"]
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-
-CONSOLE_HISTORY_MAX = 50
-
-@dataclass
-class ConsoleEvent:
-    """Ring buffer entry for console + exception traffic."""
-
-    ts: float
-    level: str  # "log" | "error" | "warning" | "exception"
-    text: str
-    url: Optional[str] = None
-
-
-_PLUGIN_COMPAT_LAZY = {
-    'DIALOG_BRIDGE_HOST': ('tools.browser_supervisor_dialogs', 'DIALOG_BRIDGE_HOST'),
-    'DIALOG_BRIDGE_URL_PATTERN': ('tools.browser_supervisor_dialogs', 'DIALOG_BRIDGE_URL_PATTERN'),
-    'DIALOG_POLICY_AUTO_ACCEPT': ('tools.browser_supervisor_dialogs', 'DIALOG_POLICY_AUTO_ACCEPT'),
-    'DIALOG_POLICY_AUTO_DISMISS': ('tools.browser_supervisor_dialogs', 'DIALOG_POLICY_AUTO_DISMISS'),
-    'DIALOG_POLICY_MUST_RESPOND': ('tools.browser_supervisor_dialogs', 'DIALOG_POLICY_MUST_RESPOND'),
-    'FRAME_TREE_MAX_ENTRIES': ('tools.browser_supervisor_frames', 'FRAME_TREE_MAX_ENTRIES'),
-    'FRAME_TREE_MAX_OOPIF_DEPTH': ('tools.browser_supervisor_frames', 'FRAME_TREE_MAX_OOPIF_DEPTH'),
-}
-
-
-def __getattr__(name):  # PEP 562 — lazy so no import cycles
-    target = _PLUGIN_COMPAT_LAZY.get(name)
-    if target is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    import importlib
-    from hermes_cli.plugin_compat import warn_once
-    warn_once(__name__, name, *target)
-    return getattr(importlib.import_module(target[0]), target[1])
-# ---- END PLUGIN-COMPAT ----
+__all__ = ["SUPERVISOR_REGISTRY", "CDPSupervisor", "SupervisorSnapshot", "_SupervisorRegistry"]

@@ -7,7 +7,6 @@ rescue-served response, or the one-shot rescue becomes sticky for a whole TTL. L
 """
 
 import logging
-from plugins.web.keyless_mcp import web_is_interrupted, is_extract_refusal, interrupted_extract_results
 
 logger = logging.getLogger("tools.web_tools")
 
@@ -26,69 +25,90 @@ def _keyless_rescue_enabled() -> bool:
     try:
         from agent.web_search_registry import _keyless_tier_enabled
         return _keyless_tier_enabled()
-    except Exception as exc:  # noqa: BLE001 — registry optional
+    except Exception as exc:
         logger.debug("keyless rescue tier check failed: %s", exc)
         return False
+
+
+def _ring_vendor_keyless(name: str) -> bool:
+    """Did *name*'s own provider route this call through the anonymous keyless ring?
+
+    Mirrors the predicate each ring provider evaluates before calling, so eligibility reflects what
+    actually happened. Firecrawl owns extra routes that bypass the ring without a key — the managed
+    Nous Tool Gateway (persisted ``nous`` selection, or the legacy never-configured fallback when the
+    gateway is ready) and a self-hosted ``FIRECRAWL_API_URL`` — so it is asked directly.
+    """
+    if name == "firecrawl":
+        from plugins.web.firecrawl.provider import _use_keyless_ring
+        return _use_keyless_ring()
+    from agent.web_search_provider import get_provider_env
+    from plugins.web.keyless_mcp import use_keyless
+    key_var = _RING_KEY_VARS.get(name, "")
+    return use_keyless(name, get_provider_env(key_var) if key_var else "")
+
+
+def _managed_search_fallback(provider, original_error: str, query: str, limit: int):
+    """Try managed Firecrawl for this call only; None leaves the original error for keyless rescue.
+    Managed Firecrawl is billed, so a caller on free fast search alone never reaches it."""
+    from agent.web_search_provider import get_provider_env
+    from tools import web_tools as _wt
+    if (getattr(provider, "name", "") != "perplexity"
+            or get_provider_env("PERPLEXITY_API_KEY") or not _wt._managed_web_search() or not _wt._is_tool_gateway_ready()):
+        return None
+    logger.warning("web_search managed Perplexity failed (%s); serving this call from managed Firecrawl", (original_error or "")[:200])
+    try:
+        from agent.web_search_registry import get_provider
+        resp = get_provider("firecrawl").search(query, limit)
+    except Exception as exc:
+        resp = {"success": False, "error": str(exc)}
+    if not resp.get("success"):
+        logger.warning("managed Firecrawl fallback failed too: %s", str(resp.get("error", ""))[:200])
+        return None
+    resp.setdefault("data", {}).update(
+        fallback_from="managed_primary",
+        backend_error=f"Primary managed search failed this call ({(original_error or 'unknown error')[:300]}); "
+                      "result served by the managed fallback. The next call will use the primary again.",
+    )
+    return resp
 
 
 def _rescue_eligible(provider) -> bool:
     """True when a failed call on *provider* should get a one-shot rescue.
 
-    Eligible: a keyed/configured path — any non-ring backend, or a ring vendor in keyed mode. A ring
-    vendor already in keyless mode is NOT eligible: its failure means the ring was already walked.
+    Eligible: any call that did NOT go through the keyless ring — a non-ring backend, a ring vendor
+    in keyed mode, or a ring vendor routed through the managed gateway / a self-hosted instance. A
+    ring vendor that walked the ring is NOT eligible: its failure means the ring already failed.
     """
-    if web_is_interrupted() or not _keyless_rescue_enabled() or provider is None:
+    if not _keyless_rescue_enabled() or provider is None:
         return False
     try:
-        from plugins.web.keyless_mcp import _KEYLESS_RING, use_keyless
+        from plugins.web.keyless_mcp import _KEYLESS_RING
         name = getattr(provider, "name", "")
-        if name not in _KEYLESS_RING:
-            return True
-        from agent.web_search_provider import get_provider_env
-        if name == "firecrawl" and get_provider_env("FIRECRAWL_API_URL"):
-            return True
-        key_var = _RING_KEY_VARS.get(name, "")
-        return not use_keyless(name, get_provider_env(key_var) if key_var else "")
-    except Exception as exc:  # noqa: BLE001 — rescue is best-effort
+        return name not in _KEYLESS_RING or not _ring_vendor_keyless(name)
+    except Exception as exc:
         logger.debug("rescue eligibility check failed: %s", exc)
         return False
 
 
 def _rescue_search(provider_name: str, original_error: str, query: str, limit: int) -> dict:
-    """One-shot keyless-ring rescue for a failed keyed/configured search.
-
-    Stateless by design: this call alone routes to the free-tier ring; the
-    NEXT web_search call attempts the chosen backend again. The result is
-    annotated with the original backend failure so the model (and the
-    user) can see the configured backend needs attention.
-    """
+    """Rescue a failed search via the ring; annotate the result with the original failure."""
     from plugins.web.keyless_mcp import search_with_failover
-
-    if web_is_interrupted() or is_extract_refusal({"error": original_error}):
-        return {"success": False, "error": "Interrupted" if web_is_interrupted() else original_error}
-
     logger.warning(
         "web_search backend '%s' failed (%s); one-shot keyless rescue",
         provider_name, (original_error or "")[:200],
     )
     rescued = search_with_failover(provider_name, query, limit)
-    if web_is_interrupted() or is_extract_refusal(rescued):
-        return {
-            "success": False,
-            "error": "Interrupted" if web_is_interrupted() else rescued.get("error", "Request refused"),
-        }
     if rescued.get("success"):
-        data = rescued.setdefault("data", {})
-        data["rescued_from"] = provider_name
-        data["backend_error"] = (
-            f"Configured backend '{provider_name}' failed this call "
-            f"({(original_error or 'unknown error')[:300]}); result served "
-            "by the keyless free tier. The next call will use "
-            f"'{provider_name}' again."
+        rescued.setdefault("data", {}).update(
+            rescued_from=provider_name,
+            backend_error=(
+                f"Configured backend '{provider_name}' failed this call "
+                f"({(original_error or 'unknown error')[:300]}); result served by the keyless free tier. "
+                f"The next call will use '{provider_name}' again."
+            ),
         )
         return rescued
-    # Ring also failed: surface the ORIGINAL backend error (it names the
-    # user's configured setup) with the rescue note appended.
+    # Ring also failed: the ORIGINAL error names the user's setup, so lead with it.
     return {
         "success": False,
         "error": (
@@ -105,109 +125,35 @@ def _policy_blocked_result(result: dict) -> bool:
 
 
 def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
-    """One-shot keyless-ring rescue for a failed keyed/configured extract.
+    """Rescue a whole-batch extract failure via the ring.
 
-    Fires only when EVERY url failed (whole-backend failure); partial
-    results are page problems and pass through untouched. Stateless —
-    the next web_extract call attempts the chosen backend again.
-
-    Cancellation, website-policy and security refusals are intentional, not
-    outages. They are never re-fetched, and completed pages are preserved.
+    Only genuine failures are re-fetched; policy-blocked entries are preserved verbatim. If the provider
+    broke url/result order parity, every entry is treated as rescueable and the ring's list replaces the
+    batch wholesale.
     """
-    from plugins.web.keyless_mcp import ExtractFailoverResults, extract_with_failover
-    from tools.web_tools_extract import _reconcile_extract_results, _extract_url_identity
+    from plugins.web.keyless_mcp import extract_with_failover
 
-    aligned, original_by_identity, mapping_valid = _reconcile_extract_results(
-        urls, results
-    )
-    if not mapping_valid:
-        # An invalid provider mapping is an integrity failure, not an outage.
-        # Never route it elsewhere and risk accepting content for the wrong URL.
-        return aligned
+    parity = len(results) == len(urls)
+    rescue_idx = [i for i, r in enumerate(results) if not parity or not _policy_blocked_result(r)]
+    if not rescue_idx:
+        return results  # every failure is an intentional policy block
 
-    if web_is_interrupted():
-        return ExtractFailoverResults(interrupted_extract_results(urls, aligned))
-    if any(
-        result.get("interrupted")
-        or "interrupted" in str(result.get("error") or "").lower()
-        for result in aligned
-    ):
-        # A provider may observe cancellation before the originating thread's
-        # bit is visible here. Its explicit stop still ends the whole batch.
-        return ExtractFailoverResults(aligned)
-
-    # Partition by canonical request identity. Rescue only genuine backend
-    # failures; website-policy refusals remain untouched.
-    rescue_urls = [
-        url
-        for url in urls
-        if original_by_identity[_extract_url_identity(url)].get("error")
-        and not is_extract_refusal(
-            original_by_identity[_extract_url_identity(url)]
-        )
-    ]
-    if not rescue_urls:
-        # Every failure is an intentional policy block.  Preserve the list
-        # contract while explicitly recording that no fallback call occurred.
-        return ExtractFailoverResults(
-            aligned,
-            fallback_attempted=False,
-            fallback_used=False,
-        )
-
-    original_error = next(
-        (
-            original_by_identity[_extract_url_identity(url)].get("error")
-            for url in rescue_urls
-            if original_by_identity[_extract_url_identity(url)].get("error")
-        ),
-        "extract failed",
-    )
+    rescue_urls = [urls[i] for i in rescue_idx] if parity else list(urls)
+    errors = (results[i].get("error") for i in rescue_idx if results[i].get("error"))
+    original_error = next(errors, "extract failed")
     logger.warning(
         "web_extract backend '%s' failed all %d URL(s) (%s); one-shot keyless rescue",
         provider_name, len(rescue_urls), (original_error or "")[:200],
     )
-    rescued_raw = extract_with_failover(provider_name, list(rescue_urls))
-    rescued, rescued_by_identity, rescue_mapping_valid = (
-        _reconcile_extract_results(rescue_urls, rescued_raw)
-    )
-    if not rescue_mapping_valid:
-        merged_by_identity = dict(original_by_identity)
-        merged_by_identity.update(rescued_by_identity)
-        merged = [
-            merged_by_identity[_extract_url_identity(url)] for url in urls
-        ]
-        return ExtractFailoverResults(
-            merged,
-            fallback_attempted=True,
-            fallback_used=False,
-        )
-    rescued_errors = [r.get("error", "") for r in rescued]
-    if rescued and all(e for e in rescued_errors):
-        # Rescue was genuinely attempted but failed everywhere. Keep the
-        # selected provider's errors, except that a later refusal must survive.
-        preserved = dict(original_by_identity)
-        preserved.update({
-            identity: row for identity, row in rescued_by_identity.items()
-            if is_extract_refusal(row)
-        })
-        return ExtractFailoverResults(
-            [preserved[_extract_url_identity(url)] for url in urls],
-            fallback_attempted=True,
-            fallback_used=False,
-        )
-    fallback_used = any(not r.get("error") for r in rescued)
+    rescued = extract_with_failover(provider_name, list(rescue_urls))
+    if rescued and all(r.get("error", "") for r in rescued):
+        return results  # rescue also failed everywhere: keep original errors
     for r in rescued:
-        if not r.get("error"):
-            meta = r.setdefault("metadata", {})
-            if isinstance(meta, dict):
-                meta["rescued_from"] = provider_name
-                meta["backend_error"] = (original_error or "")[:300]
-    merged_by_identity = dict(original_by_identity)
-    merged_by_identity.update(rescued_by_identity)
-    merged = [merged_by_identity[_extract_url_identity(url)] for url in urls]
-    return ExtractFailoverResults(
-        merged,
-        fallback_attempted=True,
-        fallback_used=fallback_used,
-    )
+        meta = None if r.get("error") else r.setdefault("metadata", {})
+        if isinstance(meta, dict):
+            meta["rescued_from"] = provider_name
+            meta["backend_error"] = (original_error or "")[:300]
+    if parity and len(rescued) == len(rescue_idx):
+        replacements = dict(zip(rescue_idx, rescued))
+        return [replacements.get(i, r) for i, r in enumerate(results)]
+    return rescued
