@@ -227,6 +227,7 @@ class TestDoctorEnvFileEncoding:
         )
 
         monkeypatch.setattr(doctor_mod, "HERMES_HOME", hermes_home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path)
 
         orig_read_text = pathlib.Path.read_text
 
@@ -269,6 +270,7 @@ class TestDoctorEnvFileEncoding:
         env_path.write_bytes(b"OPENAI_API_KEY=sk-test\xff\n")
 
         monkeypatch.setattr(doctor_mod, "HERMES_HOME", hermes_home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path)
 
         fake_model_tools = types.SimpleNamespace(
             check_tool_availability=lambda *a, **kw: (_ for _ in ()).throw(SystemExit(0)),
@@ -310,6 +312,7 @@ class TestDoctorToolAvailabilityOverrides:
 
 
 def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path):
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path)
     monkeypatch.setenv("TERMINAL_ENV", "vercel_sandbox")
     monkeypatch.setenv("TERMINAL_VERCEL_RUNTIME", "python3.13")
     monkeypatch.setenv("TERMINAL_CONTAINER_DISK", "2048")
@@ -368,7 +371,7 @@ class TestDoctorMemoryProviderSection:
             (memories / "MEMORY.md").write_text("stale memory", encoding="utf-8")
             (memories / "USER.md").write_text("stale user", encoding="utf-8")
         monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
-        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(doctor_mod, "_DHH", str(home))
         (tmp_path / "project").mkdir(exist_ok=True)
 
@@ -473,7 +476,7 @@ def test_run_doctor_accepts_named_provider_from_providers_section(monkeypatch, t
     , encoding="utf-8")
 
     monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
-    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(doctor_mod, "_DHH", str(home))
     (tmp_path / "project").mkdir(exist_ok=True)
 
@@ -517,7 +520,7 @@ def test_run_doctor_accepts_stable_key_when_provider_name_differs(
     )
 
     monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
-    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(doctor_mod, "_DHH", str(home))
     (tmp_path / "project").mkdir(exist_ok=True)
 
@@ -559,7 +562,7 @@ def test_run_doctor_accepts_bare_custom_provider(monkeypatch, tmp_path):
     )
 
     monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
-    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(doctor_mod, "_DHH", str(home))
     (tmp_path / "project").mkdir(exist_ok=True)
 
@@ -596,7 +599,7 @@ def test_run_doctor_flags_missing_credentials_for_active_openrouter_provider(mon
     )
 
     monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
-    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(doctor_mod, "_DHH", str(home))
     (tmp_path / "project").mkdir(exist_ok=True)
 
@@ -650,7 +653,7 @@ def test_run_doctor_accepts_hermes_provider_ids_that_catalog_aliases(
     )
 
     monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
-    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(doctor_mod, "_DHH", str(home))
     (tmp_path / "project").mkdir(exist_ok=True)
 
@@ -697,7 +700,7 @@ def test_run_doctor_accepts_vendor_slugs_for_named_custom_provider(monkeypatch, 
     )
 
     monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
-    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(doctor_mod, "_DHH", str(home))
     (tmp_path / "project").mkdir(exist_ok=True)
 
@@ -753,7 +756,7 @@ def test_run_doctor_vendor_slug_policy_for_openai_api_endpoint(
     )
 
     monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
-    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(doctor_mod, "_DHH", str(home))
     (tmp_path / "project").mkdir(exist_ok=True)
 
@@ -796,7 +799,7 @@ def test_run_doctor_accepts_kimi_coding_cn_provider(monkeypatch, tmp_path):
     )
 
     monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
-    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(doctor_mod, "_DHH", str(home))
     (tmp_path / "project").mkdir(exist_ok=True)
 
@@ -1354,6 +1357,7 @@ class TestDoctorStaleMaxIterationsDrift:
         (hermes_home / ".env").write_text("".join(env_lines), encoding="utf-8")
 
         monkeypatch.setattr(doctor_mod, "HERMES_HOME", hermes_home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(doctor_mod, "get_hermes_home", lambda: hermes_home)
         # Point the config helpers at the temp home.
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))

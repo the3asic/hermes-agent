@@ -1356,6 +1356,18 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         try:
             agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
             persist_msg, persist_ts = self._prepare_turn_message(agent_history)
+            # Cached agents accumulate usage; only this loop's deltas belong to the turn.
+            usage_baseline = {
+                arg: getattr(agent, counter, 0) or 0 for arg, counter in (
+                    ("uncached_input_tokens_start", "session_input_tokens"),
+                    ("completion_tokens_start", "session_completion_tokens"),
+                    ("cache_read_tokens_start", "session_cache_read_tokens"),
+                    ("cache_write_tokens_start", "session_cache_write_tokens"),
+                    ("usage_report_calls_start", "session_usage_report_calls"),
+                    ("cache_usage_report_calls_start", "session_cache_usage_report_calls"),
+                    ("context_usage_report_calls_start", "session_context_usage_report_calls"),
+                )
+            }
             compressions = getattr(getattr(agent, "context_compressor", None), "compression_count", None)
             from gateway.session_cli_turn import run_classic_cli_turn
             from gateway.session_secret_prompt import secret_prompt_scope
@@ -1372,18 +1384,6 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 publish_usage(self, agent, record=True)  # turn end: the final API call's counters
                 from gateway.session_local_inventory import publish_settled_info
                 publish_settled_info(self, agent)
-        # Cached agents accumulate usage; only this loop's deltas belong to the turn.
-        usage_baseline = {
-            arg: getattr(agent, counter, 0) or 0 for arg, counter in (
-                ("uncached_input_tokens_start", "session_input_tokens"),
-                ("completion_tokens_start", "session_completion_tokens"),
-                ("cache_read_tokens_start", "session_cache_read_tokens"),
-                ("cache_write_tokens_start", "session_cache_write_tokens"),
-                ("usage_report_calls_start", "session_usage_report_calls"),
-                ("cache_usage_report_calls_start", "session_cache_usage_report_calls"),
-                ("context_usage_report_calls_start", "session_context_usage_report_calls"),
-            )
-        }
         persisted_turn = _persisted_turn(agent, agent_history, result, compressions)
         self._finish_stream_consumer(result, agent_history, stream_consumer)
         if _finite_viewer_turn() and getattr(agent, "_codex_session", None) is not None:

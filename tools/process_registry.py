@@ -35,6 +35,7 @@ from hermes_cli.config import get_hermes_home
 from tools.process_registry_notifications import (
     format_process_notification, heartbeat_output_tail, is_child_process_notification, should_surface_notification)
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
+from tools.process_registry_observability import ProcessObservabilityMixin
 from tools.process_registry_output_log import ProcessOutputLogMixin, open_output_log, record_exit_command, worker_output_log
 from tools.process_registry_ownership import ProcessOwnershipMixin
 from tools.process_registry_termination import ProcessTerminationMixin
@@ -562,6 +563,9 @@ class ProcessSession:
     termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
     output_buffer: str = ""                     # Rolling tail (last max_output_chars)
     max_output_chars: int = MAX_OUTPUT_CHARS
+    ended_at: Optional[float] = None            # time.time() of terminal transition (observability)
+    last_output_at: Optional[float] = None      # None means no live output observation yet
+    output_history_available: Optional[bool] = True  # None after checkpoint recovery (history lost)
     detached: bool = False                      # Recovered from checkpoint (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run
@@ -643,6 +647,7 @@ class ProcessSession:
         """Record an exit. A kill that raced the observer already recorded its own
         exit_code/reason; never overwrite it."""
         self.exited = True
+        self.ended_at = self.ended_at or time.time()
         if self.completion_reason != "killed":
             self.exit_code = exit_code
             self.completion_reason = reason
@@ -674,7 +679,8 @@ _WSL_CHAIN_NOTE = (
 )
 
 
-class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOutputLogMixin, ProcessOwnershipMixin):
+class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOutputLogMixin, ProcessOwnershipMixin,
+                      ProcessObservabilityMixin):
     """In-memory registry of running and finished background processes.
     Thread-safe: accessed from executor threads (terminal_tool, process handlers),
     the gateway asyncio loop (watchers, reset checks) and the cleanup thread."""
@@ -690,6 +696,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         self._running: dict[str, ProcessSession] = {}
         self._finished: dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
+        self._init_observability()
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: list[dict[str, Any]] = []
         # Unified queue for all background events (distinguished by "type"); the CLI
@@ -1026,12 +1033,14 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             if session.exited:
                 return
             session.exited = True
+            session.ended_at = session.ended_at or time.time()
         with self._lock:
             if session.id in self._running:
                 session.exited_at = time.time()
                 self._running.pop(session.id, None)
             self._finished[session.id] = session
         self._write_checkpoint()
+        self._write_observability_snapshot()
         session._completion_event.set()
 
     def _prune_uncollected_detached(self, session: ProcessSession) -> Optional[ProcessSession]:
@@ -1042,6 +1051,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         """
         with session._lock:
             session.exited = True
+            session.ended_at = session.ended_at or time.time()
         with self._lock:
             self._running.pop(session.id, None)
             if session.systemd_unit:
@@ -1049,6 +1059,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             else:
                 self._finished.pop(session.id, None)
         self._write_checkpoint()
+        self._write_observability_snapshot()
         session._completion_event.set()
         return session if session.systemd_unit else None
 
@@ -1151,6 +1162,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             reader.start()
             self._running[session.id] = session
         self._write_checkpoint()
+        self._write_observability_snapshot()
 
     def _spawn_local_pty(self, session: ProcessSession, safe_command: str, env_vars: dict) -> ProcessSession:
         """PTY spawn for interactive CLI tools (Codex, Claude Code, REPLs).
@@ -1162,6 +1174,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             from ptyprocess import PtyProcess as _PtyProcessCls
         pty_argv = self._scope_argv(session, safe_command, session.id, "PTY")
         pty_env = self._spawn_env(env_vars)
+        # Opaque join key for a cooperating remote observer (see observability snapshot).
+        pty_env["HERMES_PROCESS_ID"] = session.id
         if session.systemd_unit:
             pty_env = systemd_user_bus_env(pty_env)
         # A PTY is a real TTY, so pager-happy tools (git log/diff, man) WILL page and
@@ -1216,6 +1230,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         spawn_argv = self._scope_argv(session, record_exit_command(log, safe_command) if log else safe_command,
                                       unit_suffix, "Local")
         spawn_env = self._spawn_env(env_vars)
+        # Opaque join key for a cooperating remote observer (see observability snapshot).
+        spawn_env["HERMES_PROCESS_ID"] = session.id
         if session.systemd_unit:
             spawn_env = systemd_user_bus_env(spawn_env)
         # start_new_session is REQUIRED with systemd-run --scope too: the scope does not
@@ -1260,6 +1276,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         self._take_handoff_group(session, proc)
         if output_so_far:
             session.append_output(output_so_far)
+            self._record_output_observation(session, output_so_far)
         try:
             self._track_started(session, self._reader_loop, f"proc-reader-{session.id}")
         except Exception:
@@ -1281,21 +1298,39 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         temp_dir = self._env_temp_dir(env)
         log_path, pid_path, exit_path = (f"{temp_dir}/hermes_bg_{session.id}.{ext}" for ext in ("log", "pid", "exit"))
         q = shlex.quote
+        # The public session.command stays the raw command; only the remote wire
+        # command carries the opaque join key for a cooperating observer.
+        remote_command = f"export HERMES_PROCESS_ID={q(session.id)}; {command}"
         bg_command = (
             f"mkdir -p {q(temp_dir)} && "
-            f"( nohup bash -lc {q(command)} > {q(log_path)} 2>&1; "
+            f"( nohup bash -lc {q(remote_command)} > {q(log_path)} 2>&1; "
             f"rc=$?; printf '%s\\n' \"$rc\" > {q(exit_path)} ) & "
             f"echo $! > {q(pid_path)} && cat {q(pid_path)}")
-        result = env.execute(bg_command, cwd=cwd or "", timeout=timeout, rewrite_compound_background=False)
-        output = result.get("output", "").strip()
-        session.pid = next((int(ln) for ln in map(str.strip, output.splitlines()) if ln.isdigit()), None)
-        # No PID from the wrapper (no bash in the image, sandbox gone, broken redirect): the
-        # command never started, so raise like a failed Popen instead of returning a session.
-        if session.pid is None:
-            raise RuntimeError(f"launch wrapper exited {result.get('returncode')} without a PID: "
-                               f"{output or '(no output)'}")
-        self._track_started(
-            session, self._env_poller_loop, f"proc-poller-{session.id}", (env, log_path, pid_path, exit_path))
+        try:
+            result = env.execute(bg_command, cwd=cwd or "", timeout=timeout, rewrite_compound_background=False)
+            output = result.get("output", "").strip()
+            session.pid = next((int(ln) for ln in map(str.strip, output.splitlines()) if ln.isdigit()), None)
+            # No PID from the wrapper (no bash in the image, sandbox gone, broken redirect):
+            # a failed launch, not a fake running session.
+            if session.pid is None:
+                session.mark_exited(int(result.get("returncode", -1)) or -1, "failed_start", "failed_start")
+                session.output_buffer = output
+        except Exception as e:
+            session.mark_exited(-1, "failed_start", "failed_start")
+            session.output_buffer = f"Failed to start: {e}"
+        if session.exited:
+            # A failed launch is still a real terminal lifecycle event. Retain it in
+            # _finished so the observability snapshot (and get/poll) keeps the record.
+            if session.output_buffer:
+                session.last_output_at = time.time()
+            with self._lock:
+                self._prune_if_needed()
+                self._finished[session.id] = session
+            session._completion_event.set()
+            self._write_observability_snapshot()
+        else:
+            self._track_started(
+                session, self._env_poller_loop, f"proc-poller-{session.id}", (env, log_path, pid_path, exit_path))
         return session
 
     # ----- Reader / Poller Threads -----
@@ -1454,6 +1489,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                         session.output_buffer += delta
                         if len(session.output_buffer) > session.max_output_chars:
                             session.output_buffer = session.output_buffer[-session.max_output_chars:]
+                    self._record_output_observation(session, delta)
                     self._check_watch_patterns(session, delta)
                     self._emit_output(session, delta)
 
@@ -1536,6 +1572,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             session.append_output(text)
         elif not session.append_output_if_running(text):
             return
+        self._record_output_observation(session, text)
         self._check_watch_patterns(session, text)
         self._emit_output(session, text)
 
@@ -1552,6 +1589,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         Idempotent: kill_process() and the reader thread can both call this; only
         the FIRST move enqueues the completion notification, so no duplicates.
         Returns True when this call is the one that persisted the session."""
+        with session._lock:
+            session.ended_at = session.ended_at or time.time()
         with self._lock:
             was_running = session.id in self._running
             if was_running:
@@ -1584,6 +1623,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
     def _publish_finished(self, session: ProcessSession, was_running: bool) -> None:
         self._release_finished_handles(session)
         self._write_checkpoint()
+        self._write_observability_snapshot()
         if was_running and session.notify_on_complete:
             notification = {
                 "type": "completion",
@@ -1622,9 +1662,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         """
         proc = session.process
         if proc is not None:
-            for stream in (proc.stdout, proc.stderr, proc.stdin):
+            # getattr per stream: mocked/alternate process handles may expose
+            # only some of the standard streams, or stand-ins without close().
+            for stream in (getattr(proc, name, None) for name in ("stdout", "stderr", "stdin")):
                 if stream is not None:
-                    with suppress(OSError, ValueError):  # a stdin flush can hit EPIPE
+                    with suppress(OSError, ValueError, AttributeError):  # stdin flush can hit EPIPE
                         stream.close()
         if session._pty is not None:
             # A live ptyprocess reader sits in a blocking read holding the PTY file
@@ -1970,7 +2012,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                     with suppress(BlockingIOError, OSError, ValueError):
                         chunk = stdout.read()
                         if chunk:
-                            session.append_output(chunk if isinstance(chunk, str) else chunk.decode("utf-8", errors="replace"))
+                            drained = chunk if isinstance(chunk, str) else chunk.decode("utf-8", errors="replace")
+                            session.append_output(drained)
+                            self._record_output_observation(session, drained)
                 finally:
                     with suppress(Exception):
                         fcntl.fcntl(fd, fcntl.F_SETFL, flags)
@@ -1999,6 +2043,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         with session._lock:
             output_preview = _output_tail(session, 1000)
             exited, finalizing = session.exited, self._reader_finalizing(session)
+            if not session.detached:
+                session.output_history_available = True
         result = {
             **self._status_head(session), "pid": session.pid,
             "uptime_seconds": int(time.time() - session.started_at), "output_preview": output_preview}
@@ -2024,6 +2070,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         with session._lock:
             full_output = strip_ansi(session.output_buffer)
             exited, finalizing = session.exited, self._reader_finalizing(session)
+            if not session.detached:
+                session.output_history_available = True
         lines = full_output.splitlines()
         total_lines = len(lines)
         # An explicit offset=0 means "start from the first line" — previously it was conflated with the

@@ -165,7 +165,8 @@ async def test_compress_command_filters_and_applies_fallback_reasoning_policy():
 
 
 @pytest.mark.asyncio
-async def test_compress_command_surfaces_aux_model_failure_even_when_recovered():
+@pytest.mark.parametrize("warning_notifications", [True, False])
+async def test_compress_command_surfaces_aux_model_failure_even_when_recovered(tmp_path, monkeypatch, warning_notifications):
     """When the user's configured ``auxiliary.compression.model`` errors out
     but compression recovers by retrying on the main model, /compress must
     STILL inform the user.  Silent recovery hides broken config the user

@@ -110,20 +110,29 @@ def _agent_stale_thinking_on_wire(agent: Any) -> bool:
         return True
 
 
+def compose_multimodal_context_part(
+    ext_prefetch_cache: str, plugin_user_context: str,
+) -> Optional[str]:
+    """The ephemeral context of one turn (memory prefetch + ``pre_llm_call``) as one text
+    block; ``None`` when nothing is injected. The string sidecar appends it to ``content``;
+    a multimodal (list) turn carries it as a durable text part (#71998)."""
+    fenced = build_memory_context_block(ext_prefetch_cache) if ext_prefetch_cache else ""
+    injections = [part for part in (fenced, plugin_user_context) if part]
+    return "\n\n".join(injections) if injections else None
+
+
 def compose_user_api_content(
     content: Any, ext_prefetch_cache: str, plugin_user_context: str
 ) -> Optional[str]:
-    """Compose the API-bound content of the current turn's user message.
+    """Compose the API-bound content of the current turn's string user message.
 
     Single source for the ``api_content`` sidecar and the wire bytes so they never drift
-    (what turn N sends is what turn N+1 replays). ``None`` when nothing is injected."""
+    (what turn N sends is what turn N+1 replays). ``None`` when nothing is injected or the
+    content is not a string (list content takes the text-part path)."""
     if not isinstance(content, str):
         return None
-    fenced = build_memory_context_block(ext_prefetch_cache) if ext_prefetch_cache else ""
-    injections = [part for part in (fenced, plugin_user_context) if part]
-    if not injections:
-        return None
-    return content + "\n\n" + "\n\n".join(injections)
+    injection = compose_multimodal_context_part(ext_prefetch_cache, plugin_user_context)
+    return None if injection is None else content + "\n\n" + injection
 
 
 def substitute_api_content(api_msg: dict[str, Any]) -> Optional[str]:
@@ -206,9 +215,13 @@ def _maybe_title_session_at_turn_start(
 
         # Turn's user message as text; image-only turns yield "" and are skipped.
         user_text = ""
+        title_preview = None
         for msg in reversed(messages or []):
             if isinstance(msg, dict) and msg.get("role") == "user":
                 user_text = flatten_message_text(msg.get("content")).strip()
+                metadata = msg.get("display_metadata")
+                if isinstance(metadata, dict) and isinstance(metadata.get("title_preview"), str):
+                    title_preview = metadata["title_preview"]
                 break
         if title_user_message is not None:
             user_text = title_user_message.strip()
@@ -227,11 +240,14 @@ def _maybe_title_session_at_turn_start(
             return
         # Snapshot runtime identity so the background titler can skip if the user
         # switches models before it fires.
+        # ``session_id`` rides along so the background titler's OpenCode request carries the
+        # same ``x-opencode-session`` affinity as the turn it belongs to (#112717).
         main_runtime = {
-            k: getattr(agent, k, None) for k in ("model", "provider", "base_url", "api_key", "api_mode")
+            k: getattr(agent, k, None)
+            for k in ("model", "provider", "base_url", "api_key", "api_mode", "session_id")
         }
         # See #19027.
-        maybe_auto_title(
+        upgrade = maybe_auto_title(
             session_db,
             session_id,
             user_text,
@@ -246,7 +262,12 @@ def _maybe_title_session_at_turn_start(
                 getattr(agent, "model", None) == main_runtime["model"]
                 and getattr(agent, "provider", None) == main_runtime["provider"]
             ),
+            title_preview=title_preview,
         )
+        # Unstarted = the title call would share a self-hosted endpoint with this turn's request
+        # (#117296); ``finalize_turn`` starts it once the model has answered.
+        if upgrade is not None and upgrade.ident is None:
+            agent._deferred_title_upgrade = upgrade
     except Exception:
         logger.debug("Turn-start auto-title dispatch failed", exc_info=True)
 
@@ -554,6 +575,11 @@ def _refresh_mcp_tools_between_turns(agent: Any) -> None:
     call assembles ``tools=``. ``preserve_prefix`` keeps the tool array append-only so a
     flapping ``check_fn`` can't fork the cache."""
     try:
+        # An authorization that committed after its connection card closed: same import-cost gate,
+        # the module is loaded only in a process that ran a connection operation.
+        if "tools.connectors.mcp" in sys.modules:
+            from tools.connectors.mcp import adopt_late_connections
+            adopt_late_connections(agent)
         # Import-cost gate: MCP tools are only registered by code that already imported
         # ``tools.mcp_tool`` (~0.4s); not in sys.modules => nothing to do.
         if not getattr(agent, "_skip_mcp_refresh", False) and "tools.mcp_tool" in sys.modules:
@@ -598,6 +624,9 @@ def _bind_turn_identity(
 _PER_TURN_RESET_STATE: tuple[tuple[str, Any], ...] = (
     ("_invalid_tool_retries", 0), ("_invalid_json_retries", 0), ("_empty_content_retries", 0),
     ("_incomplete_scratchpad_retries", 0), ("_codex_incomplete_retries", 0),
+    # Consecutive Codex reasoning-only (no answer, no tool call) responses, kept apart from
+    # the aggregate incomplete count so a visible partial resets it (#67321).
+    ("_codex_reasoning_only_streak", 0),
     ("_thinking_prefill_retries", 0), ("_post_tool_empty_retried", False),
     ("_last_content_with_tools", None), ("_last_content_tools_all_housekeeping", False),
     ("_reused_response_text", None),
@@ -620,12 +649,17 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
     if callable(_reset_consol):
         _reset_consol()
+    # Expiry clock for build_api_messages: admission time (not the input's platform-event
+    # stamp, which can predate admission by minutes), frozen so every request this turn
+    # sends identical bytes. Distinct from note_turn_start's _inflight_turn_started, a
+    # tripwire slot cleared at persist.
+    agent._current_turn_timestamp = time.time()
 
     # Pre-turn connection health check: clean up dead TCP connections.
     if agent.api_mode != "anthropic_messages":
         with suppress(Exception):
             if agent._cleanup_dead_connections():
-                agent._emit_status(
+                agent._emit_diagnostic_status(
                     "🔌 Detected stale connections from a previous provider "
                     "issue — cleaned up automatically. Proceeding with fresh "
                     "connection."
@@ -728,6 +762,11 @@ def _hydrate_from_history(agent: Any, conversation_history: Optional[list[Any]])
                     agent, conversation_history
                 ):
                     note_checkpoint()
+                    # Restored usage can describe the input that produced this
+                    # checkpoint rather than its compacted replay.
+                    from agent.usage_anchor import set_usage_anchor
+
+                    set_usage_anchor(agent, None)
             except Exception:
                 logger.debug(
                     "restored native checkpoint hydration skipped", exc_info=True
@@ -932,6 +971,15 @@ def _bind_interrupt_scope(agent: Any, ra) -> None:
     agent._interrupt_thread_signal_pending = False
 
 
+def _memory_query_text(original_user_message: Any) -> str:
+    """Semantic text of the turn for memory queries: a multimodal (list) turn carries its text
+    in parts, so keying off ``isinstance(str)`` collapsed it to ``""`` and ``is_trivial_prompt``
+    skipped prefetch entirely. An image-only turn still flattens to ``""`` (trivial)."""
+    if isinstance(original_user_message, (str, list)):
+        return flatten_message_text(original_user_message)
+    return ""
+
+
 def _memory_turn_start_and_prefetch(
     agent: Any, original_user_message: Any, turn_author: Optional[dict[str, Any]] = None,
 ) -> str:
@@ -940,7 +988,7 @@ def _memory_turn_start_and_prefetch(
     Returns the prefetch text (``""`` when nothing was injected)."""
     if not agent._memory_manager:
         return ""
-    _query = original_user_message if isinstance(original_user_message, str) else ""
+    _query = _memory_query_text(original_user_message)
     # The author rides along so a provider can attribute THIS turn, not whoever opened the session.
     _author = turn_author if isinstance(turn_author, dict) else {}
     with suppress(Exception):
@@ -1120,12 +1168,20 @@ def build_turn_context(
 
     _preview_text = summarize_user_message_for_log(user_message)
     _msg_preview = _preview_text[:80] + ("..." if len(_preview_text) > 80 else "")
-    logger.info(
-        "conversation turn: session=%s model=%s provider=%s platform=%s history=%d msg=%r",
+    _turn_fmt = (
+        "conversation turn: session=%s model=%s provider=%s platform=%s history=%d msg=%r"
+    )
+    _turn_args = [
         agent.session_id or "none", agent.model, agent.provider or "unknown",
         agent.platform or "unknown", len(conversation_history or []),
         _msg_preview.replace("\n", " "),
-    )
+    ]
+    # Fork turns (background review, side questions) reuse the parent's session_id and
+    # model; tag their turn-start line so logs can tell them apart (#118693).
+    if (_turn_origin := getattr(agent, "_turn_origin", None)):
+        _turn_fmt += " origin=%s"
+        _turn_args.append(_turn_origin)
+    logger.info(_turn_fmt, *_turn_args)
 
     # Copy so the caller's list is never mutated.
     messages = list(conversation_history) if conversation_history else []
@@ -1246,10 +1302,6 @@ def build_turn_context(
 
     _persist_turn_start(agent, messages, conversation_history, pending_cli_message)
 
-    # Title the session now: the row exists and titling depends only on the user's ask,
-    # so it runs concurrently with the turn. Daemon thread, no-op once titled.
-    _maybe_title_session_at_turn_start(agent, messages)
-
     return TurnContext(
         user_message=user_message, original_user_message=original_user_message, messages=messages,
         conversation_history=conversation_history, active_system_prompt=active_system_prompt,
@@ -1295,23 +1347,41 @@ def build_api_messages(
     replayed verbatim."""
     from agent.agent_runtime_helpers import fill_empty_non_final_wire_payload
     from agent.conversation_loop import _clone_message_for_send
+    from agent.replay_cleanup import canonicalize_replay_history
+
+    has_current = isinstance(current_turn_user_idx, int) and 0 <= current_turn_user_idx < len(messages)
+    current_turn_message = messages[current_turn_user_idx] if has_current else None
+
+    # Replay consumers canonicalize the persisted prefix on read; the request copy must
+    # carry the same bytes or a resume diverges mid-prefix. Only the rows BEFORE this
+    # turn's user message are the replayed prefix — rows this turn appended (its tool
+    # calls/results) are live and must never be rewritten between iterations. The
+    # expiry clock is the turn's admission time, frozen in _reset_per_turn_agent_state.
+    # Without an anchor (compaction found no surviving user row) there is no provable
+    # persisted prefix, so nothing is canonicalized. The clock is stamped once per turn in
+    # _reset_per_turn_agent_state; a caller that skipped the prologue fails loudly here
+    # rather than silently un-freezing it.
+    turn_now = agent._current_turn_timestamp
+    split = current_turn_user_idx if has_current else 0
+    canonical_messages = canonicalize_replay_history(messages[:split], now=turn_now) + messages[split:]
 
     api_messages = []
-    for idx, msg in enumerate(messages):
+    for idx, msg in enumerate(canonical_messages):
         # Structural clone, NOT msg.copy(): in-place transforms below must not reach
         # persisted history via nested containers; see _clone_message_for_send.
         api_msg = _clone_message_for_send(msg)
         # api_content is bookkeeping (exact bytes sent), never a provider field — pop
-        # it from EVERY outgoing copy. display_* is display-only timeline metadata
-        # (strict OpenAI backends reject unknown keys); _row_id is the durable row id
-        # from _rows_to_conversation and only chat-completions strips underscore keys.
+        # it from EVERY outgoing copy. Persistence/display fields (display_*, _row_id,
+        # timestamp) are local bookkeeping: strict OpenAI backends reject unknown keys
+        # and only chat-completions strips underscore keys. The token estimator drops
+        # the same set, so it never prices bytes the provider never receives.
         _api_content = api_msg.pop("api_content", None)
-        for key in ("display_kind", "display_metadata", "_row_id"):
+        for key in PERSISTENCE_ONLY_MESSAGE_FIELDS:
             api_msg.pop(key, None)
 
         # Inject ephemeral context (memory prefetch + pre_llm_call user hooks)
         # at API time only; `messages` is untouched beyond the api_content stamp.
-        if idx == current_turn_user_idx and msg.get("role") == "user":
+        if msg is current_turn_message and msg.get("role") == "user":
             if isinstance(_api_content, str) and _api_content:
                 # Reuse the prologue's stamp so sidecar and wire cannot drift
                 # and every pass this turn sends identical bytes.
@@ -1340,7 +1410,7 @@ def build_api_messages(
         # Fill empty non-final user/assistant wire copies so the pre-call sanitizer
         # stops re-healing and flooding errors.log; durable history is untouched.
         # After the reasoning copy so thinking-only turns keep payload.
-        fill_empty_non_final_wire_payload(api_msg, is_final=(idx == len(messages) - 1))
+        fill_empty_non_final_wire_payload(api_msg, is_final=(idx == len(canonical_messages) - 1))
         # _thinking_prefill survives intentionally: the drop pass below needs it.
         # Strip length-continuation marks; some transports keep underscore keys.
         api_msg.pop("_length_continuation_fragment", None)

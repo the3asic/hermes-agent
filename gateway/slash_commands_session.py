@@ -740,7 +740,11 @@ class GatewaySessionCommandsMixin:
                 self, source=source, session_key=session_key, model=model,
                 fallback_entry=fallback_entry,
             )
-            if isinstance(fallback_entry, dict) else None
+            if isinstance(fallback_entry, dict)
+            # Same reasoning setting as a live turn (session ``/reasoning`` > per-model >
+            # global): without it the transport applies its default effort — a 400 on
+            # non-reasoning models.
+            else self._resolve_session_reasoning_config(source=source, model=model)
         )
         # FULL transcript (tool results included), like auto-compress: user/assistant-only starves
         # tool-result pruning and can trip the protect-first/last early-return.

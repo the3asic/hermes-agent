@@ -231,12 +231,21 @@ class GatewayTurnPrepareMixin:
         runtime["args"] = list(runtime["args"] or [])
         runtime["capabilities"] = dict(runtime["capabilities"] or {})
         base_request_overrides = dict(runtime_kwargs.get("request_overrides") or {})
+        fallback_entry = runtime_kwargs.get("_resolved_fallback_entry")
+        if not isinstance(fallback_entry, dict):
+            fallback_entry = None
+        fallback_signature = (
+            tuple(str(fallback_entry.get(k) or "") for k in ("provider", "model", "base_url", "reasoning_effort"))
+            if fallback_entry else None
+        )
         route = {
             "model": model,
             "runtime": runtime,
+            "fallback_entry": dict(fallback_entry) if fallback_entry else None,
             "signature": (
                 model, runtime["provider"], runtime["requested_provider"], runtime["base_url"],
                 runtime["api_mode"], runtime["command"], tuple(runtime["args"]),
+                fallback_signature,
             ),
         }
         if tier is _TIER_FROM_RUNNER:

@@ -20,6 +20,16 @@ logger = logging.getLogger(__name__)
 _ZERO = Decimal(0)
 _ONE_MILLION = Decimal(1000000)
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
+# Pay-per-token first-party APIs whose models.dev rate card is the vendor's own
+# list price, keyed by billing-route provider -> API domain. A model missing from
+# the snapshot below is priced from models.dev only on HTTPS:443 to that domain
+# (or with no base URL, i.e. the provider default): a proxy, relay or custom
+# endpoint serving the same model id may bill differently, and subscription
+# routes (openai-codex, xai-oauth) keep their own policy.
+_MODELS_DEV_DIRECT_HOSTS = {
+    "openai": "openai.com", "xai": "x.ai", "anthropic": "anthropic.com", "google": "googleapis.com",
+    "deepseek": "deepseek.com", "xiaomi": "xiaomimimo.com",
+}
 
 # Below $0.01, render at 4 dp so cheap-model costs never display as $0.00.
 # Sub-cent cost threshold: below $0.01, render at 4 decimal places so the display is non-zero (e.g. $0.0046
@@ -635,6 +645,30 @@ def _pricing_entry_from_metadata(
     )
 
 
+def _models_dev_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
+    """models.dev list price for a direct first-party route (see ``_MODELS_DEV_DIRECT_HOSTS``)."""
+    domain = _MODELS_DEV_DIRECT_HOSTS.get(route.provider)
+    if not domain or not route.model:
+        return None
+    if route.base_url:
+        scheme, host, port = base_url_origin(route.base_url)
+        if (scheme, port) != ("https", 443) or not (host == domain or host.endswith("." + domain)):
+            return None
+    from agent.models_dev import get_model_info
+
+    model_info = get_model_info(route.provider, route.model)
+    if model_info is None or not model_info.has_cost_data():
+        return None
+    return PricingEntry(
+        input_cost_per_million=_to_decimal(model_info.cost_input),
+        output_cost_per_million=_to_decimal(model_info.cost_output),
+        cache_read_cost_per_million=_to_decimal(model_info.cost_cache_read),
+        cache_write_cost_per_million=_to_decimal(model_info.cost_cache_write),
+        source="provider_models_api", source_url="https://models.dev", pricing_version="models.dev",
+        fetched_at=_UTC_NOW(),
+    )
+
+
 def get_pricing_entry(
     model_name: str, provider: Optional[str] = None, base_url: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -656,7 +690,7 @@ def get_pricing_entry(
         )
         if entry:
             return entry
-    return None
+    return _models_dev_pricing_entry(route)
 
 
 # Usage-field candidate paths per API shape: (input/prompt total, output, cache
@@ -739,6 +773,7 @@ def normalize_usage(
     return CanonicalUsage(
         input_tokens=input_tokens, output_tokens=output_tokens, cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens, reasoning_tokens=reasoning_tokens,
+        raw_usage=dict(u) if isinstance(u, dict) else (u.model_dump() if callable(getattr(u, 'model_dump', None)) else None),
     )
 
 

@@ -2724,7 +2724,7 @@ def _runtime_main_value(field: str) -> Any:
 def set_runtime_main(
     provider: str, model: str, *, requested_provider: str = "", base_url: str = "",
     api_key: Any = "", api_mode: str = "", auth_mode: str = "", session_id: str = "",
-    cache_scope: str = "",
+    cache_scope: str = "", reasoning_config: Optional[dict] = None,
 ) -> contextvars.Token:
     """Record the current context's live main runtime for auxiliary routing.
 
@@ -2744,6 +2744,7 @@ def set_runtime_main(
         "auth_mode": (auth_mode or "").strip().lower(),
         "session_id": (session_id or "").strip(),
         "cache_scope": (cache_scope or "").strip(),
+        "reasoning_config": copy.deepcopy(reasoning_config) if isinstance(reasoning_config, dict) else None,
     }
     return _RUNTIME_MAIN_CONTEXT.set(runtime)
 
@@ -7712,6 +7713,9 @@ _FALLBACK_REASONS: tuple[tuple[Callable[[Exception], bool], str], ...] = (
     # Before the connection-error rung (its superset): a full-budget timeout must be named as one, or
     # a slow local model reads as an unreachable endpoint (#89445).
     (_is_timeout_error, "request timed out"), (_is_connection_error, "connection error"),
+    # Last: same-provider retries for pure 5xx/408 already ran above this rung; once exhausted
+    # the error must reach the configured chain instead of being re-raised pre-fallback.
+    (_is_transient_transport_error, "transient HTTP error"),
 )
 
 

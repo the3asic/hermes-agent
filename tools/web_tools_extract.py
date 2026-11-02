@@ -121,15 +121,25 @@ def _reconcile_extract_results(
                 source_url = metadata.get(source_key)
                 if isinstance(source_url, str) and source_url.strip():
                     candidates.append(_extract_url_identity(source_url))
-        candidate_identities = set(candidates)
-        if len(candidate_identities) != 1:
+        # A row binds to a requested URL when exactly one of its reported
+        # identities is requested: a redirector row carries the target in
+        # ``url`` and the requested URL in ``metadata.sourceURL``. Two
+        # requested identities (or none) is ambiguous/unexpected — fail closed.
+        requested_hits = set(candidates) & set(requested_by_identity)
+        if len(requested_hits) != 1:
             invalid_mapping = True
             continue
-        identity = next(iter(candidate_identities))
-        if identity not in requested_by_identity or identity in matched:
+        identity = next(iter(requested_hits))
+        if identity in matched:
             invalid_mapping = True
             continue
         accepted = dict(raw_result)
+        if result_url and _extract_url_identity(result_url) != identity:
+            # Keep the provider-reported final URL so cache hits can re-gate
+            # the page they actually serve (blocklist added after caching).
+            accepted_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            accepted_metadata.setdefault("url", result_url)
+            accepted["metadata"] = accepted_metadata
         accepted["url"] = requested_by_identity[identity]
         matched[identity] = accepted
 
@@ -407,9 +417,11 @@ async def _gate_final_urls(results: list[dict], requested: set[str]) -> list[dic
     return gated
 
 
-async def _dispatch_extract(provider, fetch_urls: list[str], format: Optional[str], facts: dict) -> list[dict]:
+async def _dispatch_extract(provider, fetch_urls: list[str], format: Optional[str], facts: Optional[dict] = None) -> list[dict]:
     """Fetch *fetch_urls* (with keyless rescue), re-gate redirect targets, reconcile rows by URL
     identity, then cache the passes. Rescued and interrupted batches are never cached."""
+    if facts is None:
+        facts = {}
     from tools.web_result_cache import extract_cache_put, extract_cache_record_final_url
     facts["provider_call_attempted"] = not web_is_interrupted()
     results, rescued = await _fetch_with_rescue(provider, fetch_urls, format)
@@ -485,7 +497,7 @@ async def _dispatch_extract(provider, fetch_urls: list[str], format: Optional[st
         if not _content:
             continue
         metadata = fetched.get("metadata")
-        final_url = (
+        provider_url = (
             metadata.get("url")
             if isinstance(metadata, dict) else None
         )
@@ -497,10 +509,10 @@ async def _dispatch_extract(provider, fetch_urls: list[str], format: Optional[st
             provider=provider.name,
             served_by=provider.name,
             retrieved_at=facts["network_retrieved_at"],
-            final_url=final_url or requested_url,
+            final_url=provider_url or requested_url,
         )
-        if stored and fetched.get("url") and fetched["url"] != requested_url:
-            extract_cache_record_final_url(requested_url, fetched["url"], _content, format=format, provider=provider.name)
+        if stored and provider_url and provider_url != requested_url:
+            extract_cache_record_final_url(requested_url, provider_url, _content, format=format, provider=provider.name)
     return results
 
 
@@ -521,13 +533,17 @@ async def _cached_final_url_allowed(hit: dict, requested: str) -> bool:
     return await async_is_safe_url(final_url)
 
 
-async def _extract_safe_urls(provider, safe_urls: list[str], format: Optional[str], *, facts: dict) -> list[dict]:
+async def _extract_safe_urls(provider, safe_urls: list[str], format: Optional[str], *, facts: Optional[dict] = None) -> list[dict]:
     """Apply website and redirect policy to every cache hit, then fetch unique uncached URLs."""
+    if facts is None:
+        facts = {}
     from tools.web_result_cache import (
         cache_enabled as _extract_cache_enabled,
         extract_cache_get as _extract_cache_get,
     )
     from tools.website_policy import check_website_access as _check_site
+    # Late binding: tests stub the URL-safety seam on its own module.
+    from tools.url_safety import async_is_safe_url as _async_is_safe_url
     cached_results: Dict[str, Dict[str, Any]] = {}
     refused_results: Dict[str, Dict[str, Any]] = {}
     fetch_urls: List[str] = []
@@ -565,7 +581,7 @@ async def _extract_safe_urls(provider, safe_urls: list[str], format: Optional[st
             hit = None  # a miss: the live fetch re-checks the redirect and refuses with blocked_by_policy
         if hit is not None:
             final_url = hit.get("final_url", url)
-            if not await async_is_safe_url(final_url):
+            if not await _async_is_safe_url(final_url):
                 refused_results[identity] = {
                     "url": url, "title": "", "content": "",
                     "error": "Blocked: URL targets a private or internal network address",

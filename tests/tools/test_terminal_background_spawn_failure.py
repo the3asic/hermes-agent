@@ -31,7 +31,7 @@ class _SandboxEnv:
     (RuntimeError("container 808ea027557c is not running"), "container 808ea027557c is not running"),
 ])
 def test_failed_sandbox_launch_returns_error_not_started_session(outcome, reason):
-    before = set(process_registry._running) | set(process_registry._finished)
+    before_running = set(process_registry._running)
 
     result = json.loads(spawn_background_process(
         command="sleep 30", env=_SandboxEnv(outcome), env_type="docker",
@@ -44,4 +44,6 @@ def test_failed_sandbox_launch_returns_error_not_started_session(outcome, reason
     assert "session_id" not in result
     assert result["output"] != "Background process started"
     assert reason in result["error"]
-    assert set(process_registry._running) | set(process_registry._finished) == before
+    # The launch is retained as a finished failed_start lifecycle record (the
+    # observability trail); it must never appear as a running session.
+    assert set(process_registry._running) == before_running

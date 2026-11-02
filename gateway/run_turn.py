@@ -1612,6 +1612,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         # Delivery uses the finalized task result (empty/failure normalization), not raw ``result``.
         _delivery_result = response if isinstance(response, dict) else (result or {})
         first_response = _delivery_result.get("final_response", "")
+        footer = self._hmwa_runtime_footer_line(_delivery_result, turn_ctx.source, None)
         _already_streamed = self._run_agent_stream_confirmed_final_delivery(
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )
@@ -1646,8 +1647,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                 session_key or "?",
             )
             try:
+                delivery_text = f"{first_response}\n\n{footer}" if footer and not _already_streamed else first_response
                 _text_delivered = await self._deliver_queued_first_response(
-                    first_response, source=turn_ctx.source, adapter=adapter,
+                    delivery_text, source=turn_ctx.source, adapter=adapter,
                     metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
                     text_already_delivered=_already_streamed,
                     deliver_media=_deliver_media, stream_consumer=_sc,
@@ -1669,6 +1671,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     # The queued lane already uploaded this response's MEDIA: attachments; without
                     # this the completion path's already_sent rescan uploads every file twice.
                     result["media_already_delivered"] = _deliver_media
+                if footer and _already_streamed:
+                    await adapter.send(turn_ctx.source.chat_id, footer, metadata=turn_ctx._status_thread_metadata)
         # Release deferred bg-review notifications: pop (no double-fire in base.py's finally) and call.
         _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)
         if callable(_bg_cb):

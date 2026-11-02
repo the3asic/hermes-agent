@@ -138,9 +138,12 @@ class ProcessCheckpointMixin:
                 owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
                 started_at=entry.get("started_at", time.time()))
             # detached: no Popen handle, but can report status + kill; a worker spawn's output log
-            # (and recorded exit) outlives its spawner, so tail it from the start.
+            # (and recorded exit) outlives its spawner, so tail it from the start. The pre-crash
+            # output pipe is gone, so observability cannot claim output history exists.
             fields["output_log"] = log
-            session = ProcessSession(id=entry["session_id"], detached=True, **fields)
+            session = ProcessSession(
+                id=entry["session_id"], detached=True,
+                last_output_at=None, output_history_available=None, **fields)
             if session.output_log:
                 self._track_started(session, self._log_reader_loop, f"proc-log-reader-{session.id}")
             else:
@@ -159,4 +162,5 @@ class ProcessCheckpointMixin:
                     "parent_session_id": session.parent_session_id,
                 })
         self._write_checkpoint(extra_entries=unresolved_scope_entries)
+        self._write_observability_snapshot()
         return recovered

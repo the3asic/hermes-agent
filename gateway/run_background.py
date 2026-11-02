@@ -61,10 +61,17 @@ class GatewayBackgroundMixin:
             enabled_toolsets, disabled_toolsets = self._resolve_turn_toolsets(user_config, source, platform_key)
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
-            reasoning_config = self._resolve_session_reasoning_config(source=source, model=model)
-            self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            from gateway.run_reasoning import (
+                _apply_route_reasoning_policy_to_agent,
+                _resolve_gateway_reasoning_for_route,
+            )
+            reasoning_config = _resolve_gateway_reasoning_for_route(
+                self, source=source, session_key=None, model=turn_route["model"],
+                fallback_entry=turn_route.get("fallback_entry"),
+            )
+            self._reasoning_config = reasoning_config
 
             # Enrich the prompt with image descriptions (same as the main flow).
             enriched_prompt = prompt
@@ -109,6 +116,9 @@ class GatewayBackgroundMixin:
                     # Reload from disk — do not reuse the startup snapshot.
                     # See #60955.
                     fallback_model=self._refresh_fallback_model(),
+                )
+                _apply_route_reasoning_policy_to_agent(
+                    agent, turn_route.get("fallback_entry"), reasoning_config
                 )
                 try:
                     return agent.run_conversation(user_message=enriched_prompt, task_id=task_id)

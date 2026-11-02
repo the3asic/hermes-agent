@@ -9,6 +9,68 @@ Production runtime: Python 3.11 venv at ~/.hermes/hermes-agent/venv. Prod extras
 (telegram/discord/aiohttp/slack), mcp, cron, acp, homeassistant etc.; NO tts engines (neutts/
 kittentts/piper), no matrix, no playwright.
 
+## Post-merge regression fixes (commit after 6bd7a6fe4a)
+
+Clean merges can silently drop fork or upstream behavior without textual conflicts; the
+targeted suite below caught the dropped pieces and each was restored deliberately:
+
+- `gateway/run_turn_prepare.py`: restored `_resolved_fallback_entry` consumption in
+  `_resolve_turn_agent_config` → `route["fallback_entry"]` + signature key (feed for
+  `_resolve_gateway_reasoning_for_route`).
+- `gateway/slash_commands_session.py`: /compress reasoning — non-fallback routes resolve via
+  `_resolve_session_reasoning_config` (was `None`; dropped else-branch).
+- `gateway/run_background.py`: background tasks route reasoning through
+  `_resolve_gateway_reasoning_for_route(fallback_entry=turn_route["fallback_entry"])` +
+  `_apply_route_reasoning_policy_to_agent` (upstream file didn't exist on fork side).
+- `gateway/run_turn_runner.py`: `usage_baseline` restored to pre-run position (post-run
+  baseline zeroed every turn delta → footer `tokens_turn` always hidden).
+- `gateway/run_turn.py` + `run_turn_persistence.py`: runtime-footer wiring — `_hmwa_runtime_footer_line`
+  calls fork's `_gateway_runtime_footer_line` (upstream `build_footer_line` kwargs signature is
+  incompatible and its TypeError was swallowed to ""); queued-followup delivery restores footer
+  append + trailing footer send when streamed.
+- `agent/turn_context.py`: taken to upstream then fork grafts reapplied — checkpoint hydration
+  (`awaiting_real_usage_after_compression` latch on replayable native checkpoints),
+  title/session-affinity, reasoning resolver + `reasoning_config` in `_publish_runtime_main`.
+- `agent/auxiliary_client.py`: `set_runtime_main(..., reasoning_config=)` parameter +
+  ContextVar (merged signature dropped it; every publish call TypeError'd under suppress).
+- `agent/auxiliary_codex_response.py`: `input_tokens_details → prompt_tokens_details`,
+  `output_tokens_details → completion_tokens_details` (Codex usage detail fields the upstream
+  extraction dropped → cache-hit tokens invisible to pricing).
+- `agent/usage_pricing.py`: restored `_MODELS_DEV_DIRECT_HOSTS` + `_models_dev_pricing_entry()`
+  (models.dev pricing for first-party direct routes) and `raw_usage` propagation in
+  `CanonicalUsage` (fast-mode `speed`/`service_tier` detection).
+- `agent/auxiliary fallback ladder`: transient 5xx/408 exhaustion now enters the configured
+  fallback chain (fork `_is_recoverable_aux_fallback_error` semantics grafted onto upstream's
+  `_FALLBACK_REASONS`/`_ladder_provider_fallback`; per-endpoint `base_url` isolation keys).
+- `tools/browser_supervisor.py`: fork registry restored onto upstream rewrite — `target_id`
+  pinning, `CDPProtocolError`, structured `_runtime_failure`, generation fencing, in-flight
+  starter tracking, displaced-instance stop outside the lock; upstream `capture()`/`stop_home()`
+  retained.
+- `tools/web_tools_extract.py`: redirect reconciliation accepts exactly-one-requested-identity
+  rows (final URL in `url` + requested in `metadata.sourceURL` is valid, not ambiguous);
+  `metadata["url"]` carries the final URL to the cache; `async_is_safe_url` late-bound so the
+  `tools.url_safety` patch seam works; `_extract_safe_urls(facts=None)` backward compat.
+- `tools/process_registry*.py`: `ProcessObservabilityMixin` wired into `ProcessRegistry`
+  (dead on fork main since the fa91c06c7c refactor — mixin never entered the MRO): session
+  fields `ended_at`/`last_output_at`/`output_history_available`, `_init_observability()` in
+  `__init__`, snapshots on spawn/output/exit/recover, `HERMES_PROCESS_ID` env marker on
+  PTY/pipe/remote spawns. `spawn_via_env` keeps the FORK contract (retained `failed_start`
+  session) — upstream cd818a4d05's raise-reporting UX re-implemented one layer up in
+  `terminal_tool_background.py`; `test_process_registry.py` and
+  `test_terminal_background_spawn_failure.py` assertions updated to match.
+- `hermes_cli/doctor.py` tests: `PROJECT_ROOT` pointed at an existing temp dir (subprocess
+  cwd), utf-8 `.env` fallback.
+- `run_agent.py`: `import copy` restored (`_current_main_runtime` deepcopy).
+- `agent/auxiliary_client.py`: `get_scoped_runtime_main` accessor (dead lazy import surfaced
+  by a new upstream test).
+- `hermes_cli/_early_recovery.py`: pytest-owned-checkout check hoisted above the update-pull
+  marker stat (home_io_guard fired on `~/.hermes`-resident worktrees).
+
+Test isolation note: `test_process_registry_observability.py` was red on fork main already
+(mixin never wired). Verified-clean suite set: see PR body. Remaining suite failures were
+diffed per-test against upstream baseline fbf6c6c91d — every merged failure is red upstream
+too (banner, multiplex_status, hold_stream_edges residuals, fal_sdk import = missing dep).
+
 ## Deploy procedure (later)
 1. In production worktree: `git checkout -- gateway/run_agent_cache.py gateway/run_turn.py gateway/session_state.py`
 2. `rm tests/gateway/test_internal_event_pin_wiring.py`

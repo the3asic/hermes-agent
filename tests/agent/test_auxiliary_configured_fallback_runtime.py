@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from agent.auxiliary_client import (
-    _is_recoverable_aux_fallback_error,
     async_call_llm,
     call_llm,
 )
@@ -17,6 +16,9 @@ _PROVIDER = "custom:test-gateway"
 _PRIMARY_MODEL = "vision-primary"
 _MIDDLE_MODEL = "vision-middle"
 _FINAL_MODEL = "vision-final"
+_PRIMARY_URL = "https://primary.invalid/v1"
+_MIDDLE_URL = "https://middle.invalid/v1"
+_FINAL_URL = "https://final.invalid/v1"
 
 
 class _HttpStatusError(Exception):
@@ -51,16 +53,16 @@ def _vision_messages() -> list[dict]:
 def _fallback_config() -> dict:
     return {
         "fallback_chain": [
-            {"provider": _PROVIDER, "model": _MIDDLE_MODEL},
-            {"provider": _PROVIDER, "model": _FINAL_MODEL},
+            {"provider": _PROVIDER, "model": _MIDDLE_MODEL, "base_url": _MIDDLE_URL},
+            {"provider": _PROVIDER, "model": _FINAL_MODEL, "base_url": _FINAL_URL},
         ]
     }
 
 
-def _sync_client(*, side_effect=None, result=None) -> MagicMock:
+def _sync_client(*, base_url=_PRIMARY_URL, side_effect=None, result=None) -> MagicMock:
     client = MagicMock()
     client.api_key = "test-key"
-    client.base_url = "https://example.invalid/v1"
+    client.base_url = base_url
     if side_effect is not None:
         client.chat.completions.create.side_effect = side_effect
     else:
@@ -68,10 +70,10 @@ def _sync_client(*, side_effect=None, result=None) -> MagicMock:
     return client
 
 
-def _async_client(*, side_effect=None, result=None) -> MagicMock:
+def _async_client(*, base_url=_PRIMARY_URL, side_effect=None, result=None) -> MagicMock:
     client = MagicMock()
     client.api_key = "test-key"
-    client.base_url = "https://example.invalid/v1"
+    client.base_url = base_url
     client.chat.completions.create = AsyncMock(
         side_effect=side_effect,
         return_value=result or _response(),
@@ -110,9 +112,29 @@ def _common_patches(primary, middle_sync, final_sync):
 
 
 def test_unstructured_503_text_does_not_override_explicit_route():
-    error = RuntimeError("HTTP 503 Service Unavailable")
+    """A bare "HTTP 503" RuntimeError has no status object: it must raise, not walk the chain."""
+    primary = _sync_client(side_effect=RuntimeError("HTTP 503 Service Unavailable"))
+    middle = _sync_client(base_url=_MIDDLE_URL, result=_response("middle result"))
+    final = _sync_client(base_url=_FINAL_URL, result=_response("final result"))
+    messages = _vision_messages()
 
-    assert _is_recoverable_aux_fallback_error(error) is False
+    with ExitStack() as stack:
+        for current_patch in _common_patches(primary, middle, final):
+            stack.enter_context(current_patch)
+        stack.enter_context(
+            patch("agent.auxiliary_client._transient_retry_count", return_value=1)
+        )
+        stack.enter_context(
+            patch("agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE", 0.0)
+        )
+        stack.enter_context(
+            patch("agent.auxiliary_client._try_main_agent_model_fallback")
+        )
+        with pytest.raises(RuntimeError, match="HTTP 503"):
+            call_llm(task="vision", messages=messages, route_info={})
+
+    assert middle.chat.completions.create.call_count == 0
+    assert final.chat.completions.create.call_count == 0
 
 
 @pytest.mark.parametrize("status_code", [502, 503])
@@ -121,8 +143,8 @@ def test_sync_persistent_5xx_walks_configured_chain_and_preserves_image(
 ):
     server_error = _HttpStatusError(status_code, "persistent upstream failure")
     primary = _sync_client(side_effect=[server_error, server_error])
-    middle = _sync_client(side_effect=server_error)
-    final = _sync_client(result=_response("final vision result"))
+    middle = _sync_client(base_url=_MIDDLE_URL, side_effect=server_error)
+    final = _sync_client(base_url=_FINAL_URL, result=_response("final vision result"))
     messages = _vision_messages()
     route_info = {}
 
@@ -150,7 +172,10 @@ def test_sync_persistent_5xx_walks_configured_chain_and_preserves_image(
     assert final.chat.completions.create.call_count == 1
     assert middle.chat.completions.create.call_args.kwargs["messages"] == messages
     assert final.chat.completions.create.call_args.kwargs["messages"] == messages
-    assert route_info == {"provider": _PROVIDER, "model": _FINAL_MODEL}
+    assert route_info["provider"] == _PROVIDER
+    assert route_info["model"] == _FINAL_MODEL
+    assert route_info["failed_model"] == _PRIMARY_MODEL
+    assert "transient HTTP error" in route_info["failure"]
     main_fallback.assert_not_called()
 
 
@@ -158,12 +183,12 @@ def test_sync_persistent_5xx_walks_configured_chain_and_preserves_image(
 async def test_async_persistent_503_walks_configured_chain_and_preserves_image():
     server_error = _HttpStatusError(503, "upstream service unavailable")
     primary = _async_client(
-        side_effect=[server_error, server_error, server_error]
+        side_effect=[server_error, server_error]
     )
-    middle_sync = _sync_client()
-    final_sync = _sync_client()
-    middle = _async_client(side_effect=server_error)
-    final = _async_client(result=_response("final async vision result"))
+    middle_sync = _sync_client(base_url=_MIDDLE_URL)
+    final_sync = _sync_client(base_url=_FINAL_URL)
+    middle = _async_client(base_url=_MIDDLE_URL, side_effect=server_error)
+    final = _async_client(base_url=_FINAL_URL, result=_response("final async vision result"))
     messages = _vision_messages()
     route_info = {}
 
@@ -197,12 +222,15 @@ async def test_async_persistent_503_walks_configured_chain_and_preserves_image()
         )
 
     assert result.choices[0].message.content == "final async vision result"
-    assert primary.chat.completions.create.await_count == 3
+    assert primary.chat.completions.create.await_count == 2
     assert middle.chat.completions.create.await_count == 1
     assert final.chat.completions.create.await_count == 1
     assert middle.chat.completions.create.call_args.kwargs["messages"] == messages
     assert final.chat.completions.create.call_args.kwargs["messages"] == messages
-    assert route_info == {"provider": _PROVIDER, "model": _FINAL_MODEL}
+    assert route_info["provider"] == _PROVIDER
+    assert route_info["model"] == _FINAL_MODEL
+    assert route_info["failed_model"] == _PRIMARY_MODEL
+    assert "transient HTTP error" in route_info["failure"]
     main_fallback.assert_not_called()
 
 
@@ -210,8 +238,8 @@ def test_deterministic_fallback_error_does_not_advance_chain():
     server_error = _HttpStatusError(502, "upstream bad gateway")
     bad_request = _HttpStatusError(400, "invalid image request")
     primary = _sync_client(side_effect=[server_error, server_error])
-    middle = _sync_client(side_effect=bad_request)
-    final = _sync_client(result=_response("must not run"))
+    middle = _sync_client(base_url=_MIDDLE_URL, side_effect=bad_request)
+    final = _sync_client(base_url=_FINAL_URL, result=_response("must not run"))
 
     with ExitStack() as stack:
         for current_patch in _common_patches(primary, middle, final):
@@ -233,9 +261,11 @@ def test_exhausted_configured_chain_reraises_primary_error(caplog):
     primary_error = _HttpStatusError(502, "primary upstream bad gateway")
     primary = _sync_client(side_effect=[primary_error, primary_error])
     middle = _sync_client(
+        base_url=_MIDDLE_URL,
         side_effect=_HttpStatusError(503, "middle service unavailable")
     )
     final = _sync_client(
+        base_url=_FINAL_URL,
         side_effect=_HttpStatusError(504, "final gateway timeout")
     )
 

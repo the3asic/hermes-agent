@@ -181,6 +181,17 @@ def spawn_background_process(
             effective_task_id=effective_task_id, task_id=task_id, session_key=session_key,
             effective_pty=effective_pty, persist_on_release=persist_on_release,
         )
+        if getattr(proc_session, "exited", False):
+            # The launch wrapper never produced a PID (no bash in the image, sandbox
+            # gone, execute() raised): the registry keeps a finished failed_start
+            # record for observability, but the model must see an error, not a
+            # started session whose id answers not_found.
+            detail = getattr(proc_session, "output_buffer", "") or \
+                f"launch wrapper exited {getattr(proc_session, 'exit_code', None)} without a PID"
+            return json.dumps({
+                "output": "", "exit_code": -1,
+                "error": _redact_terminal_error_text(f"Failed to start background process: {detail}"),
+            }, ensure_ascii=False)
         result_data = {"output": "Background process started", "session_id": proc_session.id,
                        "pid": proc_session.pid, "exit_code": 0, "error": None}
         if persist_on_release:

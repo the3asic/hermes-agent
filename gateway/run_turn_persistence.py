@@ -249,21 +249,12 @@ class GatewayTurnPersistenceMixin:
         """Runtime-metadata footer for the FINAL message of the turn; off by default
         (display.runtime_footer.enabled=false). Never on a finite (`-z`, `chat -q`) turn: its reply is
         the printed answer itself."""
-        from gateway.run import _load_gateway_config, _platform_config_key, _terminal_scope_cwd
         from gateway.session_finite import finite_turn_required
         if finite_turn_required() is True:
             return ""
         try:
-            from gateway.runtime_footer import build_footer_line as _bfl
-            return _bfl(
-                user_config=_load_gateway_config(),
-                platform_key=_platform_config_key(source.platform), model=agent_result.get("model"),
-                context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
-                context_length=agent_result.get("context_length") or None,
-                cwd=_terminal_scope_cwd(""), turn_seconds=_turn_seconds,
-                requested_model=agent_result.get("requested_model"),
-                served_model=agent_result.get("served_model"),
-            )
+            from gateway.runtime_footer import _gateway_runtime_footer_line
+            return _gateway_runtime_footer_line(agent_result, source, turn_seconds=_turn_seconds)
         except Exception as _footer_err:
             logger.debug("runtime_footer build failed: %s", _footer_err)
             return ""
