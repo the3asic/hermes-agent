@@ -91,7 +91,7 @@ class _StalledSummaryWorker:
             fence.finish_commit()
 
 
-def _run(worker, *, chain, timeouts, messages, idle=0.05, ceiling=2.0):
+def _run(worker, *, chain, timeouts, messages, idle=2.0, ceiling=5.0):
     with _patch_chain(chain):
         return run_compress_context_with_progress_timeout(
             worker=worker,
@@ -152,8 +152,8 @@ def test_retry_runs_on_a_host_published_fence():
                 worker=worker,
                 messages=original,
                 system_prompt_fallback="degraded-prompt",
-                idle_timeout_seconds=0.05,
-                total_ceiling_seconds=2.0,
+                idle_timeout_seconds=2.0,
+                total_ceiling_seconds=5.0,
                 new_fence=_new_fence,
             )
     finally:
@@ -182,8 +182,8 @@ def test_hard_interrupt_suppresses_the_fallback_attempt():
                 worker=worker,
                 messages=original,
                 system_prompt_fallback="degraded-prompt",
-                idle_timeout_seconds=0.05,
-                total_ceiling_seconds=2.0,
+                idle_timeout_seconds=2.0,
+                total_ceiling_seconds=5.0,
                 on_timeout=lambda *args: timeouts.append(args),
                 telemetry_agent=agent,
             )
@@ -218,7 +218,7 @@ def test_fallback_that_also_stalls_degrades_after_one_attempt():
         [{"role": "user", "content": "unused"}], stall_attempts=2
     )
     timeouts = []
-    entry = dict(CHAIN_ENTRY, timeout=0.05)
+    entry = dict(CHAIN_ENTRY, timeout=2.0)
 
     try:
         msgs, prompt = _run(worker, chain=[entry], timeouts=timeouts, messages=original)
@@ -241,8 +241,10 @@ def test_total_ceiling_exhaustion_does_not_start_fallback():
 
     try:
         msgs, prompt = _run(
-            worker, chain=[dict(CHAIN_ENTRY, timeout=0.3)], timeouts=timeouts, messages=original,
-            idle=0.3, ceiling=0.3,
+            # idle == ceiling: the primary's idle expiry spends the whole shared budget. >= 2 s so a
+            # loaded runner still starts the primary worker inside it (tests/AGENTS.md).
+            worker, chain=[dict(CHAIN_ENTRY, timeout=2.0)], timeouts=timeouts, messages=original,
+            idle=2.0, ceiling=2.0,
         )
     finally:
         worker.release.set()
@@ -251,6 +253,38 @@ def test_total_ceiling_exhaustion_does_not_start_fallback():
     assert msgs is original
     assert prompt == "degraded-prompt"
     assert len(timeouts) == 1
+
+
+class _ReadThenStallWorker(_StalledSummaryWorker):
+    """The primary attempt's server reads the prompt (pushing the fence deadline back), then stalls."""
+
+    def __call__(self, fence: CompressionCommitFence):
+        if not self.routes:
+            assert fence.extend_deadline(10.0)
+        return super().__call__(fence)
+
+
+def test_stall_after_prompt_reading_still_funds_the_fallback():
+    """Prompt reading moves the fence deadline; the fallback must be budgeted from the moved deadline,
+    not the primary attempt's original one, or a long read followed by a stall skips the fallback."""
+    original = [{"role": "user", "content": "keep-me"}]
+    compressed = [{"role": "user", "content": "summary"}]
+    worker = _ReadThenStallWorker(compressed)
+    timeouts = []
+
+    try:
+        msgs, prompt = _run(
+            # Same budget as the exhaustion test above: without the extension the idle expiry spends it.
+            worker, chain=[dict(CHAIN_ENTRY, timeout=2.0)], timeouts=timeouts, messages=original,
+            idle=2.0, ceiling=2.0,
+        )
+    finally:
+        worker.release.set()
+
+    assert worker.attempts == 2, "the extended budget must fund the fallback attempt"
+    assert msgs == compressed
+    assert prompt == "summarized-prompt"
+    assert not timeouts
 
 
 def test_same_turn_fallback_retry_is_not_gated_by_the_primary_stall_backoff(tmp_path, monkeypatch):

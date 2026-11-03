@@ -307,11 +307,13 @@ def test_feasibility_check_passes_live_main_runtime():
         main_runtime={
             "model": "gpt-5.4",
             "provider": "openai-codex",
+            "requested_provider": "",
             "base_url": "https://chatgpt.com/backend-api/codex",
             "api_key": "codex-token",
             "api_mode": "codex_responses",
             "auth_mode": "",
             "session_id": "",
+            "reasoning_config": None,
         },
     )
 

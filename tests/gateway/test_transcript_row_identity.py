@@ -44,6 +44,7 @@ def test_real_transcript_reopen_preserves_distinct_row_ids_off_wire(tmp_path, mo
         _copy_reasoning_content_for_api=lambda *_: None,
         _should_sanitize_tool_calls=lambda: False,
         ephemeral_system_prompt=None,
+        _current_turn_timestamp=1234567890.0,
     )
     wire, _ = build_api_messages(
         agent, replay, current_turn_user_idx=None, ext_prefetch_cache=None,

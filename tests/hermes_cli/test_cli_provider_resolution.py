@@ -251,7 +251,8 @@ def test_runtime_resolution_failure_is_not_sticky(monkeypatch):
 
     monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
     monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
-    monkeypatch.setattr("run_agent.AIAgent", _DummyAgent)
+    monkeypatch.setattr("hermes_cli.gateway_agent.GatewayAgent", _DummyAgent)
+    monkeypatch.setattr("hermes_cli.gateway_session_store.session_store", lambda: None)  # no live gateway
 
     shell = cli.HermesCLI(model="gpt-5", compact=True, max_turns=1)
 
@@ -288,7 +289,7 @@ def test_cli_turn_routing_uses_primary_when_disabled(monkeypatch):
 
 
 def test_model_flow_nous_does_not_restore_stale_custom_api_key(tmp_path, monkeypatch):
-    import yaml
+    import hermes_yaml as yaml
 
     config_home = tmp_path / "hermes"
     config_home.mkdir()
@@ -358,7 +359,7 @@ def test_model_flow_nous_does_not_restore_stale_custom_api_key(tmp_path, monkeyp
 
 
 def _seed_stale_custom_model(tmp_path, monkeypatch):
-    import yaml
+    import hermes_yaml as yaml
 
     config_home = tmp_path / "hermes"
     config_home.mkdir()
@@ -537,6 +538,7 @@ def test_cli_auth_fallback_reasoning_is_target_owned_across_agent_init(
     shell.finalize_preloaded_skills = lambda: None
     shell._install_tool_callbacks = lambda: None
     shell._ensure_tirith_security = lambda: None
+    shell._ensure_gateway_session = lambda: None
     shell._session_db = MagicMock()
     shell._resumed = False
     shell.conversation_history = []
@@ -580,6 +582,7 @@ def test_cli_auth_fallback_reasoning_is_target_owned_across_agent_init(
     shell._on_reaction = None
     shell._pending_title = None
     shell._agent_status_print = lambda *_args, **_kwargs: None
+    shell._mark_automation_stale = lambda: None
 
     captured = {}
 
@@ -591,7 +594,8 @@ def test_cli_auth_fallback_reasoning_is_target_owned_across_agent_init(
             _print_fn=None,
         )
 
-    monkeypatch.setattr("run_agent.AIAgent", _fake_agent)
+    monkeypatch.setattr("hermes_cli.gateway_agent.GatewayAgent", _fake_agent)
+    monkeypatch.setattr("hermes_cli.gateway_session_store.session_store", lambda: None)  # no live gateway
     monkeypatch.setattr(
         "hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build",
         lambda **_kwargs: None,
@@ -620,10 +624,7 @@ def test_cli_auth_fallback_reasoning_is_target_owned_across_agent_init(
 
 
 def test_model_flow_custom_saves_verified_v1_base_url(monkeypatch, capsys):
-    monkeypatch.setattr(
-        "hermes_cli.config.get_env_value",
-        lambda key: "" if key in {"OPENAI_BASE_URL", "OPENAI_API_KEY"} else "",
-    )
+    monkeypatch.setattr("hermes_cli.config.get_env_value", lambda key: "")
     saved_env = {}
     monkeypatch.setattr("hermes_cli.config.save_env_value", lambda key, value: saved_env.__setitem__(key, value))
     monkeypatch.setattr("hermes_cli.auth._save_model_choice", lambda model: saved_env.__setitem__("MODEL", model))
@@ -666,10 +667,7 @@ def test_model_flow_custom_persists_selected_api_mode(monkeypatch):
     saved_cfg = {"model": {"default": "", "provider": "custom", "base_url": ""}}
     captured_provider = {}
 
-    monkeypatch.setattr(
-        "hermes_cli.config.get_env_value",
-        lambda key: "" if key in {"OPENAI_BASE_URL", "OPENAI_API_KEY"} else "",
-    )
+    monkeypatch.setattr("hermes_cli.config.get_env_value", lambda key: "")
     monkeypatch.setattr("hermes_cli.auth._save_model_choice", lambda model: None)
     monkeypatch.setattr("hermes_cli.auth.deactivate_provider", lambda: None)
     monkeypatch.setattr(
@@ -798,11 +796,11 @@ def test_auto_provider_name_localhost():
 
 def test_save_custom_provider_uses_provided_name(monkeypatch, tmp_path):
     """When a display name is passed, it should appear in the saved entry."""
-    import yaml
+    import hermes_yaml as yaml
     from hermes_cli.main_provider_setup import _save_custom_provider
 
     cfg_path = tmp_path / "config.yaml"
-    cfg_path.write_text(yaml.dump({}))
+    cfg_path.write_text(yaml.safe_dump({}))
 
     monkeypatch.setattr(
         "hermes_cli.config.load_config", lambda: yaml.safe_load(cfg_path.read_text()) or {},
@@ -820,11 +818,11 @@ def test_save_custom_provider_uses_provided_name(monkeypatch, tmp_path):
 
 def test_save_custom_provider_references_the_key_instead_of_inlining_it(monkeypatch, tmp_path):
     """With key_env set the entry must not carry the secret (#69449)."""
-    import yaml
+    import hermes_yaml as yaml
     from hermes_cli.main_provider_setup import _save_custom_provider
 
     cfg_path = tmp_path / "config.yaml"
-    cfg_path.write_text(yaml.dump({}))
+    cfg_path.write_text(yaml.safe_dump({}))
     monkeypatch.setattr(
         "hermes_cli.config.load_config", lambda: yaml.safe_load(cfg_path.read_text()) or {},
     )

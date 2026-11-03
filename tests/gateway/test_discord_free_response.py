@@ -3,7 +3,7 @@
 import asyncio
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 import sys
@@ -50,8 +50,8 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+import plugins.platforms.discord.adapter as discord_platform
+from plugins.platforms.discord.adapter import DiscordAdapter
 
 
 class FakeDMChannel:
@@ -140,7 +140,7 @@ def make_message(*, channel, content: str, mentions=None, msg_type=None):
         mentions=list(mentions or []),
         attachments=[],
         reference=None,
-        created_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
         channel=channel,
         author=author,
         type=msg_type if msg_type is not None else discord_platform.discord.MessageType.default,
@@ -944,7 +944,6 @@ async def test_discord_dm_does_not_backfill(adapter, monkeypatch):
     adapter.config.extra["history_backfill"] = True
     adapter._fetch_channel_context = AsyncMock(return_value="[Recent channel messages]\n[Alice] context")
 
-    bot_user = adapter._client.user
     dm_channel = SimpleNamespace(
         id=999,
         name=None,
@@ -1024,7 +1023,7 @@ async def test_discord_free_response_can_opt_into_history_backfill_from_yaml(
     adapter, monkeypatch, tmp_path
 ):
     """Raw top-level YAML hydrates scrollback in configured free-response channels."""
-    import yaml
+    import hermes_yaml as yaml
 
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir()
