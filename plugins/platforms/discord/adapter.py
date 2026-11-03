@@ -7146,8 +7146,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         value = discord_cfg.get(config_key, platform_extra_cfg.get(config_key))
         if value is not None:
             seeded_extra[config_key] = value
-            if not _skip_env_bridge:
-                _env_default(env_key, str(value).lower())
+            _env_default(env_key, str(value).lower())
     # allow_mentions: safe defaults live in the adapter; these keys only override when set.
     allow_mentions_cfg = discord_cfg.get("allow_mentions")
     if isinstance(allow_mentions_cfg, dict):

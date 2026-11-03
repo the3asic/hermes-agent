@@ -1023,7 +1023,7 @@ async def test_discord_free_response_can_opt_into_history_backfill_from_yaml(
     adapter, monkeypatch, tmp_path
 ):
     """Raw top-level YAML hydrates scrollback in configured free-response channels."""
-    import yaml
+    import hermes_yaml as yaml
 
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir()

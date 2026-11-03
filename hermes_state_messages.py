@@ -1581,10 +1581,12 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         from hermes_state import _strip_background_review_harness, _strip_stale_tool_call_markers
         # Runtime import avoids the transcript_repair -> hermes_state_messages module cycle.
         from agent.transcript_repair import transcript_row_snapshot
-        # Only the unaddressed live replay gets the digest: row-addressed loaders (include_row_ids) keep the
-        # legacy resumed-dict path, whose rewrite never re-writes columns the projection does not decode
-        # (a CAS-match rewrite of a resumed row would otherwise null token_count).
-        stamp_snapshot = repair_alternation and not include_row_ids
+        # Row-addressed live replay ALSO needs the digest: its held dicts feed the lease-less CAS
+        # (prune / compaction commit) after view transforms (timestamp injection) legitimately
+        # rewrote ``content`` — the identity-lens compare would read that as a lost writer race and
+        # refuse the commit. Resumed dicts carry no stamp either way, so their loader-lens path is
+        # unchanged; the rewrite still cannot touch columns the projection does not decode.
+        stamp_snapshot = repair_alternation
         messages = []
         exact_user_clones: dict[tuple[Any, str], dict[str, Any]] = {}
         tool_uid_index: dict[str, str] = {}  # pairing-id variant -> uid, from the assistant rows indexed so far

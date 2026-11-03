@@ -40,7 +40,7 @@ from agent.conversation_compression import (
 from agent.conversation_compression_archive import MERGED_DURABLE_ROWS, RETIRED_DURABLE_ROWS, UNNAMED_DURABLE_ROWS
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.interrupt_compat import request_hard_interrupt
-from agent.message_metadata import ABSORBED_MESSAGE_UIDS, MESSAGE_UID, copy_identity_fields, is_compaction_scaffolding, scaffolding_replay_fields
+from agent.message_metadata import ABSORBED_MESSAGE_UIDS, DB_ROW_SNAPSHOT, MESSAGE_UID, copy_identity_fields, is_compaction_scaffolding, scaffolding_replay_fields
 from agent.turn_context import compression_made_progress
 from agent.session_activity import ActivityProvenance, AwakeIdleMeter
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get, config_exists
@@ -1170,6 +1170,10 @@ def _build_replay_entry(
     # flushes skip rows already in state.db (#121462/#123462).
     if msg.get("_db_persisted"):
         entry["_db_persisted"] = True
+    # The durable-row CAS digest travels with the row id: without it a view transform (timestamp
+    # injection) reads as a lost writer race and the lease-less commit refuses the whole pass.
+    if isinstance(msg.get(DB_ROW_SNAPSHOT), str):
+        entry[DB_ROW_SNAPSHOT] = msg[DB_ROW_SNAPSHOT]
     # A merged user dict lost that stamp; this one is what ties it to its durable rows at compaction.
     # The other counts the rows the repair dropped behind a dict or folded into an assistant turn,
     # which this view cannot name either; the last names them for the commit.

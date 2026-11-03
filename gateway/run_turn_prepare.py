@@ -187,6 +187,10 @@ class GatewayTurnPrepareMixin:
                 parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
             )
             if ch:
+                if ch.model or ch.provider:
+                    # A channel pin supersedes the global auth-fallback provenance: keeping the
+                    # stale entry would attribute the pinned route to the previous fallback.
+                    runtime_kwargs.pop("_resolved_fallback_entry", None)
                 if ch.model:
                     model = ch.model
                 if ch.provider:

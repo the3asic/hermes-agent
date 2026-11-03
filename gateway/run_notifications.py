@@ -1808,16 +1808,6 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         old bracketed ``[Background process proc_… finished~ …]`` debug wrapper (#54266)."""
         from gateway.run import _format_concise_process_notification, _redact_gateway_user_facing_secrets
         new_output = self._redacted_output_tail(session, 1000)
-        if notify_mode != "concise":
-            if session.exit_code is None:
-                return (
-                    f"[Background process {session_id} is no longer running; "
-                    f"exit status is unavailable~ Here's the final output:\n{new_output}]"
-                )
-            return (
-                f"[Background process {session_id} finished with exit code {session.exit_code}~ "
-                f"Here's the final output:\n{new_output}]"
-            )
         _started = getattr(session, "started_at", None)
         _dur = max(0.0, time.time() - _started) if isinstance(_started, (int, float)) else None
         command = _redact_gateway_user_facing_secrets(getattr(session, "command", "") or "")
