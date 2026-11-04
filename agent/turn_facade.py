@@ -7,7 +7,7 @@ MRO unchanged.
 """
 import logging
 import uuid
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from typing import Any, Dict, Generator, List, Optional
 
@@ -110,7 +110,7 @@ class TurnFacadeMixin:
         token = affinity_token = acct_token = None
         task_started = task_finished = False
         relay_outcome = "failed"
-        browser_cleanup_scope = None
+        browser_cleanup_scope = nullcontext()
 
         try:
             # First statement of the try so the finally's note_turn_finished balances every exit.
@@ -239,8 +239,7 @@ class TurnFacadeMixin:
                             lease.stop_refresher()
                             lease.join_threads()
                             lease.clear_interrupt()  # refresher interrupt between stop and join; AFTER join
-                        if browser_cleanup_scope is not None:
-                            browser_cleanup_scope.__exit__(None, None, None)
+                        browser_cleanup_scope.__exit__(None, None, None)
                     finally:
                         if lease is not None:
                             lease.release()
