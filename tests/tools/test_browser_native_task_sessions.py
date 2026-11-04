@@ -387,6 +387,8 @@ def test_first_running_call_registers_the_actual_daemon_owner(shared_browser, tm
         assert not running.done()
         cleanup_browser(shared_browser)
         running.result(timeout=10)
+        assert binding.daemon not in browser_use_cli._owned_daemon_groups
+        assert binding.daemon not in browser_use_cli._driven_daemons
 
 
 def test_cleanup_before_first_daemon_start_blocks_the_queued_operation(shared_browser, tmp_path):
@@ -468,6 +470,98 @@ def test_timeout_kills_real_descendants_that_hold_capture_pipes(shared_browser, 
     pid = int(child_pid.read_text())
     assert wait_until(lambda: not any(process.pid == pid and process.info["status"] != psutil.STATUS_ZOMBIE
                                      for process in psutil.process_iter(["status"])), timeout=5)
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.live_system_guard_bypass
+def test_starting_daemon_cleanup_preserves_ownership_until_ipc_is_ready(shared_browser):
+    import signal
+
+    from tests.tools.native_cdp_discovery import gated_chrome_discovery
+    from tools.browser_harness_dirs import daemon_identity, fit_default_socket_dir, harness_pid_file
+    from tools.browser_use_sessions import (BrowserTaskEnded, capture_task, execute_harness_call,
+                                           task_session_name)
+
+    task = capture_task(shared_browser)
+    env = browser_use_cli._base_subprocess_env()
+    env.pop("BU_CDP_WS", None)
+    env["BU_NAME"] = task_session_name(shared_browser)
+    fit_default_socket_dir(env)
+    identity = daemon_identity(env)
+    pid = None
+    with gated_chrome_discovery() as gate, concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        env["BU_CDP_URL"] = gate.address
+        started = pool.submit(execute_harness_call, browser_use_cli._find_cli(), "print('not admitted')",
+                              env, task, time.monotonic() + 40, "never")
+        try:
+            assert gate.received.wait(timeout=10)
+            pid = browser_use_cli._published_daemon_pid(env)
+            assert pid is not None and psutil.pid_exists(pid)
+            os.kill(pid, signal.SIGSTOP)
+            with pytest.raises(subprocess.CalledProcessError):
+                cleanup_browser(shared_browser)
+            assert identity in browser_use_cli._driven_daemons
+            assert harness_pid_file(env).exists()
+            assert task.ended and not task.cleanup_complete
+        finally:
+            if pid is not None and psutil.pid_exists(pid):
+                os.kill(pid, signal.SIGCONT)
+            gate.release.set()
+        with pytest.raises(BrowserTaskEnded):
+            started.result(timeout=10)
+        ping = "from browser_harness import _ipc, admin; print(_ipc.identify(admin.NAME, timeout=1))"
+
+        def ready():
+            result = subprocess.run([sys.executable, "-c", ping], env=env, capture_output=True,
+                                    text=True, timeout=5, check=True)
+            return result.stdout.strip() == str(pid)
+
+        assert wait_until(ready, timeout=15)
+        cleanup_browser(shared_browser)
+        assert task.cleanup_complete
+        assert identity not in browser_use_cli._driven_daemons
+        assert not harness_pid_file(env).exists()
+        assert wait_until(lambda: not psutil.pid_exists(pid), timeout=5)
+
+
+def test_headed_turn_ends_native_task_pages_and_preserves_named_workflows(shared_browser):
+    from agent.turn_facade import _browser_turn_cleanup_boundary, _mark_browser_turn_cleanup_complete
+    from tools.browser_use_sessions import capture_task
+
+    save_config({"browser": {"cdp_url": "http://127.0.0.1:9222", "allow_private_urls": True, "headed": True}})
+    persistent = _exec(shared_browser + "-workflow", "print(current_tab())", session=shared_browser)
+    sibling = _exec(shared_browser + "-sibling", "print(current_tab())")
+    with _browser_turn_cleanup_boundary(shared_browser):
+        result = _exec(shared_browser, "print(current_tab())")
+        task = capture_task(shared_browser)
+        # The headed finalizer marks backend cleanup as skipped; native resources must still end.
+        _mark_browser_turn_cleanup_complete()
+    assert task.ended and task.cleanup_complete
+    assert SUPERVISOR_REGISTRY.get(shared_browser) is None
+    removed = json.loads(browser_cdp("Target.getTargetInfo", {"targetId": result["target_id"]}))
+    assert removed.get("error"), removed
+    assert _exec(shared_browser + "-workflow-next", "print(current_tab())", session=shared_browser)["target_id"] == persistent["target_id"]
+    assert _exec(shared_browser + "-sibling", "print(current_tab())")["target_id"] == sibling["target_id"]
+
+
+def test_old_cleanup_context_cannot_end_the_next_browser_turn(shared_browser):
+    import contextvars
+
+    from agent.turn_facade import _browser_turn_cleanup_boundary
+    from tools.browser_use_sessions import capture_task
+
+    with _browser_turn_cleanup_boundary(shared_browser):
+        original = _exec(shared_browser, "print(current_tab())")
+        old_context = contextvars.copy_context()
+        previous = capture_task(shared_browser)
+    with _browser_turn_cleanup_boundary(shared_browser):
+        next_turn = _exec(shared_browser, "print(current_tab())")
+        current = capture_task(shared_browser)
+        assert current is not previous
+        old_context.run(cleanup_browser, shared_browser)
+        assert not current.ended
+        assert _exec(shared_browser, "print(current_tab())")["target_id"] == next_turn["target_id"]
+    assert original["target_id"] != next_turn["target_id"]
 
 
 def test_running_native_call_survives_the_browser_inactivity_threshold(shared_browser):

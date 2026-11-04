@@ -433,8 +433,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             return False
         logger.warning("CDP supervisor %s: stopped after %s failed reconnect attempts: %s",
                        self.task_id, failures, _redact_cdp_error_text(e))
-        if SUPERVISOR_REGISTRY.get(self.task_id) is self:
-            SUPERVISOR_REGISTRY._pop(self.task_id, home_key=self.home_key, expected=self)
+        SUPERVISOR_REGISTRY._pop(self.task_id, home_key=self.home_key, expected=self)
         return True
 
     async def _run(self) -> None:
@@ -621,7 +620,7 @@ class _SupervisorRegistry:
                 if (existing.cdp_url == cdp_url and existing.target_id == target_id
                         and thread_ok and loop_ok and (publish_guard is None or publish_guard())):
                     return existing
-            supervisor = CDPSupervisor(task_id, cdp_url, target_id=target_id,
+            supervisor = CDPSupervisor(task_id=task_id, cdp_url=cdp_url, target_id=target_id,
                                        dialog_policy=dialog_policy, dialog_timeout_s=dialog_timeout_s)
             self._by_task.pop(key, None)
             self._home_by_task.pop(key, None)
@@ -663,9 +662,12 @@ class _SupervisorRegistry:
         if not starters:
             self._starting.pop(key, None)
 
-    def stop(self, task_id: str, *, home_key: Optional[str] = None) -> None:
+    def stop(self, task_id: str, *, home_key: Optional[str] = None,
+             expected: Optional[CDPSupervisor] = None) -> None:
         key = self._key(task_id, home_key)
         with self._lock:
+            if expected is not None and self._by_task.get(key) is not expected:
+                return
             self._generation[key] = self._generation.get(key, 0) + 1
             supervisor = self._by_task.pop(key, None)
             self._home_by_task.pop(key, None)

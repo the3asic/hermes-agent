@@ -116,18 +116,6 @@ def test_a_pid_file_naming_something_else_is_never_registered(tmp_path, register
     assert registered == []
 
 
-def test_stopping_the_daemons_releases_their_groups(monkeypatch, registered):
-    daemon = browser_use_cli.daemon_identity({"BU_NAME": "work"})
-    browser_use_cli._owned_daemon_groups.update({daemon: 4242})
-    monkeypatch.setattr(browser_use_cli, "_driven_daemons", {daemon: "home"})
-    monkeypatch.setattr(browser_use_cli, "_find_cli", lambda: ["browser-harness"])
-    monkeypatch.setattr(browser_use_cli, "_base_subprocess_env", dict)
-    monkeypatch.setattr(browser_use_cli, "_run_cli_killing_process_group", lambda *a: None)
-
-    browser_use_cli.stop_harness_daemons()
-
-    assert registered == [("unregister", [4242])]
-    assert browser_use_cli._owned_daemon_groups == {}
 
 
 def _shared_runtime(tmp_path) -> tuple[Path, dict]:

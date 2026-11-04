@@ -588,16 +588,23 @@ def stop_harness_daemons(home_key: Optional[str] = None) -> None:
     _reload_daemons(daemons)
 
 
-def stop_task_harness_daemons(task_id: str) -> None:
+def stop_task_harness_daemons(task_id: str, *, expected=None) -> bool:
     """Finish this task's implicit native sessions; explicit named sessions remain reusable."""
-    from tools.browser_use_sessions import cancel_task_cli, clear_task_binding, retire_task, task_session_name
+    from tools.browser_use_sessions import (cancel_task_cli, clear_task_binding, complete_task_cleanup,
+                                            retire_task, task_session_name)
 
-    task = retire_task(task_id)
+    task = retire_task(task_id, expected=expected)
+    if task is None:
+        return False
     cancel_task_cli(task)
     clear_task_binding(task)
     name = task_session_name(task_id)
-    daemons = [key for key in task.daemons if key[-1] in (name, _sidecar_daemon_name(name))]
+    with _driven_daemons_lock:
+        daemons = [key for key in task.daemons if key in _driven_daemons
+                   and key[-1] in (name, _sidecar_daemon_name(name))]
     _reload_daemons(daemons, deadline=time.monotonic() + 20)
+    complete_task_cleanup(task)
+    return True
 
 
 def _published_daemon_pid(env: dict) -> Optional[int]:

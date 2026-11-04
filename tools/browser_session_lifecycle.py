@@ -163,7 +163,8 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     with the bare task id."""
     from tools.browser_use_cli import stop_task_harness_daemons
     task = task_id or "default"
-    stop_task_harness_daemons(task)
+    if not stop_task_harness_daemons(task):
+        return
     bs = _bs()
     with bs._cleanup_lock:
         if bs.is_local_sidecar_key(task):

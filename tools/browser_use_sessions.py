@@ -34,8 +34,10 @@ class BrowserTask:
     home: str
     task_id: str
     ended: bool = False
+    cleanup_complete: bool = False
     daemons: set[tuple[str, ...]] = field(default_factory=set)
     page: Optional[HarnessPage] = None
+    supervisor: Optional[object] = None
     processes: set[subprocess.Popen] = field(default_factory=set)
 
     def current(self) -> bool:
@@ -108,6 +110,8 @@ def begin_task(task_id: Optional[str]) -> BrowserTask:
     key = (hermes_home_key(), task_id or "default")
     with _lock:
         current = _tasks.get(key)
+        if current is not None and current.ended and not current.cleanup_complete:
+            raise BrowserTaskEnded("The previous browser task is still being cleaned up")
         if current is None or current.ended:
             current = BrowserTask(*key)
             _tasks[key] = current
@@ -115,10 +119,11 @@ def begin_task(task_id: Optional[str]) -> BrowserTask:
 
 
 @contextmanager
-def browser_task_scope(task_id: str) -> Iterator[None]:
-    token = _current_task.set(begin_task(task_id))
+def browser_task_scope(task_id: str) -> Iterator[BrowserTask]:
+    task = begin_task(task_id)
+    token = _current_task.set(task)
     try:
-        yield
+        yield task
     finally:
         _current_task.reset(token)
 
@@ -165,13 +170,26 @@ def register_task_daemon(task: BrowserTask, daemon: tuple[str, ...]) -> None:
         task.daemons.add(daemon)
 
 
-def retire_task(task_id: str) -> BrowserTask:
+def retire_task(task_id: str, expected: Optional[BrowserTask] = None) -> Optional[BrowserTask]:
     key = (hermes_home_key(), task_id)
+    admitted = _current_task.get()
+    if expected is None and admitted is not None and (admitted.home, admitted.task_id) == key:
+        expected = admitted
     with _lock:
-        task = _tasks.setdefault(key, BrowserTask(*key))
+        task = _tasks.get(key)
+        if expected is not None and task is not expected:
+            return None
+        if task is None:
+            task = BrowserTask(*key)
+            _tasks[key] = task
         task.ended = True
         task.page = None
-    return task
+        return task
+
+
+def complete_task_cleanup(task: BrowserTask) -> None:
+    with _lock:
+        task.cleanup_complete = True
 
 
 @contextmanager
@@ -232,7 +250,7 @@ def bind_harness_supervisor(env: dict, task: BrowserTask, deadline: float) -> Op
     page = current_harness_page(env, task, deadline)
     policy, timeout_s = get_dialog_policy_config()
     task.require_current()
-    SUPERVISOR_REGISTRY.get_or_start(
+    supervisor = SUPERVISOR_REGISTRY.get_or_start(
         task_id=task.task_id, cdp_url=resolve_cdp_override(page.cdp_url), target_id=page.target_id,
         dialog_policy=policy, dialog_timeout_s=timeout_s,
         start_timeout=remaining(deadline, "page supervision"), publish_guard=task.current,
@@ -240,6 +258,7 @@ def bind_harness_supervisor(env: dict, task: BrowserTask, deadline: float) -> Op
     with _lock:
         task.require_current()
         task.page = page
+        task.supervisor = supervisor
     return page
 
 
@@ -247,7 +266,9 @@ def clear_task_binding(task: BrowserTask) -> None:
     from tools.browser_supervisor import SUPERVISOR_REGISTRY
     with _lock:
         task.page = None
-    SUPERVISOR_REGISTRY.stop(task.task_id, home_key=task.home)
+        supervisor, task.supervisor = task.supervisor, None
+    if supervisor is not None:
+        SUPERVISOR_REGISTRY.stop(task.task_id, home_key=task.home, expected=supervisor)
 
 
 def native_stop_command(python: str, daemon: tuple[str, ...]) -> list[str]:
@@ -255,13 +276,34 @@ def native_stop_command(python: str, daemon: tuple[str, ...]) -> list[str]:
         page = _native.get(daemon)
     expected = page.fingerprint if page is not None else None
     code = (
-        "import psutil\nfrom browser_harness import _ipc, admin\n"
+        "import json, psutil\nfrom browser_harness import _ipc, admin\n"
         f"expected = {expected!r}\n"
-        "pid = _ipc.identify(admin.NAME, timeout=5)\n"
-        "if pid is not None and expected is not None:\n"
-        "    if (pid, psutil.Process(pid).create_time()) != expected:\n"
-        "        raise RuntimeError('The native daemon changed before cleanup')\n"
+        "pid = _ipc.identify(admin.NAME, timeout=2)\n"
+        "if pid is None:\n"
+        "    record = _ipc.pid_path(admin.NAME)\n"
+        "    if record.exists():\n"
+        "        published = json.loads(record.read_text())\n"
+        "        pending = published.get('pid') if isinstance(published, dict) else published\n"
+        "        started = published.get('started') if isinstance(published, dict) else None\n"
+        "        if type(pending) is not int or pending <= 0:\n"
+        "            raise RuntimeError('The native daemon has an invalid PID record; cleanup ownership retained')\n"
+        "        if psutil.pid_exists(pending) and psutil.Process(pending).status() != psutil.STATUS_ZOMBIE:\n"
+        "            if started is None or admin._process_start_time(pending) == started:\n"
+        "                raise RuntimeError('The native browser daemon is still starting or unreachable; cleanup must be retried')\n"
+        "    elif expected is None:\n"
+        "        raise RuntimeError('The initial browser daemon has no verifiable exit record; cleanup ownership retained')\n"
+        "    if expected is not None and psutil.pid_exists(expected[0]):\n"
+        "        process = psutil.Process(expected[0])\n"
+        "        if process.create_time() == expected[1] and process.status() != psutil.STATUS_ZOMBIE:\n"
+        "            raise RuntimeError('The native daemon is alive without IPC; cleanup ownership retained')\n"
+        "elif expected is not None and (pid, psutil.Process(pid).create_time()) != expected:\n"
+        "    raise RuntimeError('The native daemon changed before cleanup')\n"
+        "identity = (pid, psutil.Process(pid).create_time()) if pid is not None else None\n"
         "admin.restart_daemon(require_clean=pid is not None)\n"
+        "if identity is not None and psutil.pid_exists(identity[0]):\n"
+        "    process = psutil.Process(identity[0])\n"
+        "    if process.create_time() == identity[1] and process.status() != psutil.STATUS_ZOMBIE:\n"
+        "        raise RuntimeError('The native daemon has not exited; cleanup ownership retained')\n"
     )
     return [python, "-c", code]
 
