@@ -195,7 +195,9 @@ def cleanup_profile_browsers(home_key: str) -> None:
 
     def _stop_harness():
         from tools.browser_use_cli import stop_harness_daemons
+        from tools.browser_use_sessions import complete_retired_tasks
         stop_harness_daemons(home_key)
+        complete_retired_tasks(home_key)
     _best_effort("Browser Use harness daemon stop", _stop_harness)
     from tools.browser_session_cloud import reset_caches
     reset_caches(home_key)
@@ -225,7 +227,9 @@ def cleanup_all_browsers() -> None:
 
     def _stop_harness():
         from tools.browser_use_cli import stop_harness_daemons
+        from tools.browser_use_sessions import complete_retired_tasks
         stop_harness_daemons()
+        complete_retired_tasks()
     _best_effort("Browser Use harness daemon stop", _stop_harness)
 
     def _stop_launched():

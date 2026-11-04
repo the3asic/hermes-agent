@@ -564,6 +564,19 @@ def test_old_cleanup_context_cannot_end_the_next_browser_turn(shared_browser):
     assert original["target_id"] != next_turn["target_id"]
 
 
+def test_profile_connection_cleanup_allows_a_later_turn_with_the_same_task_identity(shared_browser):
+    from agent.turn_facade import _browser_turn_cleanup_boundary
+    from hermes_constants import hermes_home_key
+    from tools.browser_session_lifecycle import cleanup_profile_browsers
+
+    with _browser_turn_cleanup_boundary(shared_browser):
+        first = _exec(shared_browser, "print(current_tab())")
+        cleanup_profile_browsers(hermes_home_key())
+    with _browser_turn_cleanup_boundary(shared_browser):
+        following = _exec(shared_browser, "print(current_tab())")
+    assert following["target_id"] != first["target_id"]
+
+
 def test_running_native_call_survives_the_browser_inactivity_threshold(shared_browser):
     expression = json.dumps("document.title = 'long native call'")
     first = _exec(shared_browser, f"js({expression})")

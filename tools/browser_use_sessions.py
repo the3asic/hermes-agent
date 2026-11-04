@@ -324,6 +324,15 @@ def retire_profile_tasks(home_key: Optional[str] = None) -> None:
         clear_task_binding(task)
 
 
+def complete_retired_tasks(home_key: Optional[str] = None) -> None:
+    """A successful profile teardown admits a later turn, while old contexts stay ended."""
+    with _lock:
+        for task in _tasks.values():
+            if task.ended and (home_key is None or task.home == home_key):
+                if all(process.poll() is not None for process in task.processes):
+                    task.cleanup_complete = True
+
+
 def execute_harness_call(command, code: str, env: dict, task: BrowserTask,
                          deadline: float, activation: str) -> dict:
     from agent.periodic_scheduler import schedule
