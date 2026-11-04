@@ -75,11 +75,19 @@ messaging platforms you can ask the agent to send you a screenshot — it arrive
 as a native photo attachment.
 
 **Parameters.** Besides `code`, the tool takes `timeout_s` (default 300, max
-1800) and `session`. Each `session` name gets its own driver process and its
-own browser (a separate Chromium locally, a separate cloud browser on cloud
-providers), so parallel subagents or simultaneous chats don't clobber one
-shared browser. Omitting `session` uses the shared default session, which is
-fine for one-at-a-time browsing. When [real-profile browsing](#real-profile-browsing-use-your-own-logins)
+1800) and `session`. Omitting `session` gives the current task a stable,
+profile-scoped driver name. On a shared CDP browser, browser-harness creates its
+own dedicated page for that name. Hermes binds page supervision to the driver's
+actual selected target and stops the implicit driver when the task ends; native
+shutdown closes its dedicated page while leaving sibling tasks' pages open.
+
+Use an explicit `session` name for a workflow that must persist across tasks.
+The same name shares that workflow; different names use separate drivers.
+The name `default` is reserved. The result includes `session` and, for CDP
+backends, `target_id`, so raw CDP calls can address the same page explicitly.
+Pages created in addition to the native dedicated page must be closed explicitly
+by the code that created them. This does not isolate cookies or restrict access
+to other targets through raw CDP. When [real-profile browsing](#real-profile-browsing-use-your-own-logins)
 is on, the tool also exposes a `local` flag (see that section).
 
 :::note

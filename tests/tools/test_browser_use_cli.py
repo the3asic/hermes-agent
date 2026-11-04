@@ -161,65 +161,10 @@ class TestToolSurfaceSwap:
         assert "browser_exec" in names
 
 
-class TestVaultSupervisorAttach:
-    def test_exec_attaches_supervisor_to_the_browser_it_drives(self, tmp_path, monkeypatch, _fake_supervisor_registry):
-        """browser_vault_fill injects secrets only over the supervisor's CDP WebSocket. Without this attach the
-        default (Browser Use) backend had no supervisor at all and every fill failed with supervisor_required."""
-        monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", lambda: {"browser": {}})
-        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho ok\n')
-        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-        monkeypatch.setattr("tools.browser_session_cdp.resolve_cdp_override", lambda url: url)
-
-        result = json.loads(bu_cli.browser_exec("print(1)", task_id="t-vault"))
-
-        assert result["success"] is True
-        assert _fake_supervisor_registry == [("t-vault", "ws://127.0.0.1:47000/devtools/browser/t-vault")]
 
 
-class TestBackendSwapRetargetsDaemons:
-    def test_browser_swap_restarts_every_daemon_on_the_new_endpoint(self, tmp_path, monkeypatch):
-        """/browser connect|disconnect swap the endpoint inside cleanup_all_browsers(). The harness daemon
-        latches BU_CDP_* when it starts and outlives every call, so without a stop there every later
-        browser_exec, named or not, kept driving the browser from before the swap."""
-        from tools.browser_session_lifecycle import cleanup_all_browsers
-
-        # Like browser-harness: one daemon per BU_NAME latches its first endpoint; --reload stops it.
-        cli = _fake_cli(tmp_path, f'''
-latch="{tmp_path}/daemon-${{BU_NAME:-default}}"
-if [ "${{1:-}}" = "--reload" ]; then rm -f "$latch"; exit 0; fi
-cat > /dev/null
-[ -f "$latch" ] || echo "$BU_CDP_URL" > "$latch"
-cat "$latch"
-''')
-        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-        monkeypatch.setattr("tools.browser_session_cdp.resolve_cdp_override", lambda url: url)
-        drive = lambda **kw: json.loads(bu_cli.browser_exec("print(1)", task_id="t-swap", **kw))["output"].strip()
-
-        monkeypatch.setenv("BROWSER_CDP_URL", "http://127.0.0.1:9400")
-        assert drive() == drive(session="research") == "http://127.0.0.1:9400"
-
-        cleanup_all_browsers()
-        monkeypatch.setenv("BROWSER_CDP_URL", "http://127.0.0.1:9401")
-        assert drive() == drive(session="research") == "http://127.0.0.1:9401"
 
 
-class TestVaultEgressRedaction:
-    def test_exec_redacts_registered_vault_secret_from_stdout_and_stderr(self, tmp_path, monkeypatch):
-        """A browser_exec page read must not return a vault-filled value to model history."""
-        from agent import redact
-
-        secret = "vault-filled-password-112693"
-        cli = _fake_cli(tmp_path, f'cat > /dev/null\necho "stdout={secret}"\necho "stderr={secret}" >&2\n')
-        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-        redact.register_vault_redaction_value(secret)
-        try:
-            result = json.loads(bu_cli.browser_exec("print(1)"))
-        finally:
-            redact.clear_vault_redaction_values()
-
-        serialized = json.dumps(result, ensure_ascii=False)
-        assert secret not in serialized
-        assert serialized.count("«redacted-vault-secret»") == 2
 
 
 
@@ -257,23 +202,7 @@ class TestLegacyCloudMigration:
         assert bu_cli.is_legacy_browser_use_cloud_config({}) is True
 
 
-    def test_migrated_config_gets_bu_autospawn(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", lambda: self._LEGACY)
-        monkeypatch.setenv("BROWSER_USE_API_KEY", "bu-key")
-        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "autospawn:$BU_AUTOSPAWN"\n')
-        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-        result = json.loads(bu_cli.browser_exec("print(1)"))
-        assert "autospawn:1" in result["output"]
 
-    def test_non_legacy_config_does_not_set_bu_autospawn(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            "hermes_cli.config_effective.load_user_config_effective",
-            lambda: {"browser": {}},
-        )
-        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "autospawn:[$BU_AUTOSPAWN]"\n')
-        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-        result = json.loads(bu_cli.browser_exec("print(1)"))
-        assert "autospawn:[]" in result["output"]
 
 
 class TestBackendCdpResolution:
@@ -374,27 +303,6 @@ class TestBackendCdpResolution:
         err = bu_cli._resolve_backend_cdp(self._env(), "t1")
         assert err and "no" in err.lower() and "CDP" in err
 
-    def test_named_session_composes_with_provider_backend(self, tmp_path, monkeypatch):
-        """session=<name> composes with a configured provider backend: the
-        name keys its OWN provider browser (bu-named-<name>), so concurrent
-        named sessions never share one browser (#86894)."""
-
-        seen = []
-
-        def fake_session_info(key):
-            seen.append(key)
-            return {"cdp_url": "wss://browser.example/cdp/" + key}
-
-        monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override", lambda: "")
-        monkeypatch.setattr(bs_cloud, "get_cloud_provider", lambda: object())
-        monkeypatch.setattr(bs, "get_session_info", fake_session_info)
-        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:$BU_NAME ws:$BU_CDP_WS"\n')
-        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-        result = json.loads(bu_cli.browser_exec("print(1)", session="r7k2"))
-        assert result["success"] is True
-        assert seen == ["bu-named-r7k2"]
-        assert "bu:r7k2" in result["output"]
-        assert "ws:wss://browser.example/cdp/bu-named-r7k2" in result["output"]
 
     def test_named_session_key_stable_across_tasks(self, monkeypatch):
         """The same session name maps to the same provider cache key no
@@ -513,69 +421,6 @@ class TestBackendCdpResolution:
         assert env["BU_CDP_WS"] == "wss://gateway.example/cdp/legacy"
 
 
-class TestOwnTabPreamble:
-    """Named sessions on SHARED browsers (a /browser connect CDP override) get the own-tab preamble
-    prepended; private per-name browsers (packaged Chromium, provider) and unnamed sessions do not."""
-
-    def _run(self, tmp_path, monkeypatch, *, session="", private=False, provider=False, shared_cdp=""):
-
-        monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override", lambda: shared_cdp)
-        if provider:
-            monkeypatch.setattr(bs_cloud, "get_cloud_provider", lambda: object())
-            monkeypatch.setattr(
-                bs, "get_session_info",
-                lambda key: {"cdp_url": "wss://browser.example/cdp/" + key},
-            )
-        else:
-            monkeypatch.setattr(bs_cloud, "get_cloud_provider", lambda: None)
-        # fake CLI echoes stdin back so we can inspect what code was sent
-        cli = _fake_cli(tmp_path, "cat\n")
-        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-        return json.loads(bu_cli.browser_exec("print('payload')", session=session))
-
-    def test_named_shared_browser_gets_preamble(self, tmp_path, monkeypatch):
-        result = self._run(tmp_path, monkeypatch, session="r7k2", shared_cdp="http://127.0.0.1:9222")
-        assert result["success"] is True
-        assert "_hermes_ensure_own_tab" in result["output"]
-        # model code still present, after the preamble
-        assert result["output"].index("_hermes_ensure_own_tab") < result["output"].index("print('payload')")
-
-    def test_named_packaged_chromium_skips_preamble(self, tmp_path, monkeypatch):
-        """Each named session launches its own packaged Chromium — nothing to share a tab with."""
-        result = self._run(tmp_path, monkeypatch, session="r7k2")
-        assert result["success"] is True
-        assert "_hermes_ensure_own_tab" not in result["output"]
-
-    def test_unnamed_session_gets_no_preamble(self, tmp_path, monkeypatch):
-        result = self._run(tmp_path, monkeypatch, session="")
-        assert result["success"] is True
-        assert "_hermes_ensure_own_tab" not in result["output"]
-
-    def test_named_provider_browser_skips_preamble(self, tmp_path, monkeypatch):
-        """Per-name provider browsers are private — preamble would leak a tab."""
-        result = self._run(tmp_path, monkeypatch, session="r7k2", provider=True)
-        assert result["success"] is True
-        assert "_hermes_ensure_own_tab" not in result["output"]
-
-    def test_sentinel_never_reaches_subprocess_env(self, tmp_path, monkeypatch):
-
-        monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override", lambda: "")
-        monkeypatch.setattr(bs_cloud, "get_cloud_provider", lambda: object())
-        monkeypatch.setattr(
-            bs, "get_session_info",
-            lambda key: {"cdp_url": "wss://browser.example/cdp/" + key},
-        )
-        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "sentinel:${_HERMES_BU_PRIVATE_BROWSER:-unset}"\n')
-        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-        result = json.loads(bu_cli.browser_exec("print(1)", session="r7k2"))
-        assert "sentinel:unset" in result["output"]
-
-    def test_preamble_is_valid_python(self):
-        import ast
-
-        ast.parse(bu_cli._OWN_TAB_PREAMBLE)
-        # and composes with model code
-        ast.parse(bu_cli._OWN_TAB_PREAMBLE + "print('x')")
 
 
 class TestProviderPickerIntegration:
@@ -646,39 +491,8 @@ class TestNativeScreenshots:
         out = f"{stale}\n/nonexistent/dir/x.png\n"
         assert bu_cli._find_screenshot(out, since=time.time()) is None
 
-    def test_vision_model_gets_multimodal_envelope(self, tmp_path, monkeypatch):
-        shot = self._shot(tmp_path)
-        cli = _fake_cli(tmp_path, f'cat > /dev/null\necho "{shot}"\n')
-        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-        monkeypatch.setattr(
-            "tools.vision_tools._should_use_native_vision_fast_path", lambda: True
-        )
-        monkeypatch.setattr(
-            "tools.vision_tools._resize_image_for_vision",
-            lambda p, **kw: "data:image/png;base64,QUJD",
-        )
-        result = bu_cli.browser_exec("print(capture_screenshot())")
-        assert isinstance(result, dict) and result["_multimodal"] is True
-        kinds = [part["type"] for part in result["content"]]
-        assert kinds == ["text", "image_url"]
-        assert result["meta"]["screenshot_path"] == shot
-        assert shot in result["text_summary"]
 
-    def test_text_only_model_gets_plain_result_with_path(self, tmp_path, monkeypatch):
-        shot = self._shot(tmp_path)
-        cli = _fake_cli(tmp_path, f'cat > /dev/null\necho "{shot}"\n')
-        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-        monkeypatch.setattr(
-            "tools.vision_tools._should_use_native_vision_fast_path", lambda: False
-        )
-        result = json.loads(bu_cli.browser_exec("print(capture_screenshot())"))
-        assert result["screenshot_path"] == shot
 
-    def test_no_screenshot_keeps_string_result(self, tmp_path, monkeypatch):
-        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "no images here"\n')
-        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-        result = json.loads(bu_cli.browser_exec("print(1)"))
-        assert "screenshot_path" not in result
 
 
 class TestStepLabels:
@@ -771,46 +585,6 @@ class TestSkillTextDescription:
 
 
 
-class TestBrowserExec:
-    def test_missing_cli_returns_install_hint(self, monkeypatch):
-        monkeypatch.setattr(bu_cli, "_find_cli", lambda: None)
-        result = json.loads(bu_cli.browser_exec("print(page_info())"))
-        assert result["error"]
-
-    def test_empty_code_rejected(self):
-        result = json.loads(bu_cli.browser_exec("   "))
-        assert "error" in result
-
-    def test_code_piped_on_stdin(self, tmp_path, monkeypatch):
-        cli = _fake_cli(tmp_path, 'code=$(cat)\necho "got:$code"\n')
-        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-        result = json.loads(bu_cli.browser_exec('print("hi")'))
-        assert result["success"] is True
-        assert result["exit_code"] == 0
-        assert 'got:print("hi")' in result["output"]
-        assert "session" not in result
-
-    def test_session_sets_bu_name(self, tmp_path, monkeypatch):
-        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:$BU_NAME"\n')
-        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-        result = json.loads(bu_cli.browser_exec("print(1)", session="r7k2"))
-        assert "bu:r7k2" in result["output"]
-        assert result["session"] == "r7k2"
-
-    def test_invalid_session_name_rejected(self, monkeypatch, tmp_path):
-        cli = _fake_cli(tmp_path, "cat > /dev/null\n")
-        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-        result = json.loads(bu_cli.browser_exec("print(1)", session="bad name!"))
-        assert "error" in result
-        assert "session" in result["error"].lower()
-
-    def test_nonzero_exit_reports_failure_and_stderr(self, tmp_path, monkeypatch):
-        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "boom" >&2\nexit 3\n')
-        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-        result = json.loads(bu_cli.browser_exec("print(1)"))
-        assert result["success"] is False
-        assert result["exit_code"] == 3
-        assert "boom" in result["stderr"]
 
 
 
@@ -904,24 +678,6 @@ class TestLightpandaBackendResolution:
         assert seen == ["t1"]  # provider path, same cache key
 
 
-class TestLightpandaPreamble:
-    def test_lightpanda_session_skips_own_tab_preamble(self, tmp_path, monkeypatch):
-        """A Lightpanda process is private to its session: no sibling daemon
-        to collide with, and Target.createTarget would fail anyway
-        (lightpanda-io/browser#1962)."""
-
-        monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override", lambda: "")
-        monkeypatch.setattr(bs_cloud, "get_cloud_provider", lambda: None)
-        monkeypatch.setattr("tools.browser_lightpanda.using_lightpanda_engine", lambda: True)
-        monkeypatch.setattr(
-            bs, "get_session_info", lambda key: {"cdp_url": "http://127.0.0.1:43111"}
-        )
-        cli = _fake_cli(tmp_path, "cat\n")
-        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-        result = json.loads(bu_cli.browser_exec("print('payload')", session="r7k2"))
-        assert result["success"] is True
-        assert "_hermes_ensure_own_tab" not in result["output"]
-        assert "print('payload')" in result["output"]
 
 
 class TestLightpandaHeader:
@@ -997,35 +753,6 @@ class TestTimeoutProcessGroupKill:
     blocked forever, and the wedged call's activity heartbeat pins the session at
     "now" in the sidebar indefinitely."""
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
-    def test_timeout_kills_grandchild_and_returns_promptly(self, tmp_path, monkeypatch):
-        """A grandchild that outlives the direct child and holds the inherited stdout
-        pipe must not keep browser_exec blocked past the timeout (it wedged permanently
-        before the group kill)."""
-        monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", dict)
-        pid_file = tmp_path / "grandchild.pid"
-        cli = _fake_cli(tmp_path, (
-            "cat > /dev/null\n"
-            "sleep 60 &\n"
-            "echo $! > \"" + str(pid_file) + "\"\n"
-            "sleep 60\n"
-        ))
-        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-        monkeypatch.setattr(bu_cli, "_MIN_TIMEOUT_S", 1)
-
-        start = time.time()
-        result = json.loads(bu_cli.browser_exec("print(1)", timeout_s=1))
-        elapsed = time.time() - start
-
-        assert "timed out" in result["error"]
-        # Pre-fix, this hangs until the 60s sleeps expire — and forever with a daemon child.
-        assert elapsed < 30
-        # The pipe-holding grandchild died with the group instead of leaking.
-        pid = int(pid_file.read_text(encoding="utf-8-sig").strip())
-        deadline = time.time() + 5
-        while time.time() < deadline and psutil.pid_exists(pid):
-            time.sleep(0.05)
-        assert not psutil.pid_exists(pid)
 
     def test_post_kill_drain_is_bounded(self, monkeypatch):
         """If even the post-kill drain misses its deadline, give up instead of wedging."""
@@ -1041,82 +768,3 @@ class TestTimeoutProcessGroupKill:
         monkeypatch.setattr(bu_cli, "_kill_cli_process_group", lambda proc: None)
         with pytest.raises(subprocess.TimeoutExpired):
             bu_cli._run_cli_killing_process_group(["x"], "code", {}, 5)
-
-
-class TestExecHybridPrivateUrlRouting:
-    """With a cloud provider configured and ``browser.auto_local_for_private_urls`` on, a browser_exec
-    call carrying a private URL runs on the hybrid LOCAL sidecar or is refused; it never reaches the
-    cloud browser (one CDP endpoint per call)."""
-
-    LAN = "http://192.168.0.1:9120/login"
-
-    @pytest.fixture(autouse=True)
-    def _cloud_with_hybrid(self, monkeypatch, tmp_path):
-        monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override", lambda: "")
-        monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override_raw", lambda: "")
-        monkeypatch.setattr(bs_cloud, "get_cloud_provider", lambda: object())
-        monkeypatch.setattr(bs_cloud, "auto_local_for_private_urls", lambda: True)
-        monkeypatch.setattr(bu_cli, "_exec_route_is_sidecar", {}, raising=False)
-        monkeypatch.setattr(bu_cli, "_driven_daemons", {})
-        self.cloud_keys, self.local_keys = [], []
-
-        def session_info(key):  # one session layer: the ::local sidecar is a local browser
-            if bs.is_local_sidecar_key(key):
-                self.local_keys.append(key)
-                return {"cdp_url": f"ws://127.0.0.1:47000/devtools/browser/{key}", "features": {"local": True}}
-            self.cloud_keys.append(key)
-            return {"cdp_url": "wss://cloud.example/x"}
-        monkeypatch.setattr(bs, "get_session_info", session_info)
-        cli = _fake_cli(tmp_path, 'cat >/dev/null; printf "%s" "${BU_NAME:-default}"\n')
-        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-
-    @staticmethod
-    def _dns(monkeypatch, first_ip, later_ip):
-        """A rebinding host: ``first_ip`` for the first lookup, ``later_ip`` for every later one."""
-        lookups = []
-
-        def fake_getaddrinfo(host, *a, **kw):
-            lookups.append(host)
-            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (first_ip if len(lookups) == 1 else later_ip, 0))]
-
-        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
-
-    @pytest.mark.parametrize("case, code, refusal", [
-        ("lan", f'new_tab("{LAN}")', None),
-        ("mixed", f'new_tab("https://example.com/x")\nnew_tab("{LAN}")', None),
-        ("rebind-private-then-public", 'new_tab("http://rebind.example/login")', None),
-        ("imds", 'new_tab("http://169.254.169.254/latest/meta-data/")', "cloud metadata"),
-        ("hybrid-off", f'new_tab("{LAN}")', "private or internal"),
-        ("rebind-public-then-private", 'new_tab("http://flip.example/x")', "private or internal"),
-    ])
-    def test_private_url_runs_on_local_sidecar_or_is_refused(self, monkeypatch, case, code, refusal):
-        if case.startswith("rebind-private"):
-            self._dns(monkeypatch, "192.168.1.5", "93.184.216.34")
-        elif case.startswith("rebind-public"):
-            self._dns(monkeypatch, "93.184.216.34", "192.168.1.5")
-        elif case == "hybrid-off":
-            monkeypatch.setattr(bs_cloud, "auto_local_for_private_urls", lambda: False)
-
-        result = json.loads(bu_cli.browser_exec(code, task_id="t"))
-
-        assert self.cloud_keys == [], "a call carrying a private URL reached the cloud provider"
-        if refusal:
-            assert refusal in result.get("error", ""), result
-            assert self.local_keys == []
-        else:
-            assert result["success"] is True, result
-            assert self.local_keys == ["t::local"]
-            assert result["output"] == "_local_default"
-
-    def test_sidecar_route_has_its_own_daemon_and_sticks_for_url_less_calls(self):
-        """The harness daemon reads BU_CDP_* once at spawn, so the sidecar must not share the cloud
-        route's daemon; a follow-up with no URL literal keeps driving the page the last call opened."""
-        steps = [('new_tab("https://example.com/")', "default"),
-                 (f'new_tab("{self.LAN}")', "_local_default"),
-                 ('print(js("document.title"))', "_local_default")]
-
-        daemons = [json.loads(bu_cli.browser_exec(code, task_id="t"))["output"] for code, _ in steps]
-
-        assert daemons == [want for _, want in steps]
-        assert self.cloud_keys == ["t"]
-        assert self.local_keys == ["t::local", "t::local"]

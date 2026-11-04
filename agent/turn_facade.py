@@ -7,7 +7,7 @@ MRO unchanged.
 """
 import logging
 import uuid
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from typing import Any, Dict, Generator, List, Optional
 
@@ -31,25 +31,23 @@ def _mark_browser_turn_cleanup_complete() -> None:
 @contextmanager
 def _browser_turn_cleanup_boundary(task_id: str):
     """Guarantee browser finalization for every conversation-loop exit."""
-    token = _browser_turn_cleanup_completed.set(False)
-    try:
-        yield
-    finally:
+    from tools.browser_use_sessions import browser_task_scope
+    from tools.browser_use_cli import stop_task_harness_daemons
+    with browser_task_scope(task_id) as task:
+        token = _browser_turn_cleanup_completed.set(False)
         try:
-            if not _browser_turn_cleanup_completed.get():
-                from tools.browser_session_lifecycle import cleanup_browser
-                cleanup_browser(task_id)
-        except Exception as exc:
-            # A cleanup failure must not replace a completed response or mask
-            # the original exception/cancellation. RETIRING state remains the
-            # logical fail-closed boundary for a later retry.
-            logger.warning(
-                "Browser turn cleanup failed for task %s: %s",
-                task_id,
-                exc,
-            )
+            yield
         finally:
-            _browser_turn_cleanup_completed.reset(token)
+            try:
+                # Native task resources end even when a headed backend remains open.
+                if stop_task_harness_daemons(task_id, expected=task) and not _browser_turn_cleanup_completed.get():
+                    from tools.browser_session_lifecycle import cleanup_browser
+                    cleanup_browser(task_id)
+            except Exception as exc:
+                # Preserve the completed response and retain failed cleanup ownership for retry.
+                logger.warning("Browser turn cleanup failed for task %s: %s", task_id, exc)
+            finally:
+                _browser_turn_cleanup_completed.reset(token)
 
 
 class TurnFacadeMixin:
@@ -112,8 +110,7 @@ class TurnFacadeMixin:
         token = affinity_token = acct_token = None
         task_started = task_finished = False
         relay_outcome = "failed"
-        browser_cleanup_scope = _browser_turn_cleanup_boundary(effective_task_id)
-        browser_cleanup_scope.__enter__()
+        browser_cleanup_scope = nullcontext()
 
         try:
             # First statement of the try so the finally's note_turn_finished balances every exit.
@@ -134,6 +131,9 @@ class TurnFacadeMixin:
                 return admission.early_result
             lease = admission.lease
             conversation_history = admission.conversation_history
+            admitted_browser_scope = _browser_turn_cleanup_boundary(effective_task_id)
+            admitted_browser_scope.__enter__()
+            browser_cleanup_scope = admitted_browser_scope
 
             relay_session_cwd, relay_turn_cwd = resolve_relay_scope_cwds(
                 self,
@@ -239,9 +239,10 @@ class TurnFacadeMixin:
                             lease.stop_refresher()
                             lease.join_threads()
                             lease.clear_interrupt()  # refresher interrupt between stop and join; AFTER join
-                            lease.release()
-                    finally:
                         browser_cleanup_scope.__exit__(None, None, None)
+                    finally:
+                        if lease is not None:
+                            lease.release()
                         # Always clear mid-turn labels on exit, including interrupted early returns.
                         with suppress(Exception):
                             self._reset_activity_labels_after_turn()

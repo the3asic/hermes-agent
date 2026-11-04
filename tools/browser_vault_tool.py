@@ -106,20 +106,27 @@ def _ensure_supervisor(task_id: str):
     the task's session CDP endpoint when none is running. None when no endpoint is known; a fill then
     refuses rather than touching argv."""
     from tools.browser_supervisor import SUPERVISOR_REGISTRY
+    from tools.browser_use_sessions import restore_harness_supervisor
 
+    supervisor = restore_harness_supervisor(task_id)
+    if supervisor is not None:
+        return supervisor
     supervisor = SUPERVISOR_REGISTRY.get(task_id)
     if supervisor is not None:
         return supervisor
     from tools.browser_session import session_for_task
     from tools.browser_session_cdp import get_dialog_policy_config, resolve_cdp_override
 
-    cdp_url = str(session_for_task(task_id).get("cdp_url") or "")
-    if not cdp_url:
+    session = session_for_task(task_id)
+    cdp_url = str(session.get("cdp_url") or "")
+    target_id = session.get("target_id")
+    if not cdp_url or not target_id:
         return None
     policy, timeout_s = get_dialog_policy_config()
     try:
         return SUPERVISOR_REGISTRY.get_or_start(task_id=task_id, cdp_url=resolve_cdp_override(cdp_url),
-                                                dialog_policy=policy, dialog_timeout_s=timeout_s)
+                                                target_id=target_id, dialog_policy=policy,
+                                                dialog_timeout_s=timeout_s)
     except Exception as exc:  # health: allow BLE001 -- a failed attach is reported as supervisor_required
         logger.debug("vault fill: supervisor attach to the task's session failed (%s)", exc)
         return None

@@ -161,7 +161,10 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     """Close the sessions serving ``task_id``: its exact key, its hybrid ``::local`` sidecar, and the
     served-profile-tagged keys browser_exec builds for it (``<task>@<home>``). Per-turn cleanup calls this
     with the bare task id."""
+    from tools.browser_use_cli import stop_task_harness_daemons
     task = task_id or "default"
+    if not stop_task_harness_daemons(task):
+        return
     bs = _bs()
     with bs._cleanup_lock:
         if bs.is_local_sidecar_key(task):
@@ -177,6 +180,8 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
 def cleanup_profile_browsers(home_key: str) -> None:
     """Close one profile home's sessions, CDP supervisors and harness daemons, and drop its cached config
     (``/browser connect`` on a multiplexed gateway). Other profiles' browsers stay."""
+    from tools.browser_use_sessions import retire_profile_tasks
+    retire_profile_tasks(home_key)
     bs = _bs()
     with bs._cleanup_lock:
         keys = [key for key, info in bs._active_sessions.items() if info.get("home_key") == home_key]
@@ -190,7 +195,9 @@ def cleanup_profile_browsers(home_key: str) -> None:
 
     def _stop_harness():
         from tools.browser_use_cli import stop_harness_daemons
+        from tools.browser_use_sessions import complete_retired_tasks
         stop_harness_daemons(home_key)
+        complete_retired_tasks(home_key)
     _best_effort("Browser Use harness daemon stop", _stop_harness)
     from tools.browser_session_cloud import reset_caches
     reset_caches(home_key)
@@ -205,6 +212,8 @@ def cleanup_all_browsers() -> None:
     """Close every session (gateway shutdown), stop every browser this process launched, reset caches. Each
     session is closed under its owning profile, as the janitor does: a cloud session belongs to that profile's
     provider and credentials."""
+    from tools.browser_use_sessions import retire_profile_tasks
+    retire_profile_tasks()
     bs = _bs()
     with bs._cleanup_lock:
         keys = list(bs._active_sessions)
@@ -218,7 +227,9 @@ def cleanup_all_browsers() -> None:
 
     def _stop_harness():
         from tools.browser_use_cli import stop_harness_daemons
+        from tools.browser_use_sessions import complete_retired_tasks
         stop_harness_daemons()
+        complete_retired_tasks()
     _best_effort("Browser Use harness daemon stop", _stop_harness)
 
     def _stop_launched():

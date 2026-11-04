@@ -52,45 +52,6 @@ _LOCAL_FALLBACK_SENTINEL = "_HERMES_BU_LOCAL_FALLBACK"
 # Where new/hidden tabs may be brought to the front: a browser_use_shot.ACTIVATE_* mode. Popped before launch.
 _CLOUD_BROWSER_SENTINEL = "_HERMES_BU_CLOUD_BROWSER"
 
-# Prepended to the model's code for named sessions on SHARED browsers (a /browser connect CDP override): the
-# harness daemon attaches to the first existing page at startup, so two fresh named daemons can land on the
-# SAME tab. Steering each onto a tab it created prevents clobbering. Runs once per daemon (marker keyed by
-# BU_NAME + daemon pid).
-_OWN_TAB_PREAMBLE = """\
-# hermes: pin this named session to its own tab (once per daemon process)
-def _hermes_ensure_own_tab():
-    import os as _os, tempfile as _tf
-    _name = _os.environ.get("BU_NAME", "default")
-    try:
-        # Key the marker by the daemon's pid so a daemon restart (which
-        # re-attaches to the first shared page) re-pins automatically,
-        # while agent-driven tab switches mid-session are left alone.
-        from browser_harness import _ipc as _bipc
-        _dpid = _bipc.pid_path(_name).read_text().strip() or "0"
-    except Exception:
-        _dpid = "0"
-    _uid = _os.getuid() if hasattr(_os, "getuid") else 0
-    _marker = _os.path.join(
-        _tf.gettempdir(), "hermes-bu-owntab-%s-%s-%s" % (_uid, _name, _dpid)
-    )
-    if _os.path.exists(_marker):
-        return
-    try:
-        # Force a fresh target: new_tab() would REUSE a blank current tab,
-        # which is exactly the tab a sibling daemon may also hold.
-        _tid = cdp("Target.createTarget", url="about:blank").get("targetId")
-        if _tid:
-            switch_tab(_tid)
-    except Exception:
-        pass  # best-effort: worst case is pre-fix behavior
-    try:
-        open(_marker, "w").close()
-    except OSError:
-        pass
-_hermes_ensure_own_tab()
-del _hermes_ensure_own_tab
-"""
-
 _DEFAULT_TIMEOUT_S = 300
 _MIN_TIMEOUT_S = 5
 _MAX_TIMEOUT_S = 1800
@@ -329,7 +290,7 @@ def _served_profile_tag() -> str:
     """``""`` outside a served-profile scope (every legacy key stays byte-identical); under a
     multiplexed turn, the routed profile's home key — one profile's browser must never be handed
     to another that happens to use the same session name or task id (#110032)."""
-    from hermes_constants import get_hermes_home_override, hermes_home_key
+    from hermes_constants import get_hermes_home_override
     return "" if get_hermes_home_override() is None else hermes_home_key()
 
 
@@ -418,7 +379,7 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = 
     from tools.browser_session import get_session_info
     from tools.browser_session_cdp import get_cdp_override
     from tools.browser_session_cloud import get_cloud_provider
-    override = _quiet(get_cdp_override, "")
+    override = get_cdp_override()
     if override:
         _set_cdp_env(env, override)
         return None
@@ -503,21 +464,10 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
     return err or None
 
 
-def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
-    """Attach the per-task CDP supervisor to the browser this exec drives so ``browser_vault`` fill has
-    a secret-capable WebSocket (never argv) into the SAME browser. Only CDP-routed backends expose an
-    endpoint; BU direct-cloud (BU_AUTOSPAWN) does not, and the vault tools report ``supervisor_required``."""
-    cdp = env.get("BU_CDP_WS") or env.get("BU_CDP_URL")
-    if not cdp:
-        return
-    try:
-        from tools.browser_session_cdp import get_dialog_policy_config, resolve_cdp_override
-        from tools.browser_supervisor import SUPERVISOR_REGISTRY
-        policy, timeout_s = get_dialog_policy_config()
-        SUPERVISOR_REGISTRY.get_or_start(task_id=task_id or "default", cdp_url=resolve_cdp_override(cdp),
-                                         dialog_policy=policy, dialog_timeout_s=timeout_s)
-    except Exception as exc:
-        logger.debug("browser_exec: CDP supervisor attach failed (non-fatal): %s", exc)
+def _attach_vault_supervisor(env: dict, task_id: Optional[str]):
+    """Resolve the native named page before attaching any page-level supervisor."""
+    from tools.browser_use_sessions import bind_harness_supervisor, capture_task, operation_deadline
+    return bind_harness_supervisor(env, capture_task(task_id), operation_deadline())
 
 
 def _route_backend(env: dict, session: str, task_id: Optional[str], local: bool,
@@ -589,7 +539,7 @@ def _kill_cli_process_group(proc) -> None:
         os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX only, the nt branch returned above
 
 
-def _run_cli_killing_process_group(cmd, code, env, timeout):
+def _run_cli_killing_process_group(cmd, code, env, timeout, *, task=None):
     """Run the CLI in its own process group and kill the whole group on timeout.
 
     ``subprocess.run`` only kills the direct child on ``TimeoutExpired``; a grandchild that
@@ -597,10 +547,10 @@ def _run_cli_killing_process_group(cmd, code, env, timeout):
     still holding them, and on Windows ``run()``'s unbounded post-kill ``communicate()`` then
     blocks on pipe EOF forever — so the tool call, plus its activity heartbeat, wedges (#106244).
     """
-    proc = subprocess.Popen(
-        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace", env=env, **_group_popen_kwargs(),
-    )
+    from tools.browser_use_sessions import forget_task_cli, spawn_task_cli
+    options = dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                   text=True, encoding="utf-8", errors="replace", env=env, **_group_popen_kwargs())
+    proc = spawn_task_cli(task, cmd, **options) if task is not None else subprocess.Popen(cmd, **options)
     try:
         stdout, stderr = proc.communicate(input=code, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -608,6 +558,9 @@ def _run_cli_killing_process_group(cmd, code, env, timeout):
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.communicate(timeout=_POST_KILL_DRAIN_S)
         raise
+    finally:
+        if task is not None:
+            forget_task_cli(task, proc)
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
@@ -632,9 +585,26 @@ def stop_harness_daemons(home_key: Optional[str] = None) -> None:
     it resolves then."""
     with _driven_daemons_lock:
         daemons = sorted(key for key, home in _driven_daemons.items() if home_key in (None, home))
-        for key in daemons:
-            _driven_daemons.pop(key, None)
     _reload_daemons(daemons)
+
+
+def stop_task_harness_daemons(task_id: str, *, expected=None) -> bool:
+    """Finish this task's implicit native sessions; explicit named sessions remain reusable."""
+    from tools.browser_use_sessions import (cancel_task_cli, clear_task_binding, complete_task_cleanup,
+                                            retire_task, task_session_name)
+
+    task = retire_task(task_id, expected=expected)
+    if task is None:
+        return False
+    cancel_task_cli(task)
+    clear_task_binding(task)
+    name = task_session_name(task_id)
+    with _driven_daemons_lock:
+        daemons = [key for key in task.daemons if key in _driven_daemons
+                   and key[-1] in (name, _sidecar_daemon_name(name))]
+    _reload_daemons(daemons, deadline=time.monotonic() + 20)
+    complete_task_cleanup(task)
+    return True
 
 
 def _published_daemon_pid(env: dict) -> Optional[int]:
@@ -654,18 +624,25 @@ def _own_harness_daemon_until_owned(env: dict) -> Optional[bool]:
     return None if _own_harness_daemon(env) is None else False
 
 
-def _reload_daemons(daemons) -> None:  # each ``daemon_identity`` daemon, with its own dirs
+def _reload_daemons(daemons, *, deadline=None) -> None:  # each ``daemon_identity`` daemon, with its own dirs
     cmd = _find_cli() if daemons else None
     if not cmd:
         return
+    from tools.browser_use_sessions import daemon_operation, forget_native_daemon, native_stop_command, remaining
+    deadline = deadline if deadline is not None else time.monotonic() + 25
     env = _base_subprocess_env()
     for daemon in daemons:
-        with contextlib.suppress(OSError, subprocess.SubprocessError):
-            _run_cli_killing_process_group([*cmd, "--reload"], "", daemon_env(env, daemon), 15)
-        with _owned_daemon_groups_lock:
-            pgid = _owned_daemon_groups.pop(daemon, None)
-        if pgid is not None:
-            release_process_group_once_empty(pgid)  # a daemon --reload failed to stop stays covered
+        with daemon_operation(daemon, deadline):
+            result = _run_cli_killing_process_group(native_stop_command(cmd[0], daemon), "", daemon_env(env, daemon),
+                                                  remaining(deadline, "session cleanup"))
+            result.check_returncode()
+            forget_native_daemon(daemon)
+            with _driven_daemons_lock:
+                _driven_daemons.pop(daemon, None)
+            with _owned_daemon_groups_lock:
+                pgid = _owned_daemon_groups.pop(daemon, None)
+            if pgid is not None:
+                release_process_group_once_empty(pgid)
 
 
 # Daemon identity (``daemon_identity``: its dirs + BU_NAME) -> process group of the harness daemon this
@@ -758,8 +735,6 @@ def _reload_if_republished(env: dict, generation: int) -> None:
     if _live_generation() == generation:
         return
     daemon = daemon_identity(env)
-    with _driven_daemons_lock:
-        _driven_daemons.pop(daemon, None)
     _reload_daemons([daemon])
 
 
@@ -779,6 +754,11 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     if not code or not code.strip():
         return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
 
+    from tools.browser_use_sessions import capture_task
+    task = capture_task(task_id)
+    timeout = _clamp_timeout(timeout_s)
+    deadline = time.monotonic() + timeout
+
     # The verdict is carried into the route, never re-derived: the predicate resolves DNS, so a second
     # evaluation could relax the floor and still pick the cloud for a rebinding host.
     verdict = _code_url_verdict(code)
@@ -794,33 +774,33 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         return tool_error("browser-harness is missing from Hermes's Python environment. "
                           "Run `hermes update` to re-sync it.")
 
+    from tools.browser_use_sessions import task_session_name
     env = _base_subprocess_env()
-    if session:
-        if not _SESSION_RE.match(session):
-            return tool_error(f"Invalid session name {session!r}: use 1-64 letters, digits, "
-                              "dashes, or underscores (e.g. 'r7k2').")
-        env["BU_NAME"] = session
+    if session == "default" or session.startswith("hermes-"):
+        return tool_error("The session name is reserved for automatic task pages. Omit session, "
+                          "or choose a workflow name outside 'default' and the 'hermes-' prefix.")
+    if session and not _SESSION_RE.match(session):
+        return tool_error(f"Invalid session name {session!r}: use 1-64 letters, digits, "
+                          "dashes, or underscores (e.g. 'r7k2').")
+    env["BU_NAME"] = session or task_session_name(task_id)
     env, route_err, local_sidecar, generation = _route_exec_current(
         env, session, task_id, bool(local), local_sidecar, route_key)
     if route_err:
         return tool_error(route_err)
     if local_sidecar:
-        env["BU_NAME"] = _sidecar_daemon_name(session)
+        env["BU_NAME"] = _sidecar_daemon_name(env["BU_NAME"])
     fit_default_socket_dir(env)  # BU_NAME is final: a deep HOME's socket would overflow sun_path
     _exec_route_is_sidecar[route_key] = local_sidecar
     local_engine = env.pop(_BOT_DESKTOP_BROWSER_SENTINEL, None)
     bot_desktop_browser = bool(local_engine)
     _exec_local_engine.set(local_engine)  # only local browsers carry the sentinel
 
-    # SHARED browser (/browser connect CDP override): pin each named session to its own tab (see
-    # _OWN_TAB_PREAMBLE). Private per-name browsers skip this — nothing to collide with.
-    private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)  # always pop: never exported to the CLI
-    if session and not private_browser:
-        code = _OWN_TAB_PREAMBLE + code
+    # browser-harness creates and closes its native dedicated page for each non-default name.
+    env.pop(_PRIVATE_BROWSER_SENTINEL, None)
     # Every backend: capture_screenshot() falls back to jpeg instead of hanging on a png a hidden tab never
     # renders; only on a cloud browser does it (and new_tab) bring the tab to the front (tools/browser_use_shot.py).
-    from tools.browser_use_shot import ACTIVATE_NEVER, harness_command
-    cmd = harness_command(cmd, activate=env.pop(_CLOUD_BROWSER_SENTINEL, None) or ACTIVATE_NEVER)
+    from tools.browser_use_shot import ACTIVATE_NEVER
+    activation = env.pop(_CLOUD_BROWSER_SENTINEL, None) or ACTIVATE_NEVER
 
     workspace = _workspace_dir(task_id)
     if workspace:
@@ -831,30 +811,18 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     if "BU_AUTOSPAWN" not in env and is_legacy_browser_use_cloud_config(_read_browser_cfg()):
         env["BU_AUTOSPAWN"] = "1"
 
-    timeout = _clamp_timeout(timeout_s)
     started = time.time()
 
     def dispatch() -> dict[str, Any]:
-        _attach_vault_supervisor(env, task_id)
-        with _driven_daemons_lock:
-            daemon = daemon_identity(env)
-            _driven_daemons[daemon] = hermes_home_key()
-        # The first call starts the daemon and may run long (navigation, user code): own it as soon as
-        # it publishes its pid, so a Hermes killed mid-call takes it along (the call's end owns it too).
-        from agent.periodic_scheduler import schedule
-        owning = schedule(lambda: _own_harness_daemon_until_owned(env), _OWN_DURING_CALL_S)
+        from tools.browser_use_sessions import execute_harness_call
         try:
-            return {"proc": _run_cli_killing_process_group(cmd, code, env, timeout)}
+            return execute_harness_call(cmd, code, env, task, deadline, activation)
         except subprocess.TimeoutExpired:
-            return {"error_result": tool_error(
-                f"browser-use exec timed out after {timeout}s. The daemon may still be working; retry "
-                f"with a larger timeout_s (max {_MAX_TIMEOUT_S}), or split the work into several calls that "
-                "append to workspace files — anything already written to the workspace is preserved."
-            )}
-        except OSError as e:
-            return {"error_result": tool_error(f"Failed to launch browser-use CLI: {e}")}
-        finally:
-            owning.cancel(wait=5)  # an in-flight check finishes before the post-call one runs
+            return {"error_result": tool_error(f"browser_exec timed out during execution within its {timeout}s total budget")}
+        except TimeoutError as error:
+            return {"error_result": tool_error(str(error))}
+        except OSError as error:
+            return {"error_result": tool_error(f"Failed to launch browser-use CLI: {error}")}
 
     if bot_desktop_browser:
         from tools.browser_session import run_fenced
@@ -872,14 +840,19 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     # browser_vault fill registers injected values with this forced model-egress
     # boundary. Preserve raw stdout only for screenshot-path detection below.
     result = {
-        "success": proc.returncode == 0,
+        "success": proc.returncode == 0 and not dispatched.get("binding_error"),
         "exit_code": proc.returncode,
         "output": redact_sensitive_text(proc.stdout, force=True),
     }
+    if dispatched.get("binding_error"):
+        result["execution_completed"] = True
+        result["binding_error"] = redact_sensitive_text(dispatched["binding_error"], force=True)
+        result["error"] = "Execution finished, but its browser page is no longer available for supervision"
     if workspace:
         result["workspace"] = workspace
-    if session:
-        result["session"] = session
+    result["session"] = env["BU_NAME"]
+    if dispatched.get("target_id"):
+        result["target_id"] = dispatched["target_id"]
     result.update(_take_real_profile_note(route_key))
     stderr = redact_sensitive_text((proc.stderr or "").strip(), force=True)
     if len(stderr) > _STDERR_CAP_CHARS:
@@ -995,7 +968,7 @@ BROWSER_EXEC_SCHEMA = {
         "type": "object",
         "properties": {
             "code": {"type": "string", "description": "Python code to execute using the pre-imported browser helpers. Use print(...) for any data you need back."},
-            "session": {"type": "string", "description": "Named isolated browser session — its own daemon and (on cloud backends) own browser, so concurrent tasks don't share tabs. Reuse the same name on every related call; omit for the shared default session."},
+            "session": {"type": "string", "description": "Optional reusable workflow name. Omit for an automatic page scoped to this task and cleaned up when it ends. Explicit names persist across tasks; the same name shares a session. The name 'default' and the 'hermes-' prefix are reserved."},
             "timeout_s": {"type": "integer", "default": _DEFAULT_TIMEOUT_S,
                           "description": f"Max seconds to wait for the code to finish (default {_DEFAULT_TIMEOUT_S}, max {_MAX_TIMEOUT_S})."},
         },
