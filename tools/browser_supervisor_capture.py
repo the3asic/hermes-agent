@@ -38,6 +38,7 @@ class CapturedCDP:
         self._loop: asyncio.AbstractEventLoop = supervisor._loop  # type: ignore[assignment]
         self._ws = supervisor._ws
         self.task_id: str = supervisor.task_id
+        self.home_key: str = supervisor.home_key
         self.cdp_url: str = supervisor.cdp_url
         # The default page session at capture time. A later ``focus_page`` on the supervisor
         # does not change it: calls with this id keep reaching the page captured here.
@@ -46,7 +47,7 @@ class CapturedCDP:
     def is_valid(self) -> bool:
         """True while the captured connection is still the supervisor's live one."""
         sup = self._supervisor
-        return (self._registry.get(self.task_id) is sup and sup._active and not sup._stop_requested
+        return (self._registry.get(self.task_id, home_key=self.home_key) is sup and sup._active and not sup._stop_requested
                 and sup._ws is self._ws and self._loop.is_running())
 
     def _invalid(self) -> CapturedCDPInvalid:

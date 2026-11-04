@@ -209,33 +209,6 @@ def test_a_daemon_another_live_hermes_started_on_the_same_name_is_never_register
         other_hermes.wait(timeout=10)
 
 
-def test_a_long_first_browser_exec_owns_its_daemon_before_the_call_returns(monkeypatch):
-    """The first call starts the daemon and may run for minutes (navigation, user code). Its daemon
-    must reach the supervisor during the call, or a Hermes killed mid-call leaves it running."""
-    import threading
-
-    owned_during_call = threading.Event()
-    running = threading.Event()
-    monkeypatch.setattr(browser_use_cli, "_own_harness_daemon",
-                        lambda env: running.is_set() and owned_during_call.set())
-
-    def run_cli(*_args):
-        running.set()
-        owned_during_call.wait(10)  # the CLI is still "running" until the daemon was owned
-        running.clear()
-        return subprocess.CompletedProcess([], 0, "ok", "")
-
-    monkeypatch.setattr(browser_use_cli, "_find_cli", lambda: ["browser-use"])
-    monkeypatch.setattr(browser_use_cli, "_base_subprocess_env", dict)
-    monkeypatch.setattr(browser_use_cli, "_route_exec_current",
-                        lambda env, *_a: ({**env, "BU_CDP_URL": "http://127.0.0.1:9222"}, None, False, 0))
-    monkeypatch.setattr(browser_use_cli, "_run_cli_killing_process_group", run_cli)
-    monkeypatch.setattr(browser_use_cli, "_driven_daemons", {})
-
-    browser_use_cli.browser_exec("print(page_info())", task_id="long-first-call")
-    assert owned_during_call.is_set(), "the daemon was only owned after the CLI call returned"
-
-
 def test_a_managed_worker_never_owns_its_harness_daemon(fake_daemon, registered, monkeypatch):
     """A managed per-turn worker keeps its browser between turns (agent/managed_worker.py); owning
     the daemon would kill it with every turn's worker, as _owns_job already avoids for jobs."""

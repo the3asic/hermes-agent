@@ -31,7 +31,10 @@ def _mark_browser_turn_cleanup_complete() -> None:
 @contextmanager
 def _browser_turn_cleanup_boundary(task_id: str):
     """Guarantee browser finalization for every conversation-loop exit."""
+    from tools.browser_use_sessions import browser_task_scope
     token = _browser_turn_cleanup_completed.set(False)
+    scope = browser_task_scope(task_id)
+    scope.__enter__()
     try:
         yield
     finally:
@@ -49,6 +52,7 @@ def _browser_turn_cleanup_boundary(task_id: str):
                 exc,
             )
         finally:
+            scope.__exit__(None, None, None)
             _browser_turn_cleanup_completed.reset(token)
 
 

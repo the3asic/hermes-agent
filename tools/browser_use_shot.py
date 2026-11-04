@@ -28,7 +28,9 @@ _log = logging.getLogger("hermes_browser_use_shot")
 def _default_shot_path() -> str:
     try:
         from browser_harness import _ipc  # the harness's own per-user temp dir
-        return str(_ipc._TMP / "shot.png")
+        fd, path = tempfile.mkstemp(prefix="shot-", suffix=".png", dir=_ipc._TMP)
+        os.close(fd)
+        return path
     except (ImportError, AttributeError):
         return os.path.join(tempfile.gettempdir(), "shot.png")
 
@@ -150,6 +152,19 @@ def install(helpers: Any, activate: str = ACTIVATE_NEVER) -> None:
 _HARNESS_MODULE_ARGS = ["-m", "browser_harness.run"]
 _LAUNCHER = """\
 import importlib.util, runpy
+expected = {expected!r}
+if expected is not None:
+    import psutil
+    from browser_harness import _ipc, admin
+    admin.require_existing_daemon()
+    connection, token = _ipc.connect(admin.NAME, timeout=5)
+    try:
+        ping = _ipc.request(connection, token, {{'meta': 'ping'}})
+    finally:
+        connection.close()
+    actual = (ping.get('pid'), psutil.Process(ping['pid']).create_time())
+    if actual != expected:
+        raise RuntimeError('The browser daemon changed before user code execution')
 spec = importlib.util.spec_from_file_location('hermes_browser_use_shot', {path!r})
 shot = importlib.util.module_from_spec(spec); spec.loader.exec_module(shot)
 import browser_harness.helpers
@@ -158,10 +173,10 @@ runpy.run_module('browser_harness.run', run_name='__main__', alter_sys=True)
 """
 
 
-def harness_command(cmd: list[str], activate: str) -> list[str]:
+def harness_command(cmd: list[str], activate: str, expected=None) -> list[str]:
     """``python -m browser_harness.run`` as a launcher that installs these helpers first. The model's code
     still arrives untouched on stdin (no preamble shifting its traceback line numbers). This file is loaded
     by path: the harness interpreter has no Hermes checkout on sys.path."""
     if cmd[1:] != _HARNESS_MODULE_ARGS:
         return cmd
-    return [cmd[0], "-c", _LAUNCHER.format(path=os.path.abspath(__file__), activate=activate)]
+    return [cmd[0], "-c", _LAUNCHER.format(path=os.path.abspath(__file__), activate=activate, expected=expected)]
