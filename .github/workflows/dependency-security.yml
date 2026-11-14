@@ -11,6 +11,12 @@ on:
       - scripts/ci/run_dependency_security_acceptance.py
       - .github/workflows/dependency-security.yml
   workflow_dispatch:
+    inputs:
+      lcm_ref:
+        description: Exact the3asic/hermes-lcm commit for optional compatibility checks
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -58,4 +64,64 @@ jobs:
         with:
           name: dependency-security-acceptance
           path: artifacts/hermes-dependency-security-acceptance
+          if-no-files-found: error
+
+  lcm-compatibility:
+    if: github.event_name == 'workflow_dispatch' && inputs.lcm_ref != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      HERMES_HOME: ${{ runner.temp }}/lcm-compatibility-home
+      HERMES_RUNTIME_DIR: ${{ runner.temp }}/lcm-compatibility-tools
+      UV_CACHE_DIR: ${{ runner.temp }}/lcm-compatibility-cache
+      TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/lcm-tokenizer-cache
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out the selected plugin
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: the3asic/hermes-lcm
+          ref: ${{ inputs.lcm_ref }}
+          path: artifacts/hermes-lcm
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+      - name: Build the complete host through PM
+        run: >-
+          python -m pm.build_env --source .
+          --out "${RUNNER_TEMP}/lcm-core-host-env" --python "$(command -v python)"
+          --cache "$UV_CACHE_DIR" --group test --group dev
+          --extra anthropic --extra messaging --extra mcp --extra vision --extra pty --extra web
+          --no-install-project
+      - name: Prepare the plugin environment from the real host
+        run: >-
+          "${RUNNER_TEMP}/lcm-core-host-env/bin/python"
+          artifacts/hermes-lcm/scripts/prepare_release_environment.py
+          --core-root "$GITHUB_WORKSPACE" --out "${RUNNER_TEMP}/lcm-compatibility-env"
+          --cache "$UV_CACHE_DIR"
+      - name: Prime the genuine offline tokenizer
+        run: >-
+          "${RUNNER_TEMP}/lcm-compatibility-env/bin/python"
+          -c 'import tiktoken; tiktoken.get_encoding("cl100k_base")'
+      - name: Verify the exact clean pair without provider connections
+        env:
+          EXPECTED_CORE: ${{ github.sha }}
+          EXPECTED_LCM: ${{ inputs.lcm_ref }}
+        run: >-
+          "${RUNNER_TEMP}/lcm-compatibility-env/bin/python"
+          scripts/ci/run_lcm_compatibility.py
+          --lcm-root artifacts/hermes-lcm
+          --expected-core "$EXPECTED_CORE" --expected-lcm "$EXPECTED_LCM"
+          --output artifacts/lcm-compatibility-acceptance
+      - name: Upload compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lcm-compatibility-acceptance
+          path: artifacts/lcm-compatibility-acceptance
           if-no-files-found: error
