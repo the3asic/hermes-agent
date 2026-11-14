@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
-import resource
+import sqlite3
 import subprocess
 import sys
 
@@ -27,7 +27,8 @@ def main() -> int:
         raise ValueError('Compatibility validation requires exact 40-character commit identities')
 
     def git(root: Path, *arguments: str) -> str:
-        return subprocess.check_output(['git', '-C', str(root), *arguments], text=True).strip()
+        return subprocess.check_output(['git', '-C', str(root), *arguments],
+                                       text=True, encoding='utf-8', timeout=30).strip()
 
     sources = {'core': (core, args.expected_core), 'lcm': (plugin, args.expected_lcm)}
     for name, (root, expected) in sources.items():
@@ -46,8 +47,13 @@ def main() -> int:
         result = 0
         attempts: list[str] = []
     else:
+        if os.name != 'posix':
+            raise RuntimeError('This bounded compatibility lane requires a POSIX host')
+        import resource
+
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        resource.setrlimit(resource.RLIMIT_NOFILE, (min(soft, 1024), hard))
+        bounded = 1024 if soft == resource.RLIM_INFINITY else min(soft, 1024)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (bounded, hard))
         attempts = []
 
         def audit(event, arguments):
@@ -65,6 +71,7 @@ def main() -> int:
         if git(root, 'rev-parse', 'HEAD') != expected or git(root, 'status', '--porcelain'):
             raise RuntimeError(f'{name} changed during compatibility validation')
     receipt = {'core_sha': args.expected_core, 'lcm_sha': args.expected_lcm,
+               'sqlite_version': sqlite3.sqlite_version,
                'started_at': started, 'completed_at': datetime.now(UTC).isoformat(),
                'exit_code': int(result), 'preflight_only': args.preflight_only,
                'in_process_network_connect_attempts': attempts,
