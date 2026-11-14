@@ -34,8 +34,8 @@ def _git(root: Path, *args: str) -> str:
 
 def _locked_runtime_versions(root: Path) -> dict[str, str]:
     """Require installed versions to belong to this source's lock and direct constraints."""
-    lock = tomllib.loads((root / "uv.lock").read_text(encoding="utf-8"))
-    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    lock = tomllib.loads((root / "uv.lock").read_text(encoding="utf-8-sig"))
+    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8-sig"))["project"]
     versions: dict[str, set[str]] = {}
     for package in lock["package"]:
         versions.setdefault(canonicalize_name(package["name"]), set()).add(package["version"])
