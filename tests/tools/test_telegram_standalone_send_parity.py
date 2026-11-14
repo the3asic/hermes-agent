@@ -73,6 +73,106 @@ def standalone(monkeypatch: pytest.MonkeyPatch, tmp_path):
     return SimpleNamespace(bot=bot, run=run, home=tmp_path)
 
 
+def test_error_diagnostic_redacts_the_complete_filesystem_traceback(tmp_path) -> None:
+    import logging
+
+    from plugins.platforms.telegram.standalone import _sanitized_exc_info
+
+    missing = tmp_path / "token=private-token" / "missing.txt"
+    with pytest.raises(FileNotFoundError) as failure:
+        missing.read_bytes()
+    record = logging.LogRecord(__name__, logging.ERROR, __file__, 0, "upload failed", (),
+                               _sanitized_exc_info(failure.value))
+    diagnostic = logging.Formatter().format(record)
+
+    assert "Traceback (most recent call last)" in diagnostic
+    assert "FileNotFoundError" in diagnostic
+    assert "private-token" not in diagnostic
+
+
+def test_media_handle_is_seekable_and_closed_on_cancellation(tmp_path) -> None:
+    from plugins.platforms.telegram.standalone import _open_media_file
+
+    path = tmp_path / "media.txt"
+    path.write_bytes(b"native filesystem upload")
+    opened, release = asyncio.Event(), asyncio.Event()
+    streams = []
+
+    async def upload():
+        async with _open_media_file(path) as stream:
+            streams.append(stream)
+            assert stream.read(6) == b"native"
+            stream.seek(0)
+            assert stream.read(6) == b"native"
+            opened.set()
+            await release.wait()
+
+    async def drive():
+        task = asyncio.create_task(upload())
+        await asyncio.wait_for(opened.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert streams[0].closed
+
+    asyncio.run(drive())
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("close_loop", [False, True], ids=["active-loop", "closed-loop"])
+def test_cancelled_file_open_closes_a_late_fifo_handle(tmp_path, close_loop) -> None:
+    import threading
+
+    from plugins.platforms.telegram.standalone import _open_media_file
+    from tests.waiting import async_wait_until, wait_until
+
+    pipe = tmp_path / "upload.fifo"
+    os.mkfifo(pipe)
+    descriptor_root = "/proc/self/fd"
+
+    def pipe_open():
+        for name in os.listdir(descriptor_root):
+            try:
+                if os.readlink(f"{descriptor_root}/{name}") == str(pipe):
+                    return True
+            except FileNotFoundError:  # a different worker closed its descriptor between reads
+                continue
+        return False
+
+    def connect_writer():
+        with open(pipe, "wb"):
+            pass
+
+    async def upload():
+        async with _open_media_file(pipe):
+            raise AssertionError("cancelled upload must not enter its body")
+
+    async def cancel_open():
+        task = asyncio.create_task(upload())
+        await asyncio.sleep(0)  # start the real filesystem opener, blocked until a writer connects
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    writer = threading.Thread(target=connect_writer, daemon=True)
+
+    async def drive():
+        await cancel_open()
+        writer.start()
+        await asyncio.to_thread(writer.join, 5)
+        assert not writer.is_alive(), "filesystem opener never connected to its writer"
+        await async_wait_until(lambda: not pipe_open(), timeout=5)
+
+    if close_loop:
+        asyncio.run(cancel_open())
+        writer.start()
+        writer.join(5)
+        assert not writer.is_alive(), "filesystem opener never connected to its writer"
+        wait_until(lambda: not pipe_open(), timeout=5)
+    else:
+        asyncio.run(drive())
+
+
 def test_notifications_mode_reaches_every_standalone_send(standalone) -> None:
     """``important`` (default) sends silently, text and media alike; ``notify`` rings (cron's
     ``cron.delivery.notify``); ``display.platforms.telegram.notifications: all`` in config.yaml rings."""

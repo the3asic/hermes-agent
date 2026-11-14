@@ -442,8 +442,8 @@ class PluginHost:
 
         Sent as the plugin whose code made the call (``plugin``, in its load ``load``); False, as before
         this was forwarded, unless that load is the plugin's current one and ``plugin_id`` is its own."""
+        from agent.runtime_scope import bind_profile_scope
         from hermes_cli.plugin_events import emit_plugin_session_event
-        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         plugin = str(params.get("plugin") or "")
         ctx = self._contexts.get(plugin)
         if ctx is None or getattr(ctx, "plugin_id", None) != params.get("plugin_id") \
@@ -451,12 +451,9 @@ class PluginHost:
             logger.warning("Plugin host session event %r refused: sender %r (load %r) is not that loaded plugin",
                            params.get("plugin_id"), params.get("plugin"), params.get("load"))
             return False
-        token = set_hermes_home_override(self._home)
-        try:
+        with bind_profile_scope(self._home, hydrate_secrets=False):
             return emit_plugin_session_event(str(params.get("plugin_id")), params.get("session_id"),
                                              str(params.get("event")), params.get("payload"))
-        finally:
-            reset_hermes_home_override(token)
 
     def _serve_facade(self, params: dict[str, Any]) -> Any:
         from hermes_cli.plugin_isolation import HOST_REMOTE_FACADES

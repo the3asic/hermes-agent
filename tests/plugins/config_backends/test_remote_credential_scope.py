@@ -201,6 +201,30 @@ def test_secondary_never_borrows_the_launch_profiles_env_override(launch_home, m
     assert refreshes == [("https://portal.nousresearch.com", "refresh-for-https://portal.nousresearch.com")]
 
 
+def test_secret_only_bind_keeps_the_callers_home_and_terminal_policy(tmp_path):
+    from agent.runtime_scope import bind_state, scope_for_profile
+    from hermes_scope import current_state
+
+    caller, owner = tmp_path / "caller", tmp_path / "owner"
+    for home in (caller, owner):
+        home.mkdir()
+        (home / ".env").write_text("", encoding="utf-8")
+    (owner / "config.yaml").write_text("terminal: [", encoding="utf-8")
+    set_multiplex_active(True)
+    try:
+        with bind_state(scope_for_profile(caller), secrets={}, terminal_policy={"TERMINAL_ENV": "local"}):
+            before = current_state()
+            with credentials._bind_owner_secret_scope(owner):
+                state = current_state()
+                assert state.scope.agent == str(owner)
+                assert state.home == before.home
+                assert state.terminal is before.terminal
+                assert state.secrets.profile_home == str(owner)
+            assert current_state() == before
+    finally:
+        set_multiplex_active(False)
+
+
 def test_single_profile_binds_nothing(launch_home, refreshes, monkeypatch):
     """Not multiplexing: no scope is bound and the process env still routes (unchanged behaviour)."""
     from agent.secret_scope import current_secret_scope

@@ -11,6 +11,7 @@ import contextlib
 import logging
 import os
 import re
+import traceback
 from types import SimpleNamespace
 
 from agent.redact import redact_sensitive_text
@@ -32,13 +33,19 @@ _NO_DELIVERABLE = "No deliverable text or media remained after processing MEDIA 
 _URL_SECRET_QUERY_RE = re.compile(
     r"([?&](?:access_token|api[_-]?key|auth[_-]?token|token|signature|sig)=)([^&#\s]+)", re.IGNORECASE)
 _GENERIC_SECRET_ASSIGN_RE = re.compile(
-    r"\b(access_token|api[_-]?key|auth[_-]?token|signature|sig)\s*=\s*([^\s,;]+)", re.IGNORECASE)
+    r"\b(access_token|api[_-]?key|auth[_-]?token|token|signature|sig)\s*=\s*([^\s,;]+)", re.IGNORECASE)
 
 
 def _sanitize_error_text(text) -> str:
     """Redact secrets from error text before surfacing it to users/models."""
     redacted = _URL_SECRET_QUERY_RE.sub(lambda m: f"{m.group(1)}***", redact_sensitive_text(text))
     return _GENERIC_SECRET_ASSIGN_RE.sub(lambda m: f"{m.group(1)}=***", redacted)
+
+
+def _sanitized_exc_info(error: Exception) -> tuple:
+    """Keep the diagnostic traceback while redacting its whole exception chain before logging."""
+    diagnostic = _sanitize_error_text("".join(traceback.format_exception(error)))
+    return RuntimeError, RuntimeError(diagnostic), None
 
 
 def _error(message: str) -> dict:
@@ -157,7 +164,8 @@ def _telegram_thread_kwargs(thread_id):
     try:
         from plugins.platforms.telegram.adapter import TelegramAdapter
         effective = TelegramAdapter._message_thread_id_for_send(str(thread_id))
-    except Exception:  # adapter import failed (python-telegram-bot missing): explicit mapping
+    except Exception as exc:  # adapter unavailable: keep the explicit topic mapping
+        logger.debug("Telegram adapter topic mapping unavailable", exc_info=_sanitized_exc_info(exc))
         effective = None if str(thread_id) == "1" else int(thread_id)
     return {} if effective is None else {"message_thread_id": effective}
 
@@ -167,7 +175,8 @@ def _strip_mdv2_safe(text):
     try:
         from plugins.platforms.telegram.adapter import _strip_mdv2
         return _strip_mdv2(text)
-    except Exception:
+    except Exception as exc:
+        logger.debug("Telegram MarkdownV2 stripping unavailable", exc_info=_sanitized_exc_info(exc))
         return text
 
 
@@ -214,6 +223,70 @@ async def _telegram_send_text_chunk(bot, chat_id, chunk, parse_mode, has_html, t
         return await send(chunk if has_html else _strip_mdv2_safe(chunk), None)
 
 
+@contextlib.asynccontextmanager
+async def _open_media_file(path):
+    """Open off-loop; a cancelled waiter still closes a handle its opener later returns."""
+    import threading
+
+    from agent.memory_provider import spawn_context_thread
+
+    loop = asyncio.get_running_loop()
+    opened = loop.create_future()
+    lock = threading.Lock()
+    pending = {"stream": None, "error": None, "abandoned": False}
+
+    def abandon():
+        with lock:
+            pending["abandoned"] = True
+            stream, pending["stream"] = pending["stream"], None
+        if stream is not None:
+            stream.close()
+
+    def settle():
+        with lock:
+            if pending["abandoned"]:
+                return
+            if not opened.cancelled():
+                if pending["error"] is not None:
+                    opened.set_exception(pending["error"])
+                else:
+                    opened.set_result(pending["stream"])
+                return
+        abandon()
+
+    def open_file():
+        stream, error = None, None
+        try:
+            stream = open(path, "rb")
+        except (OSError, ValueError, TypeError) as exc:
+            error = exc
+        with lock:
+            abandoned = pending["abandoned"]
+            if not abandoned:
+                pending.update(stream=stream, error=error)
+        if abandoned:
+            if stream is not None:
+                stream.close()
+            return
+        try:
+            loop.call_soon_threadsafe(settle)
+        except RuntimeError:  # the loop ended while the filesystem was still opening the file
+            abandon()
+
+    spawn_context_thread(open_file, name="telegram-media-open").start()
+    try:
+        stream = await opened
+    except asyncio.CancelledError:
+        abandon()
+        raise
+    with lock:
+        pending["stream"] = None  # the context body now owns the handle, even if the loop ends
+    try:
+        yield stream
+    finally:
+        stream.close()
+
+
 async def _telegram_send_one_media(bot, chat_id, media_path, is_voice, *, caption, parse_mode, has_html,
                                    thread_kwargs, force_document):
     """Upload one file with adapter-matching fallbacks (thread-not-found -> no
@@ -247,10 +320,10 @@ async def _telegram_send_one_media(bot, chat_id, media_path, is_voice, *, captio
     from plugins.platforms.telegram.telegram_media_budget import scaled_budgets
     # The adapter's media budgets (#133164): the Bot's 20s read timeout cuts off Telegram's
     # post-upload processing, so a delivered file came back "Timed out" and got resent.
-    media_kwargs.update(scaled_budgets([media_path, thumb_path], 0.0)[0])
+    media_kwargs.update((await asyncio.to_thread(scaled_budgets, [media_path, thumb_path], 0.0))[0])
     from plugins.platforms.telegram.telegram_media_retry import send_media_retrying
     try:
-        with open(media_path, "rb") as f:  # noqa: ASYNC230 -- file handle is streamed to the upload; a local open() is non-blocking in practice
+        async with _open_media_file(media_path) as f:
             def upload():  # a failure Telegram provably never posted repeats, as in the adapter (#62079)
                 return send_media_retrying(lambda: _telegram_send_media(
                     bot, chat_id, f, ext, is_voice, force_document, **media_kwargs), lambda: f.seek(0), "media upload")
@@ -347,7 +420,6 @@ def _record_media_failure(error, media_path, warnings, last_msg):
     maybe = request_may_have_delivered(error)
     warnings.append(_sanitize_error_text(
         f"Failed to send media {media_path}: {error}" + (" (Telegram may still deliver it; do not resend)" if maybe else "")))
-    logger.error(warnings[-1])
     if maybe:  # delivery unknown, never a hard failure a caller would answer with a resend
         return last_msg or SimpleNamespace(message_id=None)
     return last_msg
@@ -422,7 +494,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             last_msg = await _telegram_send_text_chunk(
                 bot, int_chat_id, chunk, send_parse_mode, _has_html, text_kwargs, outcome=outcome)
             outcome.landed(getattr(last_msg, "message_id", None))
-        if album := _telegram_album_paths(media_files, force_document, _tg_caption):
+        if album := await asyncio.to_thread(_telegram_album_paths, media_files, force_document, _tg_caption):
             result = await send_album_standalone(bot, extra or {}, chat_id, album, thread_id=thread_id, notify=notify)
             detail = result.raw_response or {}
             warnings += [_sanitize_error_text(f"Failed to send Telegram photo {path}: {err}")
@@ -436,7 +508,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             media_files = [(path, False) for path in detail.get("refused", ())]
             last_msg = last_msg or (SimpleNamespace(message_id=None) if result.success else None)
         for media_path, is_voice in media_files:
-            if not os.path.exists(media_path):
+            if not await asyncio.to_thread(os.path.exists, media_path):
                 warnings.append(f"Media file not found, skipping: {media_path}")
                 logger.warning(warnings[-1])
                 # Caption mode suppressed the text send; the file is gone, so deliver the words alone.
@@ -447,7 +519,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         _tg_caption = None  # delivered — don't re-caption a later file
                     except Exception as _cap_err:
                         logger.warning("Telegram caption-fallback send failed for missing media: %s",
-                                       _sanitize_error_text(_cap_err))
+                                       _sanitize_error_text(_cap_err), exc_info=_sanitized_exc_info(_cap_err))
                 continue
             try:
                 last_msg = await _telegram_send_one_media(
@@ -455,6 +527,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                     has_html=_has_html, thread_kwargs=thread_kwargs, force_document=force_document)
             except Exception as e:
                 last_msg = _record_media_failure(e, media_path, warnings, last_msg)
+                logger.error(warnings[-1], exc_info=_sanitized_exc_info(e))
         if last_msg is None:
             return {"error": _NO_DELIVERABLE, **({"warnings": warnings} if warnings else {})}
         return _success(chat_id, warnings, **({"message_id": str(last_msg.message_id)}
@@ -464,6 +537,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return {"error": "python-telegram-bot not installed. Run: "
                 f"{install_hint('telegram')}", "retryable": True}
     except Exception as e:
+        logger.error("Telegram standalone send failed", exc_info=_sanitized_exc_info(e))
         from plugins.platforms.telegram import telegram_send_errors as kinds
         # Nothing sent (cron may replay it) only when this request never left or was refused, no
         # receipt came back (``last_msg``: a chunk or the album) and ``outcome`` saw no earlier try

@@ -78,8 +78,7 @@ def _nous_token(home: Path) -> str:
             f"no Nous access token for {home} (auth.json): {exc}", retryable=not fatal) from exc
     finally:
         if scope_token is not None:
-            from agent.secret_scope import reset_secret_scope
-            reset_secret_scope(scope_token)
+            scope_token.reset()
         reset_hermes_home_override(token)
 
 
@@ -94,11 +93,13 @@ def _bind_owner_secret_scope(home: Path):
     secret sources are not hydrated here: both read the profile's config, which this token is used
     to fetch.
     """
-    from agent.secret_scope import is_multiplex_active, set_secret_scope
+    from agent.secret_scope import is_multiplex_active
     if not is_multiplex_active():
         return None  # single-profile: get_secret reads the process env, which is this profile's
+    from agent.runtime_scope import bind_state, scope_for_profile
     from tui_gateway.launch_profile_policy import owner_secret_scope
-    return set_secret_scope(owner_secret_scope(home), profile_home=str(home))
+    return bind_state(scope_for_profile(home), secrets=owner_secret_scope(home),
+                      home_override=False, terminal=False)
 
 
 def _idp_token() -> str:

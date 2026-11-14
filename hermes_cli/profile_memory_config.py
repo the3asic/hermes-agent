@@ -102,37 +102,32 @@ def notify_memory_provider(profile_dir: Path, call: Callable[[MemoryProvider], N
     provider, or an unreadable config, is logged and never fails the create/rename that called it
     (the directory is already published). A plugin host the hook started for that profile is
     stopped afterwards (``plugins.isolation: host``), so a long-lived dashboard keeps none behind."""
-    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from agent.runtime_scope import bind_state, scope_for_profile
 
     name = None
-    home_token = set_hermes_home_override(str(profile_dir))
-    secret_token = None
     try:
-        if not _names_external_provider(profile_dir):
-            return  # the common case: no provider, so no secret scope, effective config or load
-        from agent.secret_scope import build_profile_secret_scope, set_secret_scope
-        from hermes_cli.plugin_isolation import transient_plugin_host
-        from plugins.memory import load_memory_provider, provider_registration_scope
-        # Secrets first: the effective config (managed scope, ``${VAR}`` refs) expands through them.
-        # Its configured secret sources too (1Password etc.); a brand-new profile was never hydrated.
-        from hermes_cli.env_loader import hydrate_profile_secret_sources
-        hydrate_profile_secret_sources(profile_dir)
-        secret_token = set_secret_scope(build_profile_secret_scope(profile_dir), profile_home=str(profile_dir))
-        from hermes_cli.config import load_config_readonly
-        name = active_memory_provider(load_config_readonly())
-        if not name:
-            return
-        with provider_registration_scope(name) as release, transient_plugin_host(before_stop=release):
-            provider = load_memory_provider(name, register_skills=False)
-            if provider is not None:
-                call(provider)
+        # The pre-check needs only the target home; a built-in provider never resolves secrets.
+        with bind_state(scope_for_profile(profile_dir), secrets={}, terminal=False):
+            if not _names_external_provider(profile_dir):
+                return
+            from agent.secret_scope import build_profile_secret_scope
+            from hermes_cli.plugin_isolation import transient_plugin_host
+            from plugins.memory import load_memory_provider, provider_registration_scope
+            # The effective config expands through this profile's already-hydrated secrets.
+            from hermes_cli.env_loader import hydrate_profile_secret_sources
+            hydrate_profile_secret_sources(profile_dir)
+            with bind_state(scope_for_profile(profile_dir), secrets=build_profile_secret_scope(profile_dir),
+                            terminal=False):
+                from hermes_cli.config import load_config_readonly
+                name = active_memory_provider(load_config_readonly())
+                if not name:
+                    return
+                with provider_registration_scope(name) as release, transient_plugin_host(before_stop=release):
+                    provider = load_memory_provider(name, register_skills=False)
+                    if provider is not None:
+                        call(provider)
     except (Exception, SystemExit):  # ConfigBackendUnavailable is a SystemExit; a plugin may sys.exit
         logger.warning("memory provider %r: profile hook failed for %s", name, profile_dir, exc_info=True)
-    finally:
-        if secret_token is not None:
-            from agent.secret_scope import reset_secret_scope
-            reset_secret_scope(secret_token)
-        reset_hermes_home_override(home_token)
 
 
 def cloned_memory_provider(profile_dir: Path) -> Optional[str]:

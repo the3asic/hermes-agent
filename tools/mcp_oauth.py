@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlparse
 
+from agent.memory_provider import spawn_context_thread
 from hermes_constants import secure_parent_dir
 from utils import atomic_json_write
 from tools.mcp_dashboard_oauth import contextvar_set as _contextvar_set, get_dashboard_oauth_flow
@@ -918,7 +919,7 @@ async def _close_callback_server(server: HTTPServer) -> None:
             except RuntimeError:  # the loop already closed; nobody is waiting any more
                 pass
 
-    threading.Thread(target=close, daemon=True, name="mcp-oauth-cb-close").start()
+    spawn_context_thread(close, daemon=True, name="mcp-oauth-cb-close").start()
     cancelled: asyncio.CancelledError | None = None
     while not closed.done():
         try:
@@ -965,7 +966,8 @@ def _make_callback_waiter(port: int, cimd_url: str | None = None, timeout: float
         # select() keeps the listening socket alive past server_close() (the kernel holds the file for
         # the duration of the poll), so a cancelled flow — e.g. the handshake timeout firing mid-login —
         # left the port bound and the retry on the same pinned/cached port died with EADDRINUSE (#113771).
-        threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.25}, daemon=True).start()
+        spawn_context_thread(server.serve_forever, kwargs={"poll_interval": 0.25},
+                             name="mcp-oauth-cb-listen", daemon=True).start()
         # Paste fallback races the HTTP listener; whichever fills result first wins (no stdin reader
         # under a dashboard flow — the gateway's stdin is not the user's).
         if _is_interactive() and dashboard_flow is None:
@@ -973,7 +975,8 @@ def _make_callback_waiter(port: int, cimd_url: str | None = None, timeout: float
                 "\n  Or paste the redirect URL here (or the ``?code=...&state=...`` portion) and press Enter. "
                 "Type ``skip`` + Enter to continue without this server:",
                 file=sys.stderr, flush=True)
-            threading.Thread(target=_paste_callback_reader, args=(result, handler_cls.result_lock), daemon=True).start()
+            spawn_context_thread(_paste_callback_reader, args=(result, handler_cls.result_lock),
+                                 name="mcp-oauth-cb-paste", daemon=True).start()
         elapsed = 0.0
         try:
             while elapsed < timeout and not _result_taken(result):

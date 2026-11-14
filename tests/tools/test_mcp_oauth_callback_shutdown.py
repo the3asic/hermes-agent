@@ -187,6 +187,43 @@ def test_loop_teardown_during_cleanup_still_closes_the_listener(monkeypatch):
             server.server_close()
 
 
+def test_callback_close_thread_keeps_the_owning_scope(tmp_path):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from agent.memory_provider import spawn_context_thread
+    from agent.runtime_scope import bind_state, bind_turn, scope_for_profile
+    from hermes_scope import Fence, current_state
+
+    ready, seen = threading.Event(), []
+
+    class ScopedServer(HTTPServer):
+        def service_actions(self):
+            ready.set()
+
+        def server_close(self):
+            seen.append(current_state())
+            super().server_close()
+
+    server = ScopedServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+    listener = spawn_context_thread(server.serve_forever, kwargs={"poll_interval": 0.01},
+                                    name="test-oauth-native-listener")
+    listener.start()
+    try:
+        assert ready.wait(5), "native callback listener did not start"
+        with bind_state(scope_for_profile(tmp_path), secrets={}, terminal=False):
+            with bind_turn("session", "turn", Fence(1, 1)):
+                expected = current_state()
+                asyncio.run(oauth._close_callback_server(server))
+                assert seen == [expected]
+                assert current_state() == expected
+    finally:
+        server.shutdown()
+        if server.socket.fileno() >= 0:
+            server.server_close()
+        listener.join(5)
+    assert not listener.is_alive()
+
+
 def test_cleanup_failure_still_ends_the_waiter(monkeypatch):
     """A listener whose ``server_close()`` raises must not leave the waiter waiting forever."""
     monkeypatch.setattr(oauth.sys, "stdin", io.StringIO())

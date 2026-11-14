@@ -1461,12 +1461,13 @@ def _start_server_runtime(
 
     import uvicorn
 
+    logger = _log
     try:
         from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
 
         start_nous_auth_keepalive()
     except Exception as exc:
-        _log.debug("Nous auth keepalive did not start: %s", exc)
+        logger.debug("Nous auth keepalive did not start: %s", exc, exc_info=True)
 
     _configure_auth_gate(host, allow_public, ssh_session_token, ssh_owner_nonce)
 
@@ -1491,7 +1492,7 @@ def _start_server_runtime(
 
         install_exit_flush_signal_handlers()
     except Exception as exc:
-        _log.debug("exit-flush signal handlers not installed: %s", exc)
+        logger.debug("exit-flush signal handlers not installed: %s", exc, exc_info=True)
 
     # #93608: uvicorn's bind_socket() would exit 1 with a bare ERROR line,
     # indistinguishable from "backend broken". Probe first so a conflict
@@ -1515,7 +1516,7 @@ def _start_server_runtime(
 
         activate_multi_profile_hosting_eagerly()
     except Exception:
-        _log.warning("eager multi-profile activation failed", exc_info=True)
+        logger.warning("eager multi-profile activation failed", exc_info=True)
 
     async def _serve():
         # startup split from main_loop so the bound (ephemeral) port is readable.

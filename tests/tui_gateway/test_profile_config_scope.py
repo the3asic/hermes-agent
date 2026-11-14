@@ -57,6 +57,21 @@ def test_the_launch_home_inside_a_secondary_scope_is_the_launch_home(homes):
     assert (get_hermes_home_override(), current_secret_scope(), get_terminal_scope()) == (None, None, None)
 
 
+def test_config_scope_restores_the_callers_turn_when_the_body_fails(homes):
+    from agent.runtime_scope import bind_state, bind_turn, scope_for_profile
+    from hermes_scope import Fence, current_state
+
+    launch, work, _ = homes
+    with bind_state(scope_for_profile(work), secrets={}, terminal_policy={"TERMINAL_ENV": "docker"}):
+        with bind_turn("session", "turn", Fence(2, 3)):
+            expected = current_state()
+            with pytest.raises(OSError), policy.profile_config_scope(launch):
+                assert get_hermes_home() == launch
+                assert current_state().scope.agent == str(launch)
+                raise OSError("config write interrupted")
+            assert current_state() == expected
+
+
 def test_the_launch_home_keeps_the_launch_rules(homes):
     launch, _, multiplex = homes
     with policy.profile_config_scope(launch):

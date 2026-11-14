@@ -387,7 +387,10 @@ def _spawn_env(payload: dict[str, Any]) -> dict[str, str]:
     dev_server = str(payload.get("devServer") or "")
     if len(dev_server) > 2048 or any(ch in dev_server for ch in "\x00\r\n"):
         raise ValueError("invalid devServer")
-    env = dict(os.environ)
+    from hermes_cli.profiles import get_profile_dir
+    from tools.environments.local import served_profile_child_env
+    env = served_profile_child_env(
+        target_home=get_profile_dir(str(payload.get("profile") or "default")), inherit_credentials=True)
     env.pop("VIRTUAL_ENV", None)
     env.pop("PYTHONPATH", None)
     env.pop("HERMES_DESKTOP_DEV_SERVER", None)

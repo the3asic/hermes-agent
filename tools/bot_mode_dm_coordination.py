@@ -9,8 +9,8 @@ Cancel: the sender withdraws its own queued request, or stops the turn that requ
 teammate's owner through the same ``prompt.cancel`` a viewer's Stop uses. Only the request's author
 may: the receipt records who sent it.
 
-The runner half (``run_fan_out``) is stdlib only: it runs as a background process whose stdout is
-the sender's completion notification, and each sub-runner boots Hermes itself.
+The runner half (``run_fan_out``) uses stdlib process I/O and the native context-preserving thread
+factory. Its background process reports through stdout, and each sub-runner boots Hermes itself.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ import shlex
 import subprocess
 import sys
 import tempfile
-import threading
 from pathlib import Path
 from typing import Any
 
@@ -158,7 +157,10 @@ def run_fan_out(spec_path: str) -> int:
             return
         results[index] = {**base, **_outcome(entry.get("output", "text"), done.returncode, done.stdout, done.stderr)}
 
-    threads = [threading.Thread(target=run, args=item, daemon=True) for item in enumerate(entries)]
+    from agent.memory_provider import spawn_context_thread
+
+    threads = [spawn_context_thread(run, args=item, name=f"bot-dm-fanout-{item[0]}", daemon=True)
+               for item in enumerate(entries)]
     for thread in threads:
         thread.start()
     for thread in threads:

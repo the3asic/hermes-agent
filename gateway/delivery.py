@@ -185,17 +185,16 @@ async def _ensure_named_dm_topic(adapter: Any, chat_id: str, name: str, *, refre
         raise RuntimeError(f"Telegram adapter cannot {verb} named private DM topics")
     # The topic is persisted in the bot owner's config.yaml, not that of the profile delivering
     # through it (a credentialless satellite's cron job sends via the primary's bot).
-    from hermes_constants import get_routing_process_hermes_home, reset_hermes_home_override, set_hermes_home_override
+    from agent.runtime_scope import bind_profile_scope
+    from hermes_constants import get_routing_process_hermes_home
     owner = getattr(adapter, "_owner_profile", None)  # None = the launch (primary) profile's bot
     if isinstance(owner, str) and owner:
         from hermes_cli.profiles import get_profile_dir
-        token = set_hermes_home_override(get_profile_dir(owner))
+        home = get_profile_dir(owner)
     else:
-        token = set_hermes_home_override(get_routing_process_hermes_home())
-    try:
+        home = get_routing_process_hermes_home()
+    with bind_profile_scope(home, hydrate_secrets=False):
         thread_id = await ensure_dm_topic(chat_id, name, **({"force_create": True} if refresh else {}))
-    finally:
-        reset_hermes_home_override(token)
     if not thread_id:
         raise RuntimeError(f"Failed to {verb} Telegram private DM topic '{name}'")
     return str(thread_id)

@@ -25,10 +25,10 @@ def create() -> dict | None:
             _prune_stale_worktrees(repo)
             # Repack on pack sprawl so `worktree add` never crawls on a
             # multi-agent box; on a thread so it can't block launch.
-            import threading as _threading
+            from agent.memory_provider import spawn_context_thread
 
-            _threading.Thread(
-                target=_maintain_pack_health, args=(repo,), name="pack-maintenance", daemon=True).start()
+            spawn_context_thread(
+                _maintain_pack_health, args=(repo,), name="pack-maintenance", daemon=True).start()
         from hermes_cli.config import get_hermes_home
         # The session's frozen cwd keeps this checkout; name the store from creation so a
         # launcher killed with its terminal still leaves the tree to its sessions.
