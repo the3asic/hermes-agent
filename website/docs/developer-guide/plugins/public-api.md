@@ -128,6 +128,13 @@ with a name allows that one name only.
 | `agent.file_safety` | `get_write_denied_error` | plugins/index.md § Check file paths and read YAML with Hermes's own helpers |
 | `hermes_yaml` | `safe_load` | plugins/index.md § Check file paths and read YAML with Hermes's own helpers |
 | `hermes_yaml` | `safe_dump` | plugins/index.md § Check file paths and read YAML with Hermes's own helpers |
+| `agent.runtime_scope` | `bind_state` | plugins/index.md § Bind the owner of a config-backend request |
+| `agent.runtime_scope` | `scope_for_profile` | plugins/index.md § Bind the owner of a config-backend request |
+| `plugins.web.keyless_mcp` | `web_interruptible` | plugins/index.md § Preserve web request identity and interruption |
+| `plugins.web.keyless_mcp` | `web_is_interrupted` | plugins/index.md § Preserve web request identity and interruption |
+| `plugins.web.keyless_mcp` | `interrupted_extract_results` | plugins/index.md § Preserve web request identity and interruption |
+| `tools.web_tools_extract` | `_extract_url_identity` | plugins/index.md § Preserve web request identity and interruption |
+| `tools.web_tools_extract` | `_EXTRACT_RESULT_MAPPING_ERROR` | plugins/index.md § Preserve web request identity and interruption |
 | `hermes_cli.urllib_security` | `open_credentialed_url` | plugins/index.md § Send a credentialed HTTP request without leaking it on redirect |
 | `hermes_cli.chat_launch` | `hermes_command` | user-guide/features/plugins.md § A plugin with its own chat client |
 | `hermes_cli.chat_launch` | `print_exit_summary` | user-guide/features/plugins.md § A plugin with its own chat client |

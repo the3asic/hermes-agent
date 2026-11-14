@@ -1307,6 +1307,32 @@ validate` accepts those spellings and reports a bare `import agent.file_safety` 
 To read Hermes's own settings, use `load_config_readonly()` from `hermes_cli.config` rather than
 parsing `config.yaml` yourself.
 
+### Bind the owner of a config-backend request
+
+`agent.runtime_scope.scope_for_profile(home)` identifies the profile that owns a request.
+`agent.runtime_scope.bind_state(scope, ...)` binds that owner for the duration of a `with` block
+and restores the caller on exit, including a failing body. A config backend fetching its own
+credentials must not recursively load that backend to discover terminal policy or secret sources.
+Pass an already resolved `secrets` mapping, `home_override=False` and `terminal=False` when
+only its secret identity should change. A caller managing the binding explicitly must reset the
+returned token in `finally`. The binding carries identity and does not grant permission to read
+other profiles.
+
+### Preserve web request identity and interruption
+
+Web provider implementations use the originating call's interruption state across executor
+workers. `plugins.web.keyless_mcp.web_interruptible` binds that state around a sync or async
+provider entry point; `web_is_interrupted()` reads it before and after vendor work.
+`interrupted_extract_results(urls, results)` retains completed pages and policy refusals, and
+marks unfinished requests as interrupted without accepting ambiguous provider rows.
+
+`tools.web_tools_extract._extract_url_identity(url)` is the shared result-matching identity: it
+normalizes scheme/host case, IDNs, default ports, empty root paths and fragments, preserving
+path and query semantics. Compare it only to associate a vendor result with the requested URL;
+URL safety and website policy checks remain separate. If that association is ambiguous, return
+`tools.web_tools_extract._EXTRACT_RESULT_MAPPING_ERROR` with empty page content. These are
+individual published names; the other internals of their modules remain private.
+
 ### Send a credentialed HTTP request without leaking it on redirect
 
 Plain `urllib.request.urlopen` follows a redirect to another host with your `Authorization` header

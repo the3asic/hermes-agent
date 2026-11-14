@@ -168,6 +168,23 @@
       ]
     },
     {
+      "source": "plugins/index.md § Bind the owner of a config-backend request",
+      "entries": [
+        "agent.runtime_scope:bind_state",
+        "agent.runtime_scope:scope_for_profile"
+      ]
+    },
+    {
+      "source": "plugins/index.md § Preserve web request identity and interruption",
+      "entries": [
+        "plugins.web.keyless_mcp:web_interruptible",
+        "plugins.web.keyless_mcp:web_is_interrupted",
+        "plugins.web.keyless_mcp:interrupted_extract_results",
+        "tools.web_tools_extract:_extract_url_identity",
+        "tools.web_tools_extract:_EXTRACT_RESULT_MAPPING_ERROR"
+      ]
+    },
+    {
       "source": "plugins/index.md § Send a credentialed HTTP request without leaking it on redirect",
       "entries": [
         "hermes_cli.urllib_security:open_credentialed_url"
