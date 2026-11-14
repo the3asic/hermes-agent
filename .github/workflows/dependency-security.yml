@@ -71,10 +71,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
-      HERMES_HOME: ${{ runner.temp }}/lcm-compatibility-home
-      HERMES_RUNTIME_DIR: ${{ runner.temp }}/lcm-compatibility-tools
-      UV_CACHE_DIR: ${{ runner.temp }}/lcm-compatibility-cache
-      TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/lcm-tokenizer-cache
+      HERMES_HOME: ${{ github.workspace }}/artifacts/lcm-compatibility-home
+      HERMES_RUNTIME_DIR: ${{ github.workspace }}/artifacts/lcm-compatibility-tools
+      UV_CACHE_DIR: ${{ github.workspace }}/artifacts/lcm-compatibility-cache
+      TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/artifacts/lcm-tokenizer-cache
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
