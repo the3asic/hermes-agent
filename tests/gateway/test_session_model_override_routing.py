@@ -106,7 +106,7 @@ fallback_providers:
     monkeypatch.setenv("OPENCODE_GO_BRIDGE_API_KEY", "fallback-key")
 
     resolver_calls = []
-    import hermes_cli.runtime_provider as runtime_provider
+    from hermes_cli import runtime_provider
 
     real_resolve_runtime_provider = runtime_provider.resolve_runtime_provider
 

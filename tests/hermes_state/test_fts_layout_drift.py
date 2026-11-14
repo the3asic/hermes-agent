@@ -178,7 +178,7 @@ def test_a_base_index_the_next_open_realigns_is_not_offered_as_opt_in_work(tmp_p
     import hermes_state_fts
 
     db_path = tmp_path / "state.db"
-    db = SessionDB(db_path=db_path)
+    db = SessionDB(db_path=db_path, allow_fts_rebuild=True)
     _require_trigram(db)
     _seed(db)
     _install_raw_messages_base(db)
@@ -192,7 +192,7 @@ def test_a_base_index_the_next_open_realigns_is_not_offered_as_opt_in_work(tmp_p
     finally:
         conn.close()
     assert "optimize-storage" not in _notice_for(db_path, monkeypatch)
-    SessionDB(db_path=db_path).close()
+    SessionDB(db_path=db_path, allow_fts_rebuild=True).close()
     assert _stamp(db_path) == str(hermes_state_common.FTS_STORAGE_VERSION)
 
 
@@ -330,7 +330,7 @@ def test_a_stale_base_source_view_is_replaced_before_the_store_is_stamped(tmp_pa
     from hermes_state_common import FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS
 
     db_path = tmp_path / "state.db"
-    db = SessionDB(db_path=db_path)
+    db = SessionDB(db_path=db_path, allow_fts_rebuild=True)
     _seed(db)
     db.append_message("cli", role="tool", content="x" * FTS_TOOL_CONTENT_PREFIX_CHARS + " trailingneedle")
     current_view = db._conn.execute("SELECT sql FROM sqlite_master WHERE name = 'messages_fts_src'").fetchone()[0]
@@ -341,7 +341,7 @@ def test_a_stale_base_source_view_is_replaced_before_the_store_is_stamped(tmp_pa
     db._conn.commit()
     db.close()
 
-    db = SessionDB(db_path=db_path)
+    db = SessionDB(db_path=db_path, allow_fts_rebuild=True)
     try:
         view = db._conn.execute("SELECT sql FROM sqlite_master WHERE name = 'messages_fts_src'").fetchone()[0]
         assert " ".join(view.split()) == " ".join(current_view.split())

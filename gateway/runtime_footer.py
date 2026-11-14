@@ -218,7 +218,7 @@ def _gateway_turn_runtime_metadata(
 
 def _gateway_runtime_footer_line(
     agent_result: dict[str, Any],
-    source: "SessionSource",
+    source: SessionSource,
     *,
     turn_seconds: Optional[float] = None,
 ) -> str:
@@ -351,145 +351,79 @@ def _format_latency(seconds: float) -> str:
     return f"{m}m{sec:02d}s"
 
 
+def _reported_counter(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _context_field(field: str, tokens: int, length: Optional[int], status: Optional[str]) -> str:
+    if status != "reported" or not length or length <= 0 or tokens < 0:
+        return ""
+    percent = max(0, min(100, round(tokens / length * 100)))
+    if field == "context_pct":
+        return f"{percent}%"
+    return f"ctx(last):{_format_token_count(tokens)}/{_format_token_count(length)} ({percent}%)"
+
+
+def _counter_field(value: Any, unit: str, status: Optional[str]) -> str:
+    return f"{_format_token_count(value)} {unit}" if status == "reported" and _reported_counter(value) else ""
+
+
+def _turn_tokens_field(tokens_in: Any, tokens_out: Any, status: Optional[str]) -> str:
+    if status not in {"reported", "reported_partial"}:
+        return ""
+    reported = [
+        f"{_format_token_count(value)} {unit}"
+        for value, unit in ((tokens_in, "in"), (tokens_out, "out")) if _reported_counter(value)
+    ]
+    if not reported:
+        return ""
+    label = "tokens(turn,uncached,partial)" if status == "reported_partial" else "tokens(turn,uncached)"
+    return f"{label}:{'/'.join(reported)}"
+
+
+def _cache_field(tokens_in: Any, read: Any, written: Any, status: Optional[str]) -> str:
+    buckets = tokens_in, read, written
+    if status not in {"reported", "reported_partial"} or not all(_reported_counter(value) for value in buckets):
+        return ""
+    total = sum(buckets)
+    if total <= 0:
+        return ""
+    label = "cache(turn,partial)" if status == "reported_partial" else "cache(turn)"
+    return f"{label}:{round(read / total * 100)}%"
+
+
+def _served_field(model: Optional[str], requested: Optional[str], served: Optional[str]) -> str:
+    requested = requested or model
+    alias = _model_short(requested)
+    return f"{alias} → {served}" if served and served not in (alias, requested) else ""
+
+
 def format_runtime_footer(
-    *,
-    model: Optional[str],
-    context_tokens: int,
-    context_length: Optional[int],
-    cwd: Optional[str] = None,
-    turn_seconds: Optional[float] = None,
-    tokens_in: Optional[int] = None,
-    tokens_out: Optional[int] = None,
-    cache_read_tokens: Optional[int] = None,
-    cache_write_tokens: Optional[int] = None,
-    token_usage_status: Optional[str] = None,
-    cache_usage_status: Optional[str] = None,
-    context_usage_status: Optional[str] = "reported",
-    reasoning_effort: Optional[str] = None,
-    requested_model: Optional[str] = None,
-    served_model: Optional[str] = None,
+    *, model: Optional[str], context_tokens: int, context_length: Optional[int],
+    cwd: Optional[str] = None, turn_seconds: Optional[float] = None,
+    tokens_in: Optional[int] = None, tokens_out: Optional[int] = None,
+    cache_read_tokens: Optional[int] = None, cache_write_tokens: Optional[int] = None,
+    token_usage_status: Optional[str] = None, cache_usage_status: Optional[str] = None,
+    context_usage_status: Optional[str] = "reported", reasoning_effort: Optional[str] = None,
+    requested_model: Optional[str] = None, served_model: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
-    """Render the footer line, or return "" if no fields have data.
-
-    Fields are skipped silently when their underlying data is missing — a
-    partially-populated footer is better than a line with ``?%`` or empty slots.
-    """
-    parts: list[str] = []
-    for field in fields:
-        if field == "model":
-            m = _model_short(model)
-            if m:
-                parts.append(m)
-        elif field == "model_last":
-            m = _model_short(model)
-            if m:
-                parts.append(f"model(last):{m}")
-        elif field == "context_pct":
-            if (
-                context_usage_status == "reported"
-                and context_length
-                and context_length > 0
-                and context_tokens >= 0
-            ):
-                pct = max(0, min(100, round((context_tokens / context_length) * 100)))
-                parts.append(f"{pct}%")
-        elif field == "context_window":
-            if (
-                context_usage_status == "reported"
-                and context_length
-                and context_length > 0
-                and context_tokens >= 0
-            ):
-                pct = max(0, min(100, round((context_tokens / context_length) * 100)))
-                parts.append(
-                    "ctx(last):"
-                    f"{_format_token_count(context_tokens)}/"
-                    f"{_format_token_count(context_length)} ({pct}%)"
-                )
-        elif field == "latency":
-            # Wall-clock turn duration. Skipped when the caller supplied no
-            # timing (call sites that don't measure) or the value is negative.
-            if turn_seconds is not None and turn_seconds >= 0:
-                parts.append(_format_latency(turn_seconds))
-        elif field == "cwd":
-            rel = _home_relative_cwd(cwd or _env_cwd())
-            if rel:
-                parts.append(rel)
-        elif field == "tokens_in":
-            if (
-                token_usage_status == "reported"
-                and isinstance(tokens_in, int)
-                and not isinstance(tokens_in, bool)
-                and tokens_in >= 0
-            ):
-                parts.append(f"{_format_token_count(tokens_in)} in")
-        elif field == "tokens_out":
-            if (
-                token_usage_status == "reported"
-                and isinstance(tokens_out, int)
-                and not isinstance(tokens_out, bool)
-                and tokens_out >= 0
-            ):
-                parts.append(f"{_format_token_count(tokens_out)} out")
-        elif field == "tokens_turn":
-            reported: list[str] = []
-            if (
-                isinstance(tokens_in, int)
-                and not isinstance(tokens_in, bool)
-                and tokens_in >= 0
-            ):
-                reported.append(f"{_format_token_count(tokens_in)} in")
-            if (
-                isinstance(tokens_out, int)
-                and not isinstance(tokens_out, bool)
-                and tokens_out >= 0
-            ):
-                reported.append(f"{_format_token_count(tokens_out)} out")
-            if reported and token_usage_status in {
-                "reported",
-                "reported_partial",
-            }:
-                label = (
-                    "tokens(turn,uncached,partial)"
-                    if token_usage_status == "reported_partial"
-                    else "tokens(turn,uncached)"
-                )
-                parts.append(f"{label}:{'/'.join(reported)}")
-        elif field == "cache_hit":
-            cache_buckets = (tokens_in, cache_read_tokens, cache_write_tokens)
-            if (
-                cache_usage_status in {"reported", "reported_partial"}
-                and all(
-                    isinstance(value, int)
-                    and not isinstance(value, bool)
-                    and value >= 0
-                    for value in cache_buckets
-                )
-            ):
-                prompt_tokens = sum(cache_buckets)
-                if prompt_tokens > 0:
-                    cache_pct = round((cache_read_tokens / prompt_tokens) * 100)
-                    label = (
-                        "cache(turn,partial)"
-                        if cache_usage_status == "reported_partial"
-                        else "cache(turn)"
-                    )
-                    parts.append(f"{label}:{cache_pct}%")
-        elif field == "reasoning_effort":
-            if reasoning_effort:
-                parts.append(f"effort(req,last):{reasoning_effort}")
-        elif field == "served_model":
-            requested = requested_model or model
-            alias = _model_short(requested)
-            if served_model and served_model not in (alias, requested):
-                parts.append(f"{alias} → {served_model}")
-        # Unknown field names are silently ignored.
-
-    if not parts:
-        return ""
-
-    return _SEP.join(parts)
+    """Render configured fields only when their underlying telemetry is available."""
+    renderers = {
+        "model": lambda: _model_short(model),
+        "model_last": lambda: f"model(last):{_model_short(model)}" if model else "",
+        "served_model": lambda: _served_field(model, requested_model, served_model),
+        "context_pct": lambda: _context_field("context_pct", context_tokens, context_length, context_usage_status),
+        "context_window": lambda: _context_field("context_window", context_tokens, context_length, context_usage_status),
+        "latency": lambda: _format_latency(turn_seconds) if turn_seconds is not None and turn_seconds >= 0 else "",
+        "cwd": lambda: _home_relative_cwd(cwd or _env_cwd()),
+        "tokens_in": lambda: _counter_field(tokens_in, "in", token_usage_status),
+        "tokens_out": lambda: _counter_field(tokens_out, "out", token_usage_status),
+        "tokens_turn": lambda: _turn_tokens_field(tokens_in, tokens_out, token_usage_status),
+        "cache_hit": lambda: _cache_field(tokens_in, cache_read_tokens, cache_write_tokens, cache_usage_status),
+        "reasoning_effort": lambda: f"effort(req,last):{reasoning_effort}" if reasoning_effort else "",
+    }
+    return _SEP.join(value for field in fields if (render := renderers.get(field)) and (value := render()))
 
 
 def build_footer_line(

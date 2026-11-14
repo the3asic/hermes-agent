@@ -85,8 +85,8 @@ def base_index_recognised(cursor: sqlite3.Cursor) -> bool:
 
 
 def base_index_realigned_on_open(stored: str) -> bool:
-    """External-content base index not reading ``messages_fts_src``: the next read-write open rebuilds it from
-    the current DDL (``_migrate_misaligned_fts_source``), so it is never opt-in work."""
+    """External-content base index handled by explicit offline realignment from the current DDL
+    (``_migrate_misaligned_fts_source``), separately from opt-in storage-layout conversion."""
     return "tool_name" in stored and "messages_fts_src" not in stored
 
 
@@ -94,7 +94,7 @@ def fts_layout_drift(cursor: sqlite3.Cursor) -> list[str]:
     """FTS tables on an older release's definition that only ``optimize-storage`` replaces; empty otherwise.
 
     Shared by the update notice, doctor and optimize-storage's demote decision. An absent table is not drift
-    (the trigram index is optional; the base index is created on open), nor is a base index the next open
+    (the trigram index is optional; fresh stores create the base on open), nor is a base index offline recovery
     realigns, nor a definition this code does not recognise.
     """
     return [table for table, stored in _stored_vtables(cursor).items()
@@ -385,7 +385,7 @@ class SessionFtsSetupMixin:
         logger.error(
             "state.db FTS indexes remain corrupt (%s); disabled FTS sync and "
             "retrying the canonical write. Search temporarily uses LIKE until "
-            "a later SessionDB open rebuilds the indexes.",
+            "explicit offline recovery rebuilds the indexes.",
             exc,
         )
         return True

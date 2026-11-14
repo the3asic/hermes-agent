@@ -69,14 +69,13 @@ def test_cached_redirect_is_regated_on_its_final_url(monkeypatch, gate):
     monkeypatch.setattr("tools.url_safety.async_is_safe_url", safe)
     result = _extract(provider)[0]
 
-    assert provider.calls == 2, "a hit whose final URL is now refused must be a miss (live fetch re-checks)"
+    assert provider.calls == 1, "a refused cached destination must not trigger another provider request"
     assert not result.get("cached")
 
 
 
 def test_an_uncached_refetch_never_retargets_the_old_entry(monkeypatch):
-    """A refused hit re-fetches; if that fetch lands somewhere allowed but is too big to cache, the old
-    entry keeps its own final URL, so its blocked content is never served under the new target."""
+    """An oversized fetch keeps the old entry paired with its original destination."""
     check, safe = _policy()
     monkeypatch.setattr("tools.website_policy.check_website_access", check)
     monkeypatch.setattr("tools.url_safety.async_is_safe_url", safe)
@@ -94,10 +93,10 @@ def test_an_uncached_refetch_never_retargets_the_old_entry(monkeypatch):
             return [{"url": "https://allowed.example/", "content": huge, "raw_content": huge,
                      "metadata": {"sourceURL": urls[0]}}]
 
-    _extract(_NowElsewhere())
+    asyncio.run(wte._dispatch_extract(_NowElsewhere(), [REDIRECTOR], None))
     later = _RedirectingProvider()
     result = _extract(later)[0]
-    assert later.calls == 1 and not result.get("cached"), "the old blocked page was served from cache"
+    assert later.calls == 0 and not result.get("cached"), "a refused cache entry triggered a provider request"
 
 
 def test_crlf_page_round_trips_through_the_cache(monkeypatch):
@@ -122,7 +121,7 @@ def test_crlf_page_round_trips_through_the_cache(monkeypatch):
 def test_interleaved_writers_never_pair_one_body_with_anothers_final_url(monkeypatch):
     """Two fetches of one key: A writes its body, B writes its body and final URL, then A's late
     final-URL write lands. B's body must stay paired with B's destination, so blocking B's host
-    makes the hit a miss instead of serving it under A's still-allowed destination."""
+    refuses the cached body without fetching it again."""
     check, safe = _policy()
     monkeypatch.setattr("tools.website_policy.check_website_access", check)
     monkeypatch.setattr("tools.url_safety.async_is_safe_url", safe)
@@ -150,4 +149,4 @@ def test_interleaved_writers_never_pair_one_body_with_anothers_final_url(monkeyp
     monkeypatch.setattr("tools.website_policy.check_website_access", check)
     later = _RedirectingProvider()
     result = _extract(later)[0]
-    assert later.calls == 1 and not result.get("cached"), "B's blocked body was served under A's final URL"
+    assert later.calls == 0 and not result.get("cached"), "a refused cache entry triggered a provider request"

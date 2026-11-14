@@ -11,7 +11,7 @@ import sqlite3
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Optional, Sequence, Tuple
 
 from agent.image_eviction_policy import images_all_within_many_image_limit, latched_retire_count, outbound_image_retire_count, outbound_retired_image_ids
 from agent.compression_marker import (
@@ -56,23 +56,9 @@ from tools.todo_tool import TODO_INJECTION_HEADER
 logger = logging.getLogger(__name__)
 
 
-# Summary-route pin lives in a ContextVar (not on the shared compressor) so the retry after a stalled
-# summary sees it while the detached stalled worker does not. A stall raises nothing, so the aux client's
-# exception-path fallback never fires; the host pins a fallback route for exactly ONE retry (the sole aux
-# call per compaction). The main-model retry must NOT re-issue the pin.
-# ── Pinned summary route ───────────────────────────────────────────────── The summary call normally
-# resolves its provider/model from ``auxiliary.compression``. One caller needs to override that for a single
-# attempt: after the host's progress-aware timeout aborts a stalled summary (#78981),
-# ``agent.conversation_compression`` re-runs compression with the route pinned to a configured
-# ``fallback_chain`` entry. Nothing raised out of the stalled call, so the auxiliary client's own fallback
-# handling — which only runs from its exception path — never saw that failure. A ContextVar, not an
-# attribute on the compressor: the aborted worker is detached and still alive on the pool, and the
-# compressor object is shared with it. Context is copied per worker (``propagate_context_to_thread``), so
-# the pin reaches the retry's whole synchronous call chain and cannot leak into the stalled attempt or any
-# unrelated auxiliary call. Coverage is the single ``_generate_summary`` LLM call only. That is one call per
-# compression run (its only non-recursive call site is the compress path; the two recursive calls are the
-# deliberate main-model retry that must NOT re-issue the pin). The summary call is the ONLY auxiliary LLM
-# call a lean compaction attempt makes (#96603) — there are no sibling digest calls.
+# Context-local route pins belong to one compression attempt, including every plugin leaf call.
+# A detached stalled worker retains its own context and cannot consume the retry's pin.
+# The built-in compressor consumes its pin once so its deliberate main-model retry can route normally.
 _SUMMARY_ROUTE_PIN: contextvars.ContextVar[Optional[dict[str, Any]]] = (
     contextvars.ContextVar("hermes_summary_route_pin", default=None)
 )
@@ -86,14 +72,17 @@ _REASONING_CONFIG_UNSET = object()
 
 
 @contextlib.contextmanager
-def pin_summary_route(route: Optional[Dict[str, Any]]):
+def pin_summary_route(route: Optional[dict[str, Any]]):
     """Pin summary LLM calls in this compression attempt to an explicit route.
 
     ``route`` is a mapping of :data:`_PINNED_ROUTE_FIELDS`; ``None`` is a
     no-op passthrough so callers can wire it unconditionally. Re-entrant-safe:
     restores the previous pin on exit.
     """
-    token = _SUMMARY_ROUTE_PIN.set(route if isinstance(route, dict) else None)
+    snapshot = dict(route) if isinstance(route, dict) else None
+    if snapshot is not None and "reasoning_config" in snapshot:
+        snapshot["reasoning_config"] = copy.deepcopy(snapshot["reasoning_config"])
+    token = _SUMMARY_ROUTE_PIN.set(snapshot)
     try:
         yield
     finally:
@@ -124,7 +113,7 @@ def take_deterministic_summary_pin() -> bool:
     return True
 
 
-def peek_pinned_summary_route() -> Optional[Dict[str, Any]]:
+def peek_pinned_summary_route() -> Optional[dict[str, Any]]:
     """Read the pinned route without consuming it.
 
     The built-in compressor consumes its pin for one summary call so its own
@@ -134,10 +123,15 @@ def peek_pinned_summary_route() -> Optional[Dict[str, Any]]:
     fallback attempt sees the same route until :func:`pin_summary_route` exits.
     """
     route = _SUMMARY_ROUTE_PIN.get()
-    return dict(route) if isinstance(route, dict) else None
+    if not isinstance(route, dict):
+        return None
+    snapshot = dict(route)
+    if "reasoning_config" in snapshot:
+        snapshot["reasoning_config"] = copy.deepcopy(snapshot["reasoning_config"])
+    return snapshot
 
 
-def _pinned_summary_call_kwargs() -> Dict[str, Any]:
+def _pinned_summary_call_kwargs() -> dict[str, Any]:
     """Consume the pinned route as explicit ``call_llm`` keyword arguments."""
     route = take_pinned_summary_route()
     if not route:
@@ -2846,7 +2840,7 @@ class ContextCompressor(
         proactive_prune_tokens: int = 0, proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
         custom_providers: list | None = None,
-        reasoning_config: Optional[Dict[str, Any]] = None,
+        reasoning_config: Optional[dict[str, Any]] = None,
     ):
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
         self.reasoning_config = copy.deepcopy(reasoning_config)
@@ -3826,7 +3820,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self.summary_model = ""  # empty = use main model
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
 
-    def _summary_main_runtime(self) -> Dict[str, Any]:
+    def _summary_main_runtime(self) -> dict[str, Any]:
         """Use the owning session's attempt snapshot, including explicit None.
 
         A reused compressor can outlive a session effort/model switch. The
@@ -3938,7 +3932,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
     def _generate_summary(
         self, turns_to_summarize: list[dict[str, Any]], focus_topic: Optional[str] = None,
         memory_context: str = "", bypass_cooldown: bool = False,
-        *, _main_runtime: Optional[Dict[str, Any]] = None,
+        *, _main_runtime: Optional[dict[str, Any]] = None,
     ) -> Optional[str]:
         """Structured summary of the turns (iterative update when a previous summary exists); None if all attempts fail."""
         prompt_started_at = time.monotonic()
@@ -4147,7 +4141,7 @@ Target ~{summary_budget + (_LEAN_SESSION_LOG_BUDGET_TOKENS if _session_log_secti
 Write only the summary body. Do not include any preamble or prefix."""
 
     def _on_summary_failure(
-        self, e: Exception, turns_to_summarize: List[Dict[str, Any]], focus_topic: Optional[str], memory_context: str,
+        self, e: Exception, turns_to_summarize: list[dict[str, Any]], focus_topic: Optional[str], memory_context: str,
         *, _main_runtime=None,
     ) -> Optional[str]:
         """Classify a summary-call failure; retry once on the main model (returning its result) or arm a cooldown (None)."""

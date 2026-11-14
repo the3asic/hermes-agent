@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
@@ -2006,13 +2007,13 @@ def _update_fallback_context_compressor(agent) -> None:
         revalidate_compression_feasibility(agent)
 
 
-def _reresolve_fallback_reasoning_config(agent) -> None:
+def _reresolve_fallback_reasoning_config(agent, fallback_entry: dict | None = None) -> None:
     """Resolve effort from the fallback entry, target model, then global policy."""
     try:
         # Re-resolve reasoning_config for the new fallback model (Closes #21256). Wrapped in try/except
         # because a config load failure must not kill the swap.
         agent.reasoning_config = _resolve_reasoning_config_for_active_model(
-            agent, agent.model, getattr(agent, "_active_fallback_entry", None)
+            agent, agent.model, fallback_entry if fallback_entry is not None else getattr(agent, "_active_fallback_entry", None)
         )
         logger.info("Fallback %s: reasoning_config resolved: %s", agent.model, agent.reasoning_config)
     except Exception as _reasoning_err:
@@ -2086,8 +2087,7 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
                 continue
             old_model, old_provider = bound
             fb_model = agent.model  # normalized by the binder
-            agent._active_fallback_entry = dict(fb)
-            agent._runtime_reasoning_entry = dict(fb)
+            agent._active_fallback_entry, agent._runtime_reasoning_entry = deepcopy(fb), deepcopy(fb)
             rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
             notice = (

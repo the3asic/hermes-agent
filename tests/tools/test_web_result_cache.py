@@ -260,7 +260,7 @@ class _FakeSearchProvider:
 
 def _install_search_provider(monkeypatch, provider):
     import agent.web_search_registry as registry
-    import tools.web_tools as web_tools
+    from tools import web_tools
 
     monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
     monkeypatch.setattr(web_tools, "_get_search_backend", lambda: provider.name)
@@ -272,7 +272,7 @@ def _install_search_provider(monkeypatch, provider):
 
 
 def _assert_utc_iso(value):
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(value)
     assert parsed.utcoffset() is not None
     assert parsed.utcoffset().total_seconds() == 0
 
@@ -325,7 +325,7 @@ def test_web_search_success_injects_core_provenance_before_results(
 
     out = json.loads(web_tools.web_search_tool("truth contract", limit=3))
 
-    assert list(out["data"])[0] == "provenance"
+    assert next(iter(out["data"])) == "provenance"
     provenance = out["data"]["provenance"]
     assert provenance["requested_backend"] == "serper"
     assert provenance["served_by"] == "parallel"
@@ -641,7 +641,7 @@ def test_web_search_successful_rescue_is_fallback_bypass_and_not_cached(
 ):
     provider = _FakeSearchProvider({"success": False, "error": "backend down"})
     web_tools = _install_search_provider(monkeypatch, provider)
-    monkeypatch.setattr(web_tools, "_rescue_eligible", lambda candidate: True)
+    monkeypatch.setattr(web_tools, "_rescue_eligible", lambda candidate, capability=None: True)
     monkeypatch.setattr(
         web_tools,
         "_rescue_search",
@@ -685,7 +685,7 @@ def test_web_search_failure_keeps_legacy_error_shape_without_provenance(
 ):
     provider = _FakeSearchProvider({"success": False, "error": "backend down"})
     web_tools = _install_search_provider(monkeypatch, provider)
-    monkeypatch.setattr(web_tools, "_rescue_eligible", lambda candidate: False)
+    monkeypatch.setattr(web_tools, "_rescue_eligible", lambda candidate, capability=None: False)
 
     out = json.loads(web_tools.web_search_tool("failure", limit=2))
 
@@ -699,7 +699,7 @@ def test_web_search_failure_with_non_mapping_data_keeps_provider_envelope(
     response = {"success": False, "error": "backend down", "data": None}
     provider = _FakeSearchProvider(response)
     web_tools = _install_search_provider(monkeypatch, provider)
-    monkeypatch.setattr(web_tools, "_rescue_eligible", lambda candidate: False)
+    monkeypatch.setattr(web_tools, "_rescue_eligible", lambda candidate, capability=None: False)
 
     out = json.loads(web_tools.web_search_tool("failure", limit=2))
 
@@ -731,7 +731,7 @@ def test_web_search_malformed_success_fails_closed_and_is_not_cached(
 ):
     provider = _FakeSearchProvider(response)
     web_tools = _install_search_provider(monkeypatch, provider)
-    monkeypatch.setattr(web_tools, "_rescue_eligible", lambda candidate: True)
+    monkeypatch.setattr(web_tools, "_rescue_eligible", lambda candidate, capability=None: True)
     monkeypatch.setattr(
         web_tools,
         "_rescue_search",

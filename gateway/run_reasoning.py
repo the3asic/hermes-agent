@@ -12,10 +12,10 @@ logger = logging.getLogger(__name__)
 
 
 def _install_gateway_turn_reasoning_resolver(
-    runner: "GatewayRunner",
+    runner: GatewayRunner,
     agent: Any,
     *,
-    source: "SessionSource",
+    source: SessionSource,
     session_key: Optional[str],
 ) -> None:
     """Install the active-runtime effort resolver for this gateway turn.
@@ -46,9 +46,9 @@ def _install_gateway_turn_reasoning_resolver(
 
 
 def _resolve_gateway_reasoning_for_route(
-    runner: "GatewayRunner",
+    runner: GatewayRunner,
     *,
-    source: Optional["SessionSource"],
+    source: Optional[SessionSource],
     session_key: Optional[str],
     model: str,
     fallback_entry: Any = None,

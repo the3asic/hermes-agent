@@ -1051,6 +1051,32 @@ def _restore_journal_mode_after_repair(db_path: Path, before_mode: Optional[str]
                        "journal_mode on the next open", db_path, exc)
 
 
+def _fts_recovery_pending(db_path: Path) -> bool:
+    """Read the durable recovery marker without constructing a live SessionDB."""
+    from hermes_state_common import FTS_STALE_KEY
+
+    with _repair_conn(db_path) as conn:
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'state_meta'").fetchone() is None:
+            return False
+        return conn.execute("SELECT 1 FROM state_meta WHERE key = ?", (FTS_STALE_KEY,)).fetchone() is not None
+
+
+def _recover_snapshot_fts(db_path: Path, report: dict[str, Any]) -> None:
+    """Complete explicit offline recovery on the private snapshot before promotion."""
+    if not _fts_recovery_pending(db_path):
+        return
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=db_path, allow_fts_rebuild=True)
+    try:
+        if db._fts_stale or not db._fts_enabled:
+            report.update(repaired=False, error="offline FTS recovery did not complete; source snapshot preserved")
+        else:
+            report.update(repaired=True, strategy="offline_fts_rebuild")
+    finally:
+        db.close()
+
+
 def _repair_state_db_schema_locked(
     db_path: Path, *, backup: bool, report: dict[str, Any], journal_mode_before: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -1073,7 +1099,7 @@ def _repair_state_db_schema_locked(
     # Re-probe under the lock: a process we queued behind may have just repaired the file; redoing surgery
     # would undo it (the repair/re-corrupt cascade).
     reason = _db_opens_cleanly(db_path)
-    if reason is None:
+    if reason is None and not _fts_recovery_pending(db_path):
         report["repaired"], report["strategy"] = True, "already_healthy"
         return report
     if isinstance(reason, HealthCheckUnavailable):
@@ -1105,6 +1131,8 @@ def _repair_state_db_schema_locked(
             # promotion failure is classified separately.
             report["_repair_attempted"] = True
             _run_repair_strategies(scratch, report)
+            if report.get("repaired"):
+                _recover_snapshot_fts(scratch, report)
             if report.get("repaired"):
                 # Never ``os.replace`` the live DB: Windows rejects replacement under open handles and POSIX would
                 # leave those handles on the old inode. The guard keeps writer exclusion throughout.
@@ -1194,13 +1222,17 @@ def _strategy_dedup_schema(conn: sqlite3.Connection) -> None:
 
 
 def _strategy_drop_fts_vacuum(conn: sqlite3.Connection) -> None:
-    """Drop all FTS schema and VACUUM; indexes rebuild on the next open. The
+    """Drop all FTS schema and VACUUM; leave a durable offline-recovery marker. The
     destructive one, and why strategies run on a scratch copy: on a damaged
     schema b-tree VACUUM silently drops every table hanging off the unreadable part."""
     _edit_sqlite_master(conn, lambda: conn.execute("DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'") or True)
     # The schema parses now, so the barriers can stick — VACUUM rewrites the whole file.
     _reapply_durability_barriers(conn)
     conn.execute("VACUUM")
+    from hermes_state_common import FTS_STALE_KEY
+    conn.execute("CREATE TABLE IF NOT EXISTS state_meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT OR REPLACE INTO state_meta (key, value) VALUES (?, '1')", (FTS_STALE_KEY,))
+    conn.commit()
 
 
 # (name, body, success log, failure log) in escalation order. failure log None =
@@ -1213,8 +1245,8 @@ _REPAIR_STRATEGIES = (
     ("dedup_schema", _strategy_dedup_schema,
      "state.db schema repaired by de-duplicating sqlite_master (FTS index preserved): %s",
      "state.db dedup repair pass failed: %s"),
-    ("drop_fts_rebuild", _strategy_drop_fts_vacuum,
-     "state.db schema repaired by dropping FTS schema; indexes will rebuild from messages on next open: %s", None),
+    ("drop_fts_deferred", _strategy_drop_fts_vacuum,
+     "state.db schema repaired with FTS detached; complete index recovery requires explicit offline repair: %s", None),
 )
 
 

@@ -16,7 +16,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -112,7 +112,7 @@ _RUNTIME_PROVENANCE_FIELDS = frozenset(
 def utc_now_iso() -> str:
     """Return the current wall time as an explicit UTC ISO-8601 string."""
     return (
-        datetime.fromtimestamp(time.time(), timezone.utc)
+        datetime.fromtimestamp(time.time(), UTC)
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
@@ -124,7 +124,7 @@ def _normalized_utc_timestamp(value: Any) -> Optional[tuple[str, float]]:
         return None
     candidate = value.strip()
     try:
-        parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(candidate)
         if parsed.utcoffset() is None:
             return None
         epoch = parsed.timestamp()
@@ -133,7 +133,7 @@ def _normalized_utc_timestamp(value: Any) -> Optional[tuple[str, float]]:
     if not math.isfinite(epoch):
         return None
     return (
-        parsed.astimezone(timezone.utc)
+        parsed.astimezone(UTC)
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z"),
         epoch,
@@ -184,7 +184,7 @@ class SearchMemo:
     wait for (and share) the winner's response."""
 
     def __init__(self) -> None:
-        self._store: Dict[tuple, _SearchMemoEntry] = {}
+        self._store: dict[tuple, _SearchMemoEntry] = {}
         self._store_lock = threading.Lock()
         self._key_locks: dict[tuple, threading.Lock] = {}
 
@@ -260,7 +260,7 @@ class SearchMemo:
         effective_retrieved_at = (
             retrieved_at
             if isinstance(retrieved_at, str) and retrieved_at.strip()
-            else datetime.fromtimestamp(stored_wall_time, timezone.utc)
+            else datetime.fromtimestamp(stored_wall_time, UTC)
             .isoformat(timespec="seconds")
             .replace("+00:00", "Z")
         )
@@ -566,7 +566,7 @@ def extract_cache_put(
                 return False
         else:
             normalized_retrieved_at = (
-                datetime.fromtimestamp(stored_at, timezone.utc)
+                datetime.fromtimestamp(stored_at, UTC)
                 .isoformat(timespec="seconds")
                 .replace("+00:00", "Z")
             )

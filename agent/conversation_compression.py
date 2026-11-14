@@ -857,7 +857,7 @@ def resolve_compression_fallback_route() -> Optional[dict]:
     pins the route onto one bounded retry instead. Only the first complete entry: if it errors, the aux
     client's own exception path walks the rest. ``None`` when none is usable (skip compression)."""
     try:
-        from agent.auxiliary_client import _fallback_entry_api_key, _get_auxiliary_task_config
+        from agent.auxiliary_client import _get_auxiliary_task_config
         chain = _get_auxiliary_task_config("compression").get("fallback_chain")
     except Exception:
         logger.debug("compression fallback_chain lookup failed", exc_info=True)
@@ -873,22 +873,8 @@ def resolve_compression_fallback_route() -> Optional[dict]:
         # the same rule when the aux client walks this chain itself.
         if not provider or not model:
             continue
-        try:
-            api_key = _fallback_entry_api_key(entry)
-        except Exception:
-            logger.debug("compression fallback_chain[%d] api key resolution failed", index, exc_info=True)
-            api_key = None
-        from agent.auxiliary_client import _coerce_positive_timeout
-        timeout = _coerce_positive_timeout(entry.get("timeout"))
-        return {
-            "label": f"fallback_chain[{index}]({provider})",
-            "provider": provider,
-            "model": model,
-            "base_url": str(entry.get("base_url") or "").strip() or None,
-            "api_key": api_key or None,
-            "api_mode": str(entry.get("api_mode") or entry.get("transport") or "").strip() or None,
-            "timeout": timeout,
-        }
+        from agent.auxiliary_runtime_policy import compression_fallback_route
+        return compression_fallback_route(index, entry)
     return None
 
 

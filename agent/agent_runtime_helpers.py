@@ -1108,7 +1108,7 @@ def _apply_primary_runtime_fields(agent, rt: dict[str, Any]) -> None:
         agent._transport_cache.clear()
     agent.api_key = rt["api_key"]
     agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
-    agent.request_overrides = dict(rt.get("request_overrides") or {})
+    agent.request_overrides = copy.deepcopy(rt.get("request_overrides") or {})
     agent._client_kwargs = dict(rt["client_kwargs"])
 
 
@@ -1264,16 +1264,12 @@ def apply_initial_reasoning_policy_provenance(
     """
     if not isinstance(fallback_entry, dict):
         return
-    policy_entry = dict(fallback_entry)
+    policy_entry = copy.deepcopy(fallback_entry)
     agent._runtime_reasoning_entry = policy_entry
     primary_runtime = getattr(agent, "_primary_runtime", None)
     if isinstance(primary_runtime, dict):
-        primary_runtime["reasoning_policy_entry"] = dict(policy_entry)
-        primary_runtime["reasoning_config"] = (
-            dict(reasoning_config)
-            if isinstance(reasoning_config, dict)
-            else None
-        )
+        primary_runtime["reasoning_policy_entry"] = copy.deepcopy(policy_entry)
+        primary_runtime["reasoning_config"] = copy.deepcopy(reasoning_config)
 
 
 def _primary_reset_gate_blocks(agent, rt, primary_provider, primary_runtime_base_url, matches_primary, load_primary_pool):
@@ -1415,6 +1411,15 @@ def _primary_quota_reopened_early(agent, primary_provider, primary_model, matche
         return False
 
 
+def _copy_runtime_restore_field(name: str, value):
+    """Copy mutable policy without copying live clients or transport handles."""
+    if name in {"reasoning_config", "_runtime_reasoning_entry", "_active_fallback_entry", "request_overrides"}:
+        return copy.deepcopy(value)
+    if name in {"_client_kwargs", "_transport_cache"} and isinstance(value, dict):
+        return dict(value)
+    return value
+
+
 def restore_primary_runtime(agent) -> bool:
     """Restore the primary runtime at the start of a new turn so fallback stays turn-scoped
     (long-lived CLI agents and the gateway's cached agents)."""
@@ -1469,9 +1474,9 @@ def restore_primary_runtime(agent) -> bool:
     # restore commits; otherwise the same turn can run a primary-labelled
     # model with the fallback client or fallback-owned effort.
     _restore_missing = object()
-    _restore_dict_fields = {"_client_kwargs", "_transport_cache"}
     _restore_agent_fields = (
         "runtime_capabilities",
+        "request_overrides",
         "model",
         "provider",
         "requested_provider",
@@ -1507,9 +1512,9 @@ def restore_primary_runtime(agent) -> bool:
     _restore_agent_snapshot = {}
     for _field in _restore_agent_fields:
         _value = getattr(agent, _field, _restore_missing)
-        if _field in _restore_dict_fields and isinstance(_value, dict):
-            _value = dict(_value)
-        _restore_agent_snapshot[_field] = _value
+        _restore_agent_snapshot[_field] = (
+            _value if _value is _restore_missing else _copy_runtime_restore_field(_field, _value)
+        )
 
     _restore_compressor = getattr(agent, "context_compressor", None)
     _restore_compressor_fields = (
@@ -1551,10 +1556,8 @@ def restore_primary_runtime(agent) -> bool:
                 except (AttributeError, TypeError):
                     pass
                 continue
-            if _field in _restore_dict_fields and isinstance(_value, dict):
-                _value = dict(_value)
             try:
-                setattr(agent, _field, _value)
+                setattr(agent, _field, _copy_runtime_restore_field(_field, _value))
             except Exception:
                 logger.debug(
                     "Could not roll back agent field %s after failed primary restore",
@@ -1583,14 +1586,6 @@ def restore_primary_runtime(agent) -> bool:
         from agent.route_binding import reinstall_primary_runtime
         reinstall_primary_runtime(
             agent, rt, primary_provider, primary_model, _matches_primary, _load_primary_pool, prefetched_pool, prefetched,
-        )
-        # reasoning_policy_entry is a fork snapshot field upstream reinstall_runtime_snapshot
-        # does not know; restore it here.
-        saved_policy_entry = rt.get("reasoning_policy_entry")
-        agent._runtime_reasoning_entry = (
-            dict(saved_policy_entry)
-            if isinstance(saved_policy_entry, dict)
-            else None
         )
         logger.info("Primary runtime restored for new turn: %s (%s)", agent.model, agent.provider)
         agent._provider_fallback_active = False

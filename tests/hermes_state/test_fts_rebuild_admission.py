@@ -107,7 +107,7 @@ def fast_timeout(monkeypatch):
 
 @pytest.fixture
 def db(tmp_path):
-    d = SessionDB(db_path=tmp_path / "state.db")
+    d = SessionDB(db_path=tmp_path / "state.db", allow_fts_rebuild=True)
     if not d._fts_enabled:
         d.close()
         pytest.skip("FTS5 unavailable in this build")
@@ -159,7 +159,7 @@ class TestSchemaPathAdmission:
         authority — deferral must leave FTS detached with the durable stale
         breadcrumb, never triggers installed over an unrebuilt index gap."""
         db_path = tmp_path / "state.db"
-        d = SessionDB(db_path=db_path)
+        d = SessionDB(db_path=db_path, allow_fts_rebuild=True)
         if not d._fts_enabled:
             d.close()
             pytest.skip("FTS5 unavailable in this build")
@@ -175,7 +175,7 @@ class TestSchemaPathAdmission:
         raw.close()
 
         with _rebuild_lock_held_by_other_process(db_path):
-            d2 = SessionDB(db_path=db_path)
+            d2 = SessionDB(db_path=db_path, allow_fts_rebuild=True)
             try:
                 assert d2._fts_enabled is False
             finally:
@@ -191,7 +191,7 @@ class TestSchemaPathAdmission:
         """_recover_stale_fts defers under contention and completes once the
         authority is free (next open)."""
         db_path = tmp_path / "state.db"
-        d = SessionDB(db_path=db_path)
+        d = SessionDB(db_path=db_path, allow_fts_rebuild=True)
         if not d._fts_enabled:
             d.close()
             pytest.skip("FTS5 unavailable in this build")
@@ -211,7 +211,7 @@ class TestSchemaPathAdmission:
         raw.close()
 
         with _rebuild_lock_held_by_other_process(db_path):
-            d2 = SessionDB(db_path=db_path)
+            d2 = SessionDB(db_path=db_path, allow_fts_rebuild=True)
             try:
                 assert d2._fts_enabled is False
             finally:
@@ -219,7 +219,7 @@ class TestSchemaPathAdmission:
         # Deferred: breadcrumb still present, recovery not performed.
         assert _meta_value(db_path, FTS_STALE_KEY) == "1"
 
-        d3 = SessionDB(db_path=db_path)
+        d3 = SessionDB(db_path=db_path, allow_fts_rebuild=True)
         try:
             assert d3._fts_enabled is True
         finally:
@@ -390,12 +390,12 @@ class TestNonContentionErrnoFailsFast:
     def test_retry_deferred_fts_recovery_rebuilds_same_instance(
         self, tmp_path, monkeypatch
     ):
-        """Gateway-shaped: same SessionDB stays open and retries after deferral."""
+        """An explicit offline handle can retry after rebuild admission was deferred."""
         import hermes_state_schema
 
         monkeypatch.setattr(hermes_state_schema, "_FTS_STALE_RETRY_SECONDS", 0.0)
         db_path = tmp_path / "state.db"
-        d = SessionDB(db_path=db_path)
+        d = SessionDB(db_path=db_path, allow_fts_rebuild=True)
         if not d._fts_enabled:
             d.close()
             pytest.skip("FTS5 unavailable in this build")
@@ -417,7 +417,7 @@ class TestNonContentionErrnoFailsFast:
         monkeypatch.setattr(
             SessionDB, "_foreign_state_db_holders", lambda self: list(holders)
         )
-        d2 = SessionDB(db_path=db_path)
+        d2 = SessionDB(db_path=db_path, allow_fts_rebuild=True)
         try:
             assert d2._fts_stale is True
             d2._fts_stale_retry_after = 0.0
@@ -516,7 +516,7 @@ class TestDeferredFtsRetryInProcess:
         import hermes_state_schema
 
         db_path = tmp_path / "state.db"
-        d = SessionDB(db_path=db_path)
+        d = SessionDB(db_path=db_path, allow_fts_rebuild=True)
         if not d._fts_enabled:
             d.close()
             pytest.skip("FTS5 unavailable in this build")
@@ -526,7 +526,7 @@ class TestDeferredFtsRetryInProcess:
         self._mark_stale(db_path)
 
         with _rebuild_lock_held_by_other_process(db_path):
-            gw = SessionDB(db_path=db_path)  # long-lived "gateway" open
+            gw = SessionDB(db_path=db_path, allow_fts_rebuild=True)  # long-lived "gateway" open
             try:
                 assert gw._fts_stale is True
                 # Live holder: the retry must return quickly (timeout=0),
@@ -564,12 +564,10 @@ class TestDeferredFtsRetryInProcess:
         assert _meta_value(db_path, FTS_STALE_KEY) is None
         assert _base_fts_triggers(db_path) == set(_FTS_TRIGGERS)
 
-    def test_gateway_housekeeping_tick_drives_the_retry(
+    def test_gateway_housekeeping_keeps_live_indexes_detached(
         self, tmp_path, fast_timeout, monkeypatch
     ):
-        """The retry hangs off the EXISTING housekeeping loop (no new thread)
-        and reaches shared-registry instances."""
-        import threading
+        """Housekeeping preserves the stale breadcrumb on live shared instances."""
 
         import hermes_state_registry
         import hermes_state_schema
@@ -591,28 +589,17 @@ class TestDeferredFtsRetryInProcess:
         try:
             assert gw._fts_stale is True
             assert gw in hermes_state_registry.live_shared_session_dbs()
-            stop = threading.Event()
-            th = threading.Thread(
-                target=grun._start_gateway_housekeeping,
-                args=(stop,),
-                kwargs={"interval": 0.05},
-                daemon=True,
-            )
-            th.start()
-            deadline = time.monotonic() + 10.0
-            while gw._fts_stale and time.monotonic() < deadline:
-                time.sleep(0.05)
-            stop.set()
-            th.join(timeout=5)
-            assert gw._fts_stale is False
-            assert gw._fts_enabled is True
+            grun._housekeeping_deferred_fts_retry()
+            assert gw._fts_stale is True
+            assert gw._fts_enabled is False
+            assert _base_fts_triggers(db_path) == set()
         finally:
             hermes_state_registry.release_or_close(gw)
-        assert _meta_value(db_path, FTS_STALE_KEY) is None
+        assert _meta_value(db_path, FTS_STALE_KEY) == "1"
 
     def test_retry_noop_when_not_stale_or_read_only(self, tmp_path):
         db_path = tmp_path / "state.db"
-        d = SessionDB(db_path=db_path)
+        d = SessionDB(db_path=db_path, allow_fts_rebuild=True)
         try:
             assert d._fts_stale is False
             assert d.retry_deferred_fts_recovery() is False
@@ -632,7 +619,7 @@ class TestDeferredFtsRetryInProcess:
         now-corrupt handle must not retry the rebuild forever against the
         damaged image (real DDL/DML the quarantine exists to prevent)."""
         db_path = tmp_path / "state.db"
-        d = SessionDB(db_path=db_path)
+        d = SessionDB(db_path=db_path, allow_fts_rebuild=True)
         if not d._fts_enabled:
             d.close()
             pytest.skip("FTS5 unavailable in this build")
@@ -645,7 +632,7 @@ class TestDeferredFtsRetryInProcess:
         # holder) so _fts_stale is still True once the handle is open —
         # mirrors test_retry_is_non_blocking_while_live_holder_and_backs_off.
         with _rebuild_lock_held_by_other_process(db_path):
-            gw = SessionDB(db_path=db_path)
+            gw = SessionDB(db_path=db_path, allow_fts_rebuild=True)
         try:
             assert gw._fts_stale is True
             gw._db_corrupt = True

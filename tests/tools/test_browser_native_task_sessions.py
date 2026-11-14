@@ -392,13 +392,12 @@ def test_first_running_call_registers_the_actual_daemon_owner(shared_browser, tm
 
 
 def test_cleanup_before_first_daemon_start_blocks_the_queued_operation(shared_browser, tmp_path):
-    from tools.browser_harness_dirs import daemon_identity, fit_default_socket_dir
+    from tools.browser_harness_dirs import daemon_identity
     from tools.browser_use_sessions import capture_task, daemon_operation, task_session_name
 
     state = capture_task(shared_browser)
     env = browser_use_cli._base_subprocess_env()
     env["BU_NAME"] = task_session_name(shared_browser)
-    fit_default_socket_dir(env)
     identity = daemon_identity(env)
     marker = tmp_path / "late-start"
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -478,7 +477,7 @@ def test_starting_daemon_cleanup_preserves_ownership_until_ipc_is_ready(shared_b
     import signal
 
     from tests.tools.native_cdp_discovery import gated_chrome_discovery
-    from tools.browser_harness_dirs import daemon_identity, fit_default_socket_dir, harness_pid_file
+    from tools.browser_harness_dirs import daemon_identity, harness_pid_file
     from tools.browser_use_sessions import (BrowserTaskEnded, capture_task, execute_harness_call,
                                            task_session_name)
 
@@ -486,7 +485,6 @@ def test_starting_daemon_cleanup_preserves_ownership_until_ipc_is_ready(shared_b
     env = browser_use_cli._base_subprocess_env()
     env.pop("BU_CDP_WS", None)
     env["BU_NAME"] = task_session_name(shared_browser)
-    fit_default_socket_dir(env)
     identity = daemon_identity(env)
     pid = None
     with gated_chrome_discovery() as gate, concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional
 
 from gateway.platforms._shared import get_scoped_secret, platform_gate_env
 
@@ -72,7 +72,7 @@ class DiscordContextMixin:
 
 
     async def _fetch_channel_context(
-        self, channel: Any, before: "DiscordMessage", reply_target: Optional[Any] = None,
+        self, channel: Any, before: DiscordMessage, reply_target: Optional[Any] = None,
         include_self_boundary: bool = False,
     ) -> str:
         """Fetch recent channel messages; returns a ``[Recent channel messages]`` block or "".
@@ -141,7 +141,7 @@ class DiscordContextMixin:
                         has_unverified = True
                 return f"{trust_tag}[{name}] {content}"
             # ── Primary window: recent channel activity since the last bot turn ──
-            collected: List[Tuple[str, str]] = []  # (message_id, line)
+            collected: list[tuple[str, str]] = []  # (message_id, line)
             seen_ids: set = set()
             included_self_boundary = seen_nonself_after_boundary = False
             # oldest_first=False explicitly — discord.py 2.x flips the default to True when `after=`
@@ -181,7 +181,7 @@ class DiscordContextMixin:
                 if mid:
                     seen_ids.add(mid)
             # Reply window: context around the replied-to message; deliberately NOT self-partitioned.
-            reply_collected: List[Tuple[str, str]] = []
+            reply_collected: list[tuple[str, str]] = []
             reply_target_id = str(getattr(reply_target, "id", "")) if reply_target else ""
             if reply_target is not None and reply_target_id and reply_target_id not in seen_ids:
                 # Modest cap: anchored context, not a full backfill.
@@ -209,7 +209,7 @@ class DiscordContextMixin:
             # history is newest-first; reverse each window, reply context (older) first.
             collected.reverse()
             reply_collected.reverse()
-            blocks: List[str] = []
+            blocks: list[str] = []
             if has_unverified:
                 blocks.append(
                     "[Messages prefixed with [unverified] are from people whose "

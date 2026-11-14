@@ -48,11 +48,11 @@ HEADERS = frozenset({"session_id", "conversation_id", "x-session-id",
                      "x-conversation-id", "originator", "openai-beta",
                      "user-agent", "chatgpt-account-id", "openai-organization",
                      "openai-project", "x-initiator", "x-client-request-id"})
-_SECRET_KEY = re.compile(r"auth|cookie|password|passwd|secret|credential|api.?key|access.?key|private.?key|(?:^|_)token(?:$|_)|^env(?:ironment)?$", re.I)
-_OPAQUE_KEY = re.compile(r"encrypted|base64|image|audio|video|file_data|reasoning_content|reasoning_text|reasoning_summary|thinking|chain_of_thought|^cot$", re.I)
+_SECRET_KEY = re.compile(r"auth|cookie|password|passwd|secret|credential|api.?key|access.?key|private.?key|(?:^|_)token(?:$|_)|^env(?:ironment)?$", re.IGNORECASE)
+_OPAQUE_KEY = re.compile(r"encrypted|base64|image|audio|video|file_data|reasoning_content|reasoning_text|reasoning_summary|thinking|chain_of_thought|^cot$", re.IGNORECASE)
 _ASSIGN = re.compile(r"(?im)(\b[\w.-]*(?:token|secret|password|passwd|api[_-]?key|authorization|cookie)[\w.-]*\s*[=:]\s*)([^\r\n,;]+)")
 _MEDIA = re.compile(r"data:[^\s\"'<>]+|[A-Za-z0-9+/=_-]{96,}")
-_THINK = re.compile(r"<(think|thinking|analysis)\b[^>]*>.*?(?:</\1>|$)", re.I | re.S)
+_THINK = re.compile(r"<(think|thinking|analysis)\b[^>]*>.*?(?:</\1>|$)", re.IGNORECASE | re.DOTALL)
 _MISSING = object()
 
 

@@ -9,8 +9,8 @@ later as "Persisted transcript lagged live cached history" amnesia.
 
 The fix records a durable stale marker, detaches the FTS sync triggers, and
 retries the canonical write immediately. Live search degrades to canonical
-``LIKE`` queries. The existing guarded stale-open or explicit repair path may
-rebuild later, outside the failed live write/search operation.
+``LIKE`` queries. Complete rebuilding requires explicit offline permission,
+with the cross-process recovery authority still enforced.
 """
 
 import json
@@ -512,7 +512,7 @@ class TestRuntimeFtsRebuild:
         # tool high-water marker a pre-projection store may still carry.
         db.set_meta("fts_tool_full_content_high_water", "1")
         db.close()
-        reopened = SessionDB(db_path=db_path)
+        reopened = SessionDB(db_path=db_path, allow_fts_rebuild=True)
         try:
             assert reopened._fts_stale is False
             assert _meta_value(db_path, FTS_STALE_KEY) is None
@@ -722,7 +722,7 @@ class TestRuntimeFtsRebuild:
         )
         monkeypatch.setattr(hermes_state_schema.time, "time", lambda: 120.0)
 
-        reopened = SessionDB(db_path=db_path)
+        reopened = SessionDB(db_path=db_path, allow_fts_rebuild=True)
         try:
             assert reaped == [(4242, str(db_path) + "-wal")]
             assert reopened._fts_stale is False
@@ -772,7 +772,7 @@ class TestRuntimeFtsRebuild:
         # Read via getattr so the red-on-base run reaches the behavioural assertion, not a NameError.
         futile_attempts = getattr(hermes_state_schema, "_FTS_HOLDER_FUTILE_ATTEMPTS", 10)
         futile_seconds = getattr(hermes_state_schema, "_FTS_HOLDER_FUTILE_SECONDS", 1800.0)
-        reopened = SessionDB(db_path=db_path)
+        reopened = SessionDB(db_path=db_path, allow_fts_rebuild=True)
         try:
             cursor = reopened._conn.cursor()
             # One deferral short of the futile window: still the generic escalation.
@@ -821,7 +821,7 @@ class TestRuntimeFtsRebuild:
 
         holders = [(4242, str(db_path) + "-wal")]
         monkeypatch.setattr(SessionDB, "_foreign_state_db_holders", lambda self: list(holders))
-        reopened = SessionDB(db_path=db_path)
+        reopened = SessionDB(db_path=db_path, allow_fts_rebuild=True)
         try:
             assert reopened._fts_stale is True
             # Backoff pinned at the cap by the same holder; the holder still there -> no retry.
@@ -869,7 +869,7 @@ class TestRuntimeFtsRebuild:
         finally:
             legacy.close()
 
-        recovered = SessionDB(db_path=db_path)
+        recovered = SessionDB(db_path=db_path, allow_fts_rebuild=True)
         try:
             assert recovered._fts_stale is False
             assert _meta_value(db_path, FTS_STALE_KEY) is None

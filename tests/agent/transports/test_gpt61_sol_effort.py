@@ -8,7 +8,7 @@ from agent.transports import get_transport
 @pytest.mark.parametrize("model", ["gpt-6.1-sol", "openai/gpt-6.1-sol-pro"])
 @pytest.mark.parametrize("requested,expected", [("max", "max"), ("ultra", "max"), ("none", "low")])
 def test_sol_effort_reaches_responses_wire(model, requested, expected):
-    import agent.transports.codex  # noqa: F401
+    import agent.transports.codex
 
     transport = get_transport("codex_responses")
     kwargs = transport.build_kwargs(

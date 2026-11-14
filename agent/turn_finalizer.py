@@ -150,14 +150,14 @@ def _resolve_budget_fallback(
             preserved_verification_fallback = True
         else:
             # _handle_max_iterations makes one extra toolless request for a summary.
-            agent._emit_status(
+            agent._emit_diagnostic_status(
                 f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
                 "— asking model to summarise"
             )
             if not agent.quiet_mode:
                 agent._safe_print(
                     f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
-                    "— requesting summary..."
+                    "— requesting summary...", diagnostic=True,
                 )
             _summary_start = time.time()
             try:
@@ -173,7 +173,10 @@ def _resolve_budget_fallback(
 
     # A kanban worker must record a terminal outcome whether or not a fallback path
     # was eligible, so the dispatcher learns the worker could not complete.
-    _kanban_task = os.environ.get("HERMES_KANBAN_TASK") if budget_exhausted else None
+    _kanban_task = (
+        os.environ.get("HERMES_KANBAN_TASK")
+        if budget_exhausted and is_dispatcher_owned_worker_context() else None
+    )
     # If running as a kanban worker, signal the dispatcher that the worker could not complete (rather than
     # treating it as a protocol violation). This applies whether the user-facing fallback came from the
     # summary call or an explicitly pending continuation; both exhausted the task budget and must advance
@@ -377,6 +380,7 @@ def _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_r
     _diag_msg = (
         "Turn ended: reason=%s model=%s api_calls=%d/%d budget=%d/%d "
         "tool_turns=%d last_msg_role=%s response_len=%d session=%s"
+        + (" origin=%s" if getattr(agent, "_turn_origin", None) else "")
     )
     _diag_args = (
         _turn_exit_reason, agent.model, api_call_count, agent.max_iterations,
@@ -384,6 +388,7 @@ def _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_r
         agent.iteration_budget.max_total if agent.iteration_budget else 0,
         _turn_tool_count, _last_msg_role, len(final_response) if final_response else 0,
         agent.session_id or "none",
+        *((agent._turn_origin,) if getattr(agent, "_turn_origin", None) else ()),
     )
     if _last_msg_role == "tool" and not interrupted:
         logger.warning(
@@ -408,6 +413,12 @@ def _append_file_mutation_footer(agent, final_response, logger):
         # Empty/interrupted turns already have other surface text that shouldn't be augmented.
         _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
         if _failed and agent._file_mutation_verifier_enabled():
+            from tools.hosted_tool_policy import host_feature_enabled
+            from tools.file_tools_paths import _terminal_env_type_for_task
+            if host_feature_enabled("file_mutation_bookkeeping") and _terminal_env_type_for_task(
+                getattr(agent, "_current_task_id", None) or "default"
+            ) == "local":
+                _failed = agent._file_mutations_still_failed(_failed)
             footer = agent._format_file_mutation_failure_footer(_failed)
             if footer:
                 final_response = final_response.rstrip() + "\n\n" + footer
@@ -439,6 +450,7 @@ def _explain_abnormal_exit(agent, final_response, _turn_exit_reason, preserved_v
             _explanation = agent._format_turn_completion_explanation(
                 _turn_exit_reason, getattr(agent, "_last_persistence_error_cause", None),
                 db_path=getattr(getattr(agent, "_session_db", None), "db_path", None),
+                model=str(getattr(agent, "model", "") or ""),
             )
             if _explanation:
                 # Replace the bare sentinel; keep a partial fragment and append why.
@@ -634,6 +646,22 @@ def _mirror_turn_to_memory(
             )
 
 
+def _stamp_turn_failure_result(agent, result, failed, exit_reason, failure):
+    """Expose the native failure verdict and profile-specific recovery guidance."""
+    if failed and str(exit_reason) == "session_persistence_failed":
+        from hermes_constants import profile_cli_selector
+        result["error"] = result["final_response"] or (
+            "session storage could not be written — check the state database "
+            f"health (`hermes {profile_cli_selector()}doctor`), then send your message again"
+        )
+        cause = getattr(agent, "_last_persistence_error_cause", None)
+        result["failure_reason"] = "session_persistence_failed:" + (cause or "unknown")
+    elif failure is not None:
+        if failed:
+            result["error"] = result["final_response"] or str(exit_reason)
+        stamp_failure(result, failure.reason, failure.retryable)
+
+
 def finalize_turn(
     agent, *, final_response, api_call_count, interrupted, failed, messages, conversation_history,
     effective_task_id, turn_id, user_message, original_user_message, _should_review_memory,
@@ -704,6 +732,7 @@ def finalize_turn(
     completed = (
         final_response is not None
         and not failed
+        and not interrupted
         and (api_call_count < agent.max_iterations or str(_turn_exit_reason).startswith("text_response("))
     )
 
@@ -822,6 +851,7 @@ def finalize_turn(
         # explanation appended since): it carries no new text for the client to paint.
         "response_reused": bool(final_response) and final_response == getattr(agent, "_reused_response_text", None),
         "model": agent.model,
+        **result_model_fields(agent),
         "provider": agent.provider,
         "base_url": agent.base_url,
         **{key: getattr(agent, f"session_{key}") for key in _SESSION_TOKEN_KEYS},
@@ -843,13 +873,7 @@ def finalize_turn(
     # Persistence failures already set failed=True; also stamp `error` so the gateway
     # surfaces status="error" (desktop can toast) instead of a quiet complete frame, plus
     # the machine-readable cause 'session_persistence_failed:<locked|compression|...>'.
-    if failed and str(_turn_exit_reason) == "session_persistence_failed":
-        result["error"] = final_response or (
-            "session storage could not be written — check the state database "
-            "health (`hermes doctor`), then send your message again"
-        )
-        _cause = getattr(agent, "_last_persistence_error_cause", None)
-        result["failure_reason"] = "session_persistence_failed:" + (_cause or "unknown")
+    _stamp_turn_failure_result(agent, result, failed, _turn_exit_reason, _exit_failure)
     # Cleanup failures are surfaced, but the response is returned either way (#8049).
     if _cleanup_errors:
         result["cleanup_errors"] = _cleanup_errors
@@ -905,45 +929,3 @@ def finalize_turn(
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
     return result
-
-
-def apply_llm_output_transform(
-    agent, final_response, *, turn_id, platform=None, logger=None,
-) -> Tuple[Any, bool, Optional[Any]]:
-    """Fire ``transform_llm_output`` once per turn and return
-    ``(final_response, transformed, pre_transform_response)``.
-
-    Called BEFORE the final assistant row is first persisted — from ``finish_text_response``
-    ahead of its durable flush, and from ``finalize_turn._persist_step`` ahead of the
-    recovery-path tail close — so the text the user sees is the text stored in SQLite/JSON and
-    replayed next turn (#44239). SQLite treats a non-blank assistant row as settled (a re-flush
-    adopts the stored content rather than overwriting it), so transforming after that first
-    write can never reach the durable store. Idempotent per ``turn_id``: later callers in the
-    same turn get the recorded outcome instead of a second hook firing. Only the current
-    turn's not-yet-written text is touched — earlier turns and the system prompt are never
-    rewritten (prompt-cache invariant)."""
-    if logger is None:
-        from agent.conversation_loop import logger
-    recorded = getattr(agent, "_llm_output_transform", None)
-    if isinstance(recorded, tuple) and len(recorded) == 3 and recorded[0] == turn_id:
-        _, transformed, pre_transform = recorded
-        return final_response, transformed, pre_transform
-    if not final_response:
-        return final_response, False, None
-    if platform is None:
-        platform = getattr(agent, "platform", None) or ""
-    transformed, pre_transform = False, None
-    # First hook to return a string wins; None/empty leaves the text unchanged.
-    for _hook_result in _invoke_hook_safely(
-        "transform_llm_output", logger,
-        response_text=final_response,
-        session_id=agent.session_id or "",
-        model=agent.model,
-        platform=platform,
-        turn_id=turn_id,  # per-turn identity for the hook callback gate
-    ):
-        if isinstance(_hook_result, str) and _hook_result:
-            pre_transform, final_response, transformed = final_response, _hook_result, True
-            break
-    agent._llm_output_transform = (turn_id, transformed, pre_transform)
-    return final_response, transformed, pre_transform

@@ -7,6 +7,7 @@ is the inverse that ``restore_primary_runtime`` runs once its gates pass.
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any, Dict, NamedTuple, Optional, Tuple
 
@@ -109,8 +110,8 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
         provider=provider, base_url=base_url, api_mode=api_mode, model=model)
     agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
+    _reresolve_fallback_reasoning_config(agent, entry)
     _update_fallback_context_compressor(agent)
-    _reresolve_fallback_reasoning_config(agent)
     _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
     return old_model, old_provider
 
@@ -146,10 +147,11 @@ def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
     if getattr(agent, "_compression_feasibility_checked", False) is True:
         from agent.conversation_compression_feasibility import revalidate_compression_feasibility
         revalidate_compression_feasibility(agent)
-    # Older snapshots have no reasoning_config; keep the current value.
-    saved_reasoning = rt.get("reasoning_config")
-    if saved_reasoning is not None:
-        agent.reasoning_config = dict(saved_reasoning)
+    # Missing fields predate the policy snapshot; explicit None clears the previous route.
+    if "reasoning_config" in rt:
+        agent.reasoning_config = copy.deepcopy(rt["reasoning_config"])
+    if "reasoning_policy_entry" in rt:
+        agent._runtime_reasoning_entry = copy.deepcopy(rt["reasoning_policy_entry"])
     # Reset the stale-call circuit breaker: its streak measured the route being left.
     from agent.chat_completion_helpers import _reset_stale_streak, rewrite_prompt_model_identity
     _reset_stale_streak(agent)
@@ -170,6 +172,9 @@ def reinstall_primary_runtime(
     )
     from agent.route_verdicts import restore_primary_route_verdicts
     restore_primary_route_verdicts(agent, rt)
+    if "reasoning_policy_entry" not in rt:
+        agent._runtime_reasoning_entry = None
+    agent._active_fallback_entry = None
     agent._fallback_activated = False
     agent._fallback_index = 0
     agent._rate_limit_backoff_count = 0

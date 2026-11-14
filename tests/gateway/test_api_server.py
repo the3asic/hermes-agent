@@ -305,7 +305,7 @@ class TestAdapterInit:
         monkeypatch.setattr(
             "gateway.run._resolve_gateway_model", lambda: "primary-model"
         )
-        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+        monkeypatch.setattr("gateway.run._load_gateway_config", dict)
         monkeypatch.setattr(
             "gateway.run._load_gateway_runtime_config",
             lambda: {"agent": {"reasoning_effort": "high"}},

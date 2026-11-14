@@ -582,10 +582,14 @@ class SessionDB(
         except Exception as exc:
             logger.warning("%s close failed for %s: %s", label, self.db_path, exc)
 
-    def __init__(self, db_path: Path | None = None, read_only: bool = False):
+    def __init__(
+        self, db_path: Path | None = None, read_only: bool = False, *, allow_fts_rebuild: bool = False,
+    ):
+        """Open canonical state; full FTS recovery requires explicit offline permission."""
         self.db_path = db_path or _default_db_path()
         _ensure_test_isolation(self.db_path)  # before any connection/pragma/mkdir
         self.read_only = read_only
+        self._allow_fts_rebuild = allow_fts_rebuild and not read_only
         # Keep only the opening call site, never a frame (which pins caller locals).
         self._creation_site = "unknown"
         caller = None
@@ -711,7 +715,7 @@ class SessionDB(
         except sqlite3.DatabaseError as exc:
             # A malformed schema fails on the very first statement (before _init_schema), so the
             # FTS-rebuild layer never sees it: repair sqlite_master in place (backup first), reopen once.
-            if not is_malformed_schema_error(exc) or not _claim_repair_attempt(self.db_path):
+            if not self._allow_fts_rebuild or not is_malformed_schema_error(exc) or not _claim_repair_attempt(self.db_path):
                 raise
             logger.error(
                 "state.db schema is malformed (%s) — attempting automatic "

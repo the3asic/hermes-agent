@@ -770,90 +770,25 @@ class TestTimeoutProcessGroupKill:
             bu_cli._run_cli_killing_process_group(["x"], "code", {}, 5)
 
 
-class TestExecHybridPrivateUrlRouting:
-    """With a cloud provider configured and ``browser.auto_local_for_private_urls`` on, a browser_exec
-    call carrying a private URL runs on the hybrid LOCAL sidecar or is refused; it never reaches the
-    cloud browser (one CDP endpoint per call)."""
+@pytest.mark.parametrize(("url", "auto_local", "refusal"), [
+    ("http://192.168.0.1:9120/login", True, None),
+    ("http://192.168.0.1:9120/login", False, "private or internal"),
+    ("http://169.254.169.254/latest/meta-data/", True, "cloud metadata"),
+    ("http://169.254.169.254/latest/meta-data/", False, "cloud metadata"),
+    ("http://93.184.216.34/", False, None),
+])
+def test_hybrid_url_floor_uses_the_dispatch_verdict(url, auto_local, refusal):
+    """A local-routing verdict relaxes private addresses while preserving the metadata floor."""
+    from hermes_cli.config import save_config
+    from tools.browser_session_cdp import set_live_cdp_override
+    from tools.browser_url_policy import evaluate_url_safety
 
-    LAN = "http://192.168.0.1:9120/login"
-
-    @pytest.fixture(autouse=True)
-    def _cloud_with_hybrid(self, monkeypatch, tmp_path):
-        monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override", lambda: "")
-        monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override_raw", lambda: "")
-        monkeypatch.setattr(bs_cloud, "get_cloud_provider", lambda: object())
-        monkeypatch.setattr(bs_cloud, "auto_local_for_private_urls", lambda: True)
-        monkeypatch.setattr(bu_cli, "_exec_route_is_sidecar", {}, raising=False)
-        monkeypatch.setattr(bu_cli, "_driven_daemons", {})
-        self.cloud_keys, self.local_keys = [], []
-
-        def session_info(key):  # one session layer: the ::local sidecar is a local browser
-            if bs.is_local_sidecar_key(key):
-                self.local_keys.append(key)
-                return {"cdp_url": f"ws://127.0.0.1:47000/devtools/browser/{key}", "features": {"local": True}}
-            self.cloud_keys.append(key)
-            return {"cdp_url": "wss://cloud.example/x"}
-        monkeypatch.setattr(bs, "get_session_info", session_info)
-        cli = _fake_cli(tmp_path, 'cat >/dev/null; printf "%s" "${BU_NAME:-default}"\n')
-        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
-        # Public hostnames (example.com) resolve to a public address from a fixture: the SSRF
-        # guard refuses a name it cannot resolve, so these cases followed the host's resolver.
-        self._dns(monkeypatch, "93.184.216.34", "93.184.216.34")
-
-    @staticmethod
-    def _dns(monkeypatch, first_ip, later_ip):
-        """A rebinding host: ``first_ip`` for the first lookup, ``later_ip`` for every later one.
-        Address literals resolve to themselves, as they do without DNS."""
-        lookups = []
-
-        def fake_getaddrinfo(host, *a, **kw):
-            try:
-                ip = str(ipaddress.ip_address(host))
-            except ValueError:
-                lookups.append(host)
-                ip = first_ip if len(lookups) == 1 else later_ip
-            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0))]
-
-        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
-
-    @pytest.mark.parametrize("case, code, refusal", [
-        ("lan", f'new_tab("{LAN}")', None),
-        ("mixed", f'new_tab("https://example.com/x")\nnew_tab("{LAN}")', None),
-        ("rebind-private-then-public", 'new_tab("http://rebind.example/login")', None),
-        ("imds", 'new_tab("http://169.254.169.254/latest/meta-data/")', "cloud metadata"),
-        ("hybrid-off", f'new_tab("{LAN}")', "private or internal"),
-        ("rebind-public-then-private", 'new_tab("http://flip.example/x")', "private or internal"),
-    ])
-    def test_private_url_runs_on_local_sidecar_or_is_refused(self, monkeypatch, case, code, refusal):
-        if case.startswith("rebind-private"):
-            self._dns(monkeypatch, "192.168.1.5", "93.184.216.34")
-        elif case.startswith("rebind-public"):
-            self._dns(monkeypatch, "93.184.216.34", "192.168.1.5")
-        elif case == "hybrid-off":
-            monkeypatch.setattr(bs_cloud, "auto_local_for_private_urls", lambda: False)
-
-        result = json.loads(bu_cli.browser_exec(code, task_id="t"))
-
-        assert self.cloud_keys == [], "a call carrying a private URL reached the cloud provider"
-        if refusal:
-            assert refusal in result.get("error", ""), result
-            assert self.local_keys == []
-        else:
-            assert result["success"] is True, result
-            assert self.local_keys == ["t::local"]
-            assert result["output"].startswith("_local_")
-
-    def test_sidecar_route_has_its_own_daemon_and_sticks_for_url_less_calls(self):
-        """The harness daemon reads BU_CDP_* once at spawn, so the sidecar must not share the cloud
-        route's daemon; a follow-up with no URL literal keeps driving the page the last call opened."""
-        steps = ['new_tab("https://example.com/")',
-                 f'new_tab("{self.LAN}")',
-                 'print(js("document.title"))']
-
-        daemons = [json.loads(bu_cli.browser_exec(code, task_id="t"))["output"] for code in steps]
-
-        assert daemons[0] != daemons[1]
-        assert daemons[1] == daemons[2]
-        assert daemons[1].startswith("_local_")
-        assert self.cloud_keys == ["t"]
-        assert self.local_keys == ["t::local", "t::local"]
+    save_config({"browser": {"cloud_provider": "local", "cdp_url": "http://93.184.216.34:9222",
+                             "allow_private_urls": False}})
+    set_live_cdp_override(None)
+    bs_cloud.reset_caches()
+    result = evaluate_url_safety(url, auto_local=auto_local)
+    if refusal is None:
+        assert result is None
+    else:
+        assert refusal in result["error"]

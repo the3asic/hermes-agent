@@ -27,7 +27,7 @@ from urllib.parse import urlparse, parse_qs, urlunparse
 
 from agent.local_prompt_progress import (
     PromptReadingClock, current_prompt_reading_hook, prompt_progress, prompt_reading_hook, with_prompt_progress)
-from agent import auxiliary_call_outcome, auxiliary_error_policy as aux_errors
+from agent import auxiliary_call_outcome, auxiliary_error_policy as aux_errors, auxiliary_runtime_policy
 from agent.error_classifier import (
     FailoverReason,
     UNSUPPORTED_PARAM_MARKERS,
@@ -2815,8 +2815,7 @@ def reset_runtime_main(token: contextvars.Token) -> None:
 
 def get_scoped_runtime_main() -> dict[str, Any]:
     """Current context's scoped main-runtime snapshot ({} when unbound)."""
-    runtime = _RUNTIME_MAIN_CONTEXT.get()
-    return dict(runtime) if isinstance(runtime, dict) else {}
+    return _normalize_main_runtime(None)
 
 
 @contextlib.contextmanager
@@ -3148,6 +3147,9 @@ def _normalize_main_runtime(main_runtime: Optional[dict[str, Any]]) -> dict[str,
         identity = normalized.get(identity_field)
         if isinstance(identity, str):
             normalized[identity_field] = identity.lower()
+    if "reasoning_config" in main_runtime:
+        reasoning = main_runtime["reasoning_config"]
+        normalized["reasoning_config"] = copy.deepcopy(reasoning) if isinstance(reasoning, dict) else None
     return normalized
 
 
@@ -3632,6 +3634,8 @@ def _prepare_same_provider_retry(
         temperature=temperature, max_tokens=max_tokens, tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=retry_base or resolved_base_url, task=task,
+        api_mode=resolved_api_mode or ("codex_responses" if isinstance(
+            retry_client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)) else None),
     )
     # Preserve per-request attribution headers (a profile's ``request_headers``) across the rebuilt-client
     # retry: dropping them would let a recovery retry silently lose capability gating (#60293).
@@ -3822,52 +3826,28 @@ def _take_selected_fallback_route_ref() -> Optional[_FallbackRouteRef]:
 
 
 def _resolve_auxiliary_fallback_reasoning(
-    task: Optional[str],
-    fb_label: str,
-    *,
-    model: Optional[str],
+    task: Optional[str], fb_label: str, *, model: Optional[str],
     fallback_route_ref: Optional[_FallbackRouteRef] = None,
 ) -> Optional[dict[str, Any]]:
-    """Resolve target-owned reasoning for an auxiliary fallback route."""
-    try:
-        from hermes_cli.config import load_config_readonly
-        from hermes_cli.fallback_config import get_fallback_chain
-        from hermes_constants import resolve_fallback_reasoning_config
+    """Resolve entry > target-model > global reasoning without the failed route's policy."""
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.fallback_config import get_fallback_chain
+    from hermes_constants import resolve_fallback_reasoning_config
 
+    try:
         config = load_config_readonly()
     except Exception:
+        logger.warning("Auxiliary fallback defaults unavailable; using the selected entry and provider defaults", exc_info=True)
         config = {}
-    entry = (
-        dict(fallback_route_ref.entry)
-        if isinstance(fallback_route_ref, _FallbackRouteRef)
-        else _fallback_chain_entry(task, fb_label)
-    )
+    entry = (dict(fallback_route_ref.entry) if isinstance(fallback_route_ref, _FallbackRouteRef)
+             else _fallback_chain_entry(task, fb_label))
     if entry is None:
         match = re.match(r"fallback_providers\[(\d+)\]", fb_label or "")
-        try:
-            main_chain = get_fallback_chain(config)
-        except Exception:
-            main_chain = []
-        if match and isinstance(main_chain, list):
-            try:
-                candidate = main_chain[int(match.group(1))]
-                entry = candidate if isinstance(candidate, dict) else None
-            except (IndexError, ValueError):
-                entry = None
-    try:
-        return resolve_fallback_reasoning_config(
-            config,
-            str(model or ""),
-            entry,
-        )
-    except Exception:
-        logger.debug(
-            "Auxiliary %s fallback reasoning resolution failed for %s",
-            task or "call",
-            model or "default",
-            exc_info=True,
-        )
-        return None
+        chain = get_fallback_chain(config)
+        if match and int(match.group(1)) < len(chain):
+            candidate = chain[int(match.group(1))]
+            entry = candidate if isinstance(candidate, dict) else None
+    return resolve_fallback_reasoning_config(config, str(model or ""), entry)
 
 
 def _route_inherits_main_runtime(
@@ -3922,8 +3902,7 @@ def _compression_route_reasoning(
     if task != "compression":
         return reasoning_config, effective_extra_body
     if isinstance(fallback_route_ref, _FallbackRouteRef):
-        effective_extra_body = dict(effective_extra_body)
-        effective_extra_body.pop("reasoning", None)
+        effective_extra_body = auxiliary_runtime_policy.without_route_reasoning(effective_extra_body)
         return (
             _resolve_auxiliary_fallback_reasoning(
                 task,
@@ -3955,8 +3934,7 @@ def _compression_route_reasoning(
         # Auto can reach a configured fallback before the first request when
         # the active route is unavailable. That target owns its effort just
         # like a request-time fallback does.
-        effective_extra_body = dict(effective_extra_body)
-        effective_extra_body.pop("reasoning", None)
+        effective_extra_body = auxiliary_runtime_policy.without_route_reasoning(effective_extra_body)
         reasoning_config = _resolve_auxiliary_fallback_reasoning(
             task,
             "",
@@ -4055,84 +4033,36 @@ def _fallback_request_kwargs(
     destination: _FallbackDestination, *, task: Optional[str], messages: list,
     tools: Optional[list], temperature: Optional[float], max_tokens: Optional[int],
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
-    fallback_entry: dict, task_config: dict, apply_fast_lane: bool,
+    fb_label: str, fallback_route_ref: Optional[_FallbackRouteRef], apply_fast_lane: bool,
+    reasoning_is_pinned: bool = False,
 ) -> dict[str, Any]:
-    """Build request kwargs for one fallback destination (cache-section replan + fast-lane cap)."""
-    fallback_max_tokens, fallback_extra_body = max_tokens, effective_extra_body
-    if apply_fast_lane:
-        fallback_max_tokens, fallback_extra_body = _compression_fast_lane_controls(
-            task, actual_provider=destination.provider, actual_model=destination.model,
-            requested_provider=fallback_entry.get("provider"),
-            requested_model=fallback_entry.get("model"), route_config=fallback_entry,
-            leak_guard_config=task_config, max_tokens=max_tokens, extra_body=effective_extra_body,
-        )
+    """Build target-owned fallback kwargs and replan destination-specific cache sections."""
+    fallback_max_tokens, fallback_extra_body, reasoning_config = auxiliary_runtime_policy.fallback_request_controls(
+        task, destination, fb_label, max_tokens=max_tokens, effective_extra_body=effective_extra_body,
+        reasoning_config=reasoning_config, fallback_route_ref=fallback_route_ref, apply_fast_lane=apply_fast_lane,
+        reasoning_is_pinned=reasoning_is_pinned,
+    )
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(messages, tools, destination=destination)
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,
         temperature=temperature, max_tokens=fallback_max_tokens, tools=fallback_tools, timeout=effective_timeout,
-        extra_body=fallback_extra_body, reasoning_config=reasoning_config, base_url=destination.base_url, task=task)
+        extra_body=fallback_extra_body, reasoning_config=reasoning_config, base_url=destination.base_url, task=task,
+        api_mode=destination.api_mode)
     return fb_kwargs
-
-
-def _fallback_request_controls(
-    task: Optional[str],
-    destination: _FallbackDestination,
-    fb_label: str,
-    *,
-    max_tokens: Optional[int],
-    effective_extra_body: dict[str, Any],
-    reasoning_config: Optional[dict[str, Any]],
-    fallback_route_ref: Optional[_FallbackRouteRef] = None,
-    apply_fast_lane: bool = True,
-) -> tuple[Optional[int], dict[str, Any], Optional[dict[str, Any]]]:
-    """Resolve route-owned compression controls for one fallback request."""
-    task_config = _get_auxiliary_task_config(task) if task == "compression" else {}
-    fallback_entry = (
-        dict(fallback_route_ref.entry)
-        if isinstance(fallback_route_ref, _FallbackRouteRef)
-        else (_fallback_chain_entry(task, fb_label) or {})
-    )
-    fallback_reasoning = reasoning_config
-    fallback_input_body = effective_extra_body
-    if task == "compression":
-        if fallback_route_ref is not None or fb_label:
-            fallback_reasoning = _resolve_auxiliary_fallback_reasoning(
-                task,
-                fb_label,
-                model=destination.model,
-                fallback_route_ref=fallback_route_ref,
-            )
-        # The failed route's task/session policy is not fallback policy. Strip
-        # it before fast-lane controls add any target-owned declaration.
-        fallback_input_body = dict(effective_extra_body)
-        fallback_input_body.pop("reasoning", None)
-    if not apply_fast_lane:
-        return max_tokens, fallback_input_body, fallback_reasoning
-    fallback_max_tokens, fallback_extra_body = _compression_fast_lane_controls(
-        task,
-        actual_provider=destination.provider,
-        actual_model=destination.model,
-        requested_provider=fallback_entry.get("provider"),
-        requested_model=fallback_entry.get("model"),
-        route_config=fallback_entry,
-        leak_guard_config=task_config,
-        max_tokens=max_tokens,
-        extra_body=fallback_input_body,
-    )
-    return fallback_max_tokens, fallback_extra_body, fallback_reasoning
 
 
 def _plan_fallback_candidate(
     fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str],
-    effective_timeout: float, apply_fast_lane: bool, **request,
-) -> tuple[_FallbackDestination, dict[str, Any], Callable[[str, Any, Optional[str]], dict[str, Any]]]:
+    effective_timeout: float, apply_fast_lane: bool, fallback_route_ref: Optional[_FallbackRouteRef] = None, **request,
+) -> tuple[_FallbackDestination, dict[str, Any], Callable[[str, Any, Optional[str]], tuple[_FallbackDestination, dict[str, Any]]]]:
     """Resolve the destination + first-attempt kwargs for a fallback candidate.
 
     Returns ``(destination, kwargs, rebuild)`` where ``rebuild(provider, client, model)`` produces
     kwargs for the credential-refreshed retry destination. A configured-chain entry's own
     ``timeout`` overrides ``effective_timeout``.
     """
-    fb_timeout = _fallback_entry_timeout(task, fb_label)
+    fb_timeout = (_coerce_positive_timeout(fallback_route_ref.entry.get("timeout"))
+                  if isinstance(fallback_route_ref, _FallbackRouteRef) else _fallback_entry_timeout(task, fb_label))
     if fb_timeout is not None and fb_timeout != effective_timeout:
         logger.info(
             "Auxiliary %s: %s using its configured timeout %.0fs "
@@ -4140,13 +4070,17 @@ def _plan_fallback_candidate(
             task or "call", fb_label, fb_timeout, effective_timeout,
         )
         effective_timeout = fb_timeout
-    destination = _fallback_destination(task, fb_client, fb_model, fb_label)
-    task_config = _get_auxiliary_task_config(task) if task == "compression" else {}
-    fallback_entry = _fallback_chain_entry(task, fb_label) or {}
+    destination = (_fallback_destination_from_entry(dict(fallback_route_ref.entry), fb_client, fb_model)
+                   if isinstance(fallback_route_ref, _FallbackRouteRef)
+                   else _fallback_destination(task, fb_client, fb_model, fb_label))
     common = dict(
-        task=task, effective_timeout=effective_timeout, fallback_entry=fallback_entry,
-        task_config=task_config, apply_fast_lane=apply_fast_lane, **request,
+        task=task, effective_timeout=effective_timeout, fb_label=fb_label,
+        fallback_route_ref=fallback_route_ref, apply_fast_lane=apply_fast_lane, **request,
     )
+    if task == "compression":
+        common["reasoning_config"] = _resolve_auxiliary_fallback_reasoning(
+            task, fb_label, model=destination.model, fallback_route_ref=fallback_route_ref)
+        common["reasoning_is_pinned"] = True
 
     def _rebuild(provider: str, client: Any, model: Optional[str]) -> tuple[_FallbackDestination, dict[str, Any]]:
         retry_destination = _FallbackDestination(
@@ -4234,6 +4168,7 @@ def _call_fallback_candidate_sync(
     fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str], messages: list,
     temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
+    fallback_route_ref: Optional[_FallbackRouteRef] = None,
 ) -> Optional[Any]:
     """Call one fallback candidate with stale-credential recovery (``_fallback_candidate_ladder``).
 
@@ -4245,7 +4180,7 @@ def _call_fallback_candidate_sync(
         fb_client, fb_model, fb_label, task=task, effective_timeout=effective_timeout,
         apply_fast_lane=True, messages=messages, tools=tools, temperature=temperature,
         max_tokens=max_tokens, effective_extra_body=effective_extra_body,
-        reasoning_config=reasoning_config,
+        reasoning_config=reasoning_config, fallback_route_ref=fallback_route_ref,
     )
     provider = _candidate_classification_provider(fb_client, fb_model, fb_label, task)
 
@@ -4258,7 +4193,7 @@ def _call_fallback_candidate_sync(
                     force_stream=_provider_requires_stream(dest.provider, dest.base_url),
                 ),
             ),
-            task,
+            task, provider=dest.provider, base_url=dest.base_url,
         )
     from agent.auxiliary_fallback_recovery import send_with_parameter_rungs
 
@@ -4276,13 +4211,14 @@ async def _call_fallback_candidate_async(
     fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str], messages: list,
     temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict], classify_as: str,
+    fallback_route_ref: Optional[_FallbackRouteRef] = None,
 ) -> Optional[Any]:
     """Async mirror of :func:`_call_fallback_candidate_sync` (no fast-lane cap on this wire)."""
     destination, fb_kwargs, rebuild = _plan_fallback_candidate(
         fb_client, fb_model, fb_label, task=task, effective_timeout=effective_timeout,
         apply_fast_lane=False, messages=messages, tools=tools, temperature=temperature,
         max_tokens=max_tokens, effective_extra_body=effective_extra_body,
-        reasoning_config=reasoning_config,
+        reasoning_config=reasoning_config, fallback_route_ref=fallback_route_ref,
     )
     provider = classify_as
 
@@ -4292,7 +4228,7 @@ async def _call_fallback_candidate_async(
             _validate_llm_response,
             await _relay_async_completion(client, request_kwargs, provider=dest.provider, api_mode=dest.api_mode,
                                           create=lambda request: _acreate_with_progress(client, request, provider=provider)),
-            task,
+            task, provider=dest.provider, base_url=dest.base_url,
         )
     from agent.auxiliary_fallback_recovery import send_with_parameter_rungs_async
 
@@ -4472,6 +4408,7 @@ def _try_configured_fallback_chain(
     """Try auxiliary.<task>.fallback_chain entries in order (each needs ``provider``; model/base_url/api_key optional).
     ``failed_model`` scoping per ``_failed_backend_skip`` (sibling models on the same provider still run after a
     model-scoped failure); this walk's ``skip_lanes`` are passed over. Returns (client, model, label)."""
+    _SELECTED_FALLBACK_ROUTE_REF.set(None)
     if not task:
         return None, None, ""
     chain = _get_auxiliary_task_config(task).get("fallback_chain")
@@ -5073,7 +5010,7 @@ def _resolve_auto_branch(req: _ResolveRequest) -> _ResolveResult:
     client, resolved, effective_provider = _resolve_auto_route(main_runtime=req.main_runtime, task=req.task)
     if client is None:
         return None, None
-    model = req.model
+    model = None if isinstance(_SELECTED_FALLBACK_ROUTE_REF.get(), _FallbackRouteRef) else req.model
     # An OpenRouter-format model override won't work on a non-OpenRouter provider (e.g. local
     # server); drop it for the provider's default.
     if model and "/" in model and resolved and "/" not in resolved:
@@ -5870,7 +5807,8 @@ def _client_cache_key(
     runtime = _normalize_main_runtime(main_runtime)
     # `auto` resolves through the main runtime and task-specific policy, so both join the key.
     runtime_key = tuple(_runtime_cache_discriminator(f, runtime.get(f, "")) for f in _MAIN_RUNTIME_FIELDS) if provider == "auto" else ()
-    task_key = (task or "", _task_prefers_fast_model(task)) if provider == "auto" else ""
+    task_key = (task or "", _task_prefers_fast_model(task),
+                auxiliary_runtime_policy.fallback_policy_cache_fingerprint(task)) if provider == "auto" else ""
     pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime)
     # Model MUST be in the key: concurrent calls to the same endpoint with different models would
     # share an entry, and the second builder's _store_cached_client would close the first's client.
@@ -6127,7 +6065,7 @@ def _get_cached_client(
             )
             if loop_ok:
                 _SELECTED_FALLBACK_ROUTE_REF.set(cached_ref)
-                return cached_client, _compat_model(cached_client, model, cached_default)
+                return cached_client, _compat_model(cached_client, None if cached_ref is not None else model, cached_default)
             # Stale async entry — evict. Only a closed owner loop may be awaited here; a live
             # foreign loop stays force-neutered.
             _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
@@ -6162,11 +6100,11 @@ def _get_cached_client(
             else:
                 built_client = client
                 client, default_model, _, winner_ref = _client_cache[cache_key]
-                if winner_ref is not None:
-                    _SELECTED_FALLBACK_ROUTE_REF.set(winner_ref)
+                _SELECTED_FALLBACK_ROUTE_REF.set(winner_ref)
                 # Race loser was never exposed to a caller — safe to close now.
                 _close_cached_client(built_client, close_async=async_mode)
-    return client, _compat_model(client, model, default_model)
+    selected_model = None if _SELECTED_FALLBACK_ROUTE_REF.get() is not None else model
+    return client, _compat_model(client, selected_model, default_model)
 
 
 # MoA virtual provider: an *explicit* `provider: moa` override (either the caller-passed `provider` arg or
@@ -7562,6 +7500,7 @@ class _PreparedAuxRequest(NamedTuple):
     effective_timeout: float
     effective_extra_body: dict[str, Any]
     base_info: str
+    reasoning_config: Optional[dict[str, Any]]
 
 
 def _prepare_aux_request(
@@ -7599,6 +7538,9 @@ def _prepare_aux_request(
     )
     selected_fallback_ref = _take_selected_fallback_route_ref()
     request_provider = effective_provider or resolved_provider
+    if isinstance(selected_fallback_ref, _FallbackRouteRef):
+        selected_destination = _fallback_destination_from_entry(dict(selected_fallback_ref.entry), client, final_model)
+        resolved_api_mode = selected_destination.api_mode
     if not async_mode and not pinned_compression_route:
         compression_config = _get_auxiliary_task_config(task) if task == "compression" else {}  # authoritative: no aux route
         _, effective_extra_body = _compression_fast_lane_controls(
@@ -7622,12 +7564,14 @@ def _prepare_aux_request(
     effective_call_max_tokens = max_tokens
     if pinned_compression_route:
         pinned_ref = pinned_compression_route.get("fallback_route_ref")
-        effective_call_max_tokens, effective_extra_body, reasoning_config = _fallback_request_controls(
+        effective_call_max_tokens, effective_extra_body, reasoning_config = auxiliary_runtime_policy.fallback_request_controls(
             task, _FallbackDestination(request_provider, base_info or resolved_base_url or "",
                                        resolved_api_mode, final_model),
             str(pinned_compression_route.get("label") or ""), max_tokens=max_tokens,
             effective_extra_body=effective_extra_body, reasoning_config=reasoning_config,
             fallback_route_ref=pinned_ref if isinstance(pinned_ref, _FallbackRouteRef) else None,
+            reasoning_is_pinned="reasoning_config" in pinned_compression_route,
+            apply_fast_lane=not async_mode,
         )
     else:
         reasoning_config, effective_extra_body = _compression_route_reasoning(
@@ -7654,7 +7598,7 @@ def _prepare_aux_request(
     return _PreparedAuxRequest(
         client, final_model, kwargs, resolved_provider, request_provider, resolved_model,
         resolved_base_url, resolved_api_key, resolved_api_mode, effective_timeout,
-        effective_extra_body, base_info)
+        effective_extra_body, base_info, copy.deepcopy(reasoning_config))
 
 
 def _outcome(call: Callable[..., Any], *args: Any, **kwargs: Any) -> tuple[Any, Optional[Exception]]:
@@ -8254,11 +8198,13 @@ def _plan_aux_call(
         from agent.context_compressor import peek_pinned_summary_route
         pinned_compression_route = peek_pinned_summary_route()
     if pinned_compression_route:
-        provider = pinned_compression_route.get("provider") or provider
-        model = pinned_compression_route.get("model") or model
-        base_url = pinned_compression_route.get("base_url") or base_url
-        api_key = pinned_compression_route.get("api_key") or api_key
-        api_mode = pinned_compression_route.get("api_mode") or api_mode
+        from agent.auxiliary_task_config import authoritative_auxiliary_task
+        task = authoritative_auxiliary_task(task)
+        provider = pinned_compression_route.get("provider") or None
+        model = pinned_compression_route.get("model") or None
+        base_url = pinned_compression_route.get("base_url") or None
+        api_key = pinned_compression_route.get("api_key") or None
+        api_mode = pinned_compression_route.get("api_mode") or None
         if pinned_compression_route.get("timeout") is not None:
             timeout = pinned_compression_route["timeout"]
         if "reasoning_config" in pinned_compression_route:
@@ -8275,7 +8221,7 @@ def _plan_aux_call(
     candidate_kwargs = dict(
         task=task, messages=messages, temperature=temperature, max_tokens=max_tokens,
         tools=tools, effective_timeout=req.effective_timeout,
-        effective_extra_body=req.effective_extra_body, reasoning_config=reasoning_config,
+        effective_extra_body=req.effective_extra_body, reasoning_config=req.reasoning_config,
     )
     retry_kwargs = dict(
         candidate_kwargs, resolved_base_url=req.resolved_base_url,
@@ -8313,7 +8259,7 @@ def _ladder_step_call(
         retry_provider, retry_model, repairs = step.args
         return "retry", (), dict(retry_kwargs, resolved_provider=retry_provider, resolved_model=retry_model,
                                  repairs=repairs)
-    return "fallback", step.args, candidate_kwargs
+    return "fallback", step.args, dict(candidate_kwargs, fallback_route_ref=_take_selected_fallback_route_ref())
 
 
 def _start_recovery_ladder(

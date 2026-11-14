@@ -2492,6 +2492,15 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
         return setup
 
     setup.runtime, setup.model, setup.fallback_entry = _resolve_job_runtime(job, job_id, jc)
+    if setup.fallback_entry is not None:
+        from hermes_cli.fallback_config import pre_agent_fallback_notice
+        primary_provider = job.get("provider") or jc.cron_default_provider
+        if not primary_provider and isinstance(jc.model_cfg, dict):
+            primary_provider = jc.model_cfg.get("provider")
+        setup.fallback_notice = pre_agent_fallback_notice(
+            str(primary_provider or ""), str(jc.model or ""),
+            str(setup.runtime.get("provider") or ""), str(setup.model or ""),
+        )
     setup.reasoning_config = _resolve_job_reasoning_config(
         job, _cfg if isinstance(_cfg, dict) else {}, str(setup.model),
         fallback_entry=setup.fallback_entry,

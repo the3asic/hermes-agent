@@ -1381,10 +1381,17 @@ class SessionSearchMixin:
         through the cross-process ``fts_rebuild_admission`` authority and FAILS CLOSED: if another process
         holds the rebuild lock beyond the bounded wait, this call defers (returns 0) rather than racing it.
         Callers already treat 0 as "rebuild made no progress" and fall back to the stale-FTS breadcrumb
-        path, which retries in-process from the gateway housekeeping tick (``retry_deferred_fts_recovery``)
-        and at next startup.
+        path. Recovery requires an explicit offline handle (``allow_fts_rebuild=True``)
+        with every other database holder stopped.
         """
         self._raise_if_db_corrupt()
+        self._raise_if_db_replaced()
+        if not getattr(self, "_allow_fts_rebuild", False) or self.read_only:
+            logger.warning("Full FTS rebuild refused on a live handle; use explicit offline recovery.")
+            return 0
+        if self._foreign_state_db_holders():
+            logger.warning("Offline FTS rebuild refused while other state.db holders remain.")
+            return 0
         rebuilt = 0
         with fts_rebuild_admission(self.db_path) as admitted:
             if not admitted:

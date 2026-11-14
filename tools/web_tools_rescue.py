@@ -30,7 +30,7 @@ def _keyless_rescue_enabled() -> bool:
         return False
 
 
-def _ring_vendor_keyless(name: str) -> bool:
+def _ring_vendor_keyless(name: str, capability: str | None = None) -> bool:
     """Did *name*'s own provider route this call through the anonymous keyless ring?
 
     Mirrors the predicate each ring provider evaluates before calling, so eligibility reflects what
@@ -40,7 +40,7 @@ def _ring_vendor_keyless(name: str) -> bool:
     """
     if name == "firecrawl":
         from plugins.web.firecrawl.provider import _use_keyless_ring
-        return _use_keyless_ring()
+        return _use_keyless_ring(capability)
     from agent.web_search_provider import get_provider_env
     from plugins.web.keyless_mcp import use_keyless
     key_var = _RING_KEY_VARS.get(name, "")
@@ -72,7 +72,7 @@ def _managed_search_fallback(provider, original_error: str, query: str, limit: i
     return resp
 
 
-def _rescue_eligible(provider) -> bool:
+def _rescue_eligible(provider, capability: str | None = None) -> bool:
     """True when a failed call on *provider* should get a one-shot rescue.
 
     Eligible: any call that did NOT go through the keyless ring — a non-ring backend, a ring vendor
@@ -84,7 +84,7 @@ def _rescue_eligible(provider) -> bool:
     try:
         from plugins.web.keyless_mcp import _KEYLESS_RING
         name = getattr(provider, "name", "")
-        return name not in _KEYLESS_RING or not _ring_vendor_keyless(name)
+        return name not in _KEYLESS_RING or not _ring_vendor_keyless(name, capability)
     except Exception as exc:
         logger.debug("rescue eligibility check failed: %s", exc)
         return False
@@ -118,42 +118,41 @@ def _rescue_search(provider_name: str, original_error: str, query: str, limit: i
     }
 
 
-def _policy_blocked_result(result: dict) -> bool:
-    """True for a website-policy refusal — intentional, never rescued (it would fetch blocked content)."""
-    error = str(result.get("error") or "").lower()
-    return bool(result.get("blocked_by_policy")) or "blocked by website policy" in error
-
-
 def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
-    """Rescue a whole-batch extract failure via the ring.
+    """Retry failed request identities once, preserving completed pages and safety refusals."""
+    from plugins.web._common import is_origin_http_error
+    from plugins.web.keyless_mcp import ExtractFailoverResults, extract_with_failover, is_extract_refusal, web_is_interrupted
+    from tools.web_tools_extract import _extract_url_identity, _reconcile_extract_results
 
-    Only genuine failures are re-fetched; policy-blocked entries are preserved verbatim. If the provider
-    broke url/result order parity, every entry is treated as rescueable and the ring's list replaces the
-    batch wholesale.
-    """
-    from plugins.web.keyless_mcp import extract_with_failover
-
-    parity = len(results) == len(urls)
-    rescue_idx = [i for i, r in enumerate(results) if not parity or not _policy_blocked_result(r)]
-    if not rescue_idx:
-        return results  # every failure is an intentional policy block
-
-    rescue_urls = [urls[i] for i in rescue_idx] if parity else list(urls)
-    errors = (results[i].get("error") for i in rescue_idx if results[i].get("error"))
-    original_error = next(errors, "extract failed")
-    logger.warning(
-        "web_extract backend '%s' failed all %d URL(s) (%s); one-shot keyless rescue",
-        provider_name, len(rescue_urls), (original_error or "")[:200],
+    ordered, by_identity, valid = _reconcile_extract_results(urls, results)
+    if not valid or web_is_interrupted() or any(str(row.get("error", "")).casefold() == "interrupted" for row in ordered):
+        return ordered
+    rescue_urls = [url for url in urls if (
+        (row := by_identity[_extract_url_identity(url)]).get("error")
+        and not is_extract_refusal(row) and not is_origin_http_error(row.get("error"))
+    )]
+    if not rescue_urls:
+        return ordered
+    original_error = str(by_identity[_extract_url_identity(rescue_urls[0])].get("error") or "extract failed")
+    logger.warning("web_extract backend '%s' failed %d URL(s) (%s); one-shot keyless rescue",
+                   provider_name, len(rescue_urls), original_error[:200])
+    _rescued, recovered, valid = _reconcile_extract_results(
+        rescue_urls, extract_with_failover(provider_name, rescue_urls),
     )
-    rescued = extract_with_failover(provider_name, list(rescue_urls))
-    if rescued and all(r.get("error", "") for r in rescued):
-        return results  # rescue also failed everywhere: keep original errors
-    for r in rescued:
-        meta = None if r.get("error") else r.setdefault("metadata", {})
-        if isinstance(meta, dict):
-            meta["rescued_from"] = provider_name
-            meta["backend_error"] = (original_error or "")[:300]
-    if parity and len(rescued) == len(rescue_idx):
-        replacements = dict(zip(rescue_idx, rescued))
-        return [replacements.get(i, r) for i, r in enumerate(results)]
-    return rescued
+    used = False
+    partial_success = any(not row.get("error") for row in recovered.values())
+    for url in rescue_urls:
+        identity = _extract_url_identity(url)
+        row = recovered[identity]
+        if valid and (not row.get("error") or is_extract_refusal(row) or partial_success):
+            if not row.get("error"):
+                meta = row.setdefault("metadata", {})
+                if isinstance(meta, dict):
+                    meta.update(rescued_from=provider_name, backend_error=original_error[:300])
+                used = True
+            by_identity[identity] = row
+        elif not valid:
+            by_identity[identity] = row
+    return ExtractFailoverResults(
+        [by_identity[_extract_url_identity(url)] for url in urls], fallback_attempted=True, fallback_used=used,
+    )

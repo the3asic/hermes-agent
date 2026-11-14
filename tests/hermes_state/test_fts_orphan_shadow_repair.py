@@ -53,7 +53,7 @@ def test_orphaned_base_family_is_repaired_and_healthy_trigram_untouched(tmp_path
     raw.close()
     assert orphan_shadows == 2, "fixture must leave the base shadows behind"
 
-    reopened = SessionDB(db_path=db_path)
+    reopened = SessionDB(db_path=db_path, allow_fts_rebuild=True)
     try:
         assert reopened._fts_enabled is True
         with reopened._lock:

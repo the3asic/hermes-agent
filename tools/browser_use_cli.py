@@ -799,7 +799,6 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         return tool_error(route_err)
     if local_sidecar:
         env["BU_NAME"] = _sidecar_daemon_name(env["BU_NAME"])
-    fit_default_socket_dir(env)  # BU_NAME is final: a deep HOME's socket would overflow sun_path
     _exec_route_is_sidecar[route_key] = local_sidecar
     local_engine = env.pop(_BOT_DESKTOP_BROWSER_SENTINEL, None)
     bot_desktop_browser = bool(local_engine)

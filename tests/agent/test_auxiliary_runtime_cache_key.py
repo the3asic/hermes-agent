@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import agent.auxiliary_client as aux
+from agent import auxiliary_runtime_policy
 
 
 @pytest.fixture(autouse=True)
@@ -169,7 +170,7 @@ def test_repeated_auto_fallback_reuses_client_and_publishes_cached_ref(monkeypat
     ref = aux._fallback_route_ref("auxiliary", 0, entry)
     client = SimpleNamespace(close=MagicMock())
     resolves = []
-    monkeypatch.setattr(aux, "_fallback_policy_cache_fingerprint", lambda task: b"p1")
+    monkeypatch.setattr(auxiliary_runtime_policy, "fallback_policy_cache_fingerprint", lambda task: b"p1")
 
     def _resolve(*args, **kwargs):
         resolves.append(1)
@@ -199,8 +200,8 @@ def test_fallback_policy_fingerprint_isolates_same_deployment_entries(monkeypatc
     clients = [SimpleNamespace(close=MagicMock()), SimpleNamespace(close=MagicMock())]
     state = {"index": 0}
     monkeypatch.setattr(
-        aux,
-        "_fallback_policy_cache_fingerprint",
+        auxiliary_runtime_policy,
+        "fallback_policy_cache_fingerprint",
         lambda task: f"policy-{state['index']}".encode(),
     )
 
@@ -232,7 +233,7 @@ def test_concurrent_cache_loser_uses_winner_route_ref(monkeypatch):
     barrier = Barrier(2)
     created = []
     created_lock = Lock()
-    monkeypatch.setattr(aux, "_fallback_policy_cache_fingerprint", lambda task: b"p1")
+    monkeypatch.setattr(auxiliary_runtime_policy, "fallback_policy_cache_fingerprint", lambda task: b"p1")
 
     def _resolve(*args, **kwargs):
         with created_lock:

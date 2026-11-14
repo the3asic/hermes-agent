@@ -77,7 +77,7 @@ def test_fts_admission_still_admits_a_pathless_db(tmp_path):
 
 def test_rebuild_fts_defers_when_lock_file_is_unopenable(tmp_path):
     """Behavior: the rebuild entry point reports no progress and rebuilds nothing."""
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = SessionDB(db_path=tmp_path / "state.db", allow_fts_rebuild=True)
     if not db._fts_enabled:
         db.close()
         pytest.skip("FTS5 unavailable in this build")

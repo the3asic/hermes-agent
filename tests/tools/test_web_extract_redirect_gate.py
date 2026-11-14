@@ -68,7 +68,7 @@ def test_keenable_redirect_into_a_blocked_host_is_refused_and_never_cached(monke
         result = _extract(provider)[0]
         assert result["content"] == "" and "TARGET PAGE" not in str(result)
         assert result["blocked_by_policy"] == {"host": "blocked.example", "rule": "blocked.example", "source": "config"}
-        assert result["url"] == BLOCKED and result["error"].startswith("Blocked")
+        assert result["url"] == REDIRECTOR and result["error"].startswith("Blocked")
     # Nothing was cached, so no hit is ever refused into a paid re-fetch of a page we will not serve.
     assert wrc.extract_cache_get(REDIRECTOR, provider="keenable") is None
     assert len(calls) == 3
@@ -103,7 +103,7 @@ class _VendorUrlProvider:
 
 def test_a_vendor_reported_url_outside_the_request_is_regated():
     result = _extract(_VendorUrlProvider())[0]
-    assert result["content"] == "" and result["blocked_by_policy"]["host"] == "blocked.example"
+    assert result["content"] == "" and result["error"] == wte._EXTRACT_RESULT_MAPPING_ERROR
 
 
 def test_a_rescued_batch_is_regated(monkeypatch):
@@ -113,13 +113,13 @@ def test_a_rescued_batch_is_regated(monkeypatch):
         def extract(self, urls, format=None):
             raise RuntimeError("backend down")
 
-    monkeypatch.setattr(wte, "_rescue_eligible", lambda _p: True)
+    monkeypatch.setattr(wte, "_rescue_eligible", lambda _p, capability=None: True)
     monkeypatch.setattr(wte, "_rescue_extract", lambda _n, urls, _f: _VendorUrlProvider().extract(urls))
     result = _extract(_Down())[0]
-    assert result["content"] == "" and result["blocked_by_policy"]["host"] == "blocked.example"
+    assert result["content"] == "" and result["error"] == wte._EXTRACT_RESULT_MAPPING_ERROR
 
 
-def test_a_policy_check_that_raises_on_a_cached_final_url_is_a_miss(monkeypatch):
+def test_a_policy_check_that_raises_on_a_cached_final_url_refuses_without_refetch(monkeypatch):
     provider, calls = _keenable(monkeypatch, "https://allowed.example/page")
     _extract(provider)
 
@@ -129,5 +129,5 @@ def test_a_policy_check_that_raises_on_a_cached_final_url_is_a_miss(monkeypatch)
 
     monkeypatch.setattr("tools.website_policy.check_website_access", boom)
     result = _extract(provider)[0]
-    assert not result.get("cached") and len(calls) == 2
+    assert not result.get("cached") and len(calls) == 1
     assert result["content"] == "" and "policy check failed" in result["error"]

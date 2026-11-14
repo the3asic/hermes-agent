@@ -415,22 +415,14 @@ def firecrawl_search_keyless(query: str, limit: int = 5) -> dict[str, Any]:
 
 
 def firecrawl_extract_keyless(urls: list[str]) -> list[dict[str, Any]]:
-    from plugins.web.firecrawl.provider import (
-        _KeylessFirecrawlClient, _extract_scrape_payload, _final_url, _website_refusal, _with_scrape_status,
-    )
+    from plugins.web.firecrawl.provider import _KeylessFirecrawlClient, _scrape_entry, _website_refusal
     client = _KeylessFirecrawlClient()
 
     def _fetch(url: str) -> dict[str, Any]:
         refusal = _website_refusal(url)
         if refusal is not None:
             return refusal
-        payload = _extract_scrape_payload(client.scrape(url=url, formats=["markdown"])) or {}
-        metadata = payload.get("metadata")
-        metadata = metadata if isinstance(metadata, dict) else {}
-        content = payload.get("markdown") or payload.get("html") or ""
-        # Report the post-redirect page as ``url`` so the shared dispatch re-gates it.
-        page = _page(_final_url(metadata, url), metadata.get("title") or "", content, source_url=url)
-        return _with_scrape_status(page, metadata)
+        return _scrape_entry(url, client.scrape(url=url, formats=["markdown"]), "markdown")
 
     return _per_url(urls, _fetch, "firecrawl")
 
@@ -580,7 +572,7 @@ def extract_with_failover(name: str, urls: list[str]) -> list[dict[str, Any]]:
                 for u in urls
             ]
         )
-    last: List[Dict[str, Any]] = []
+    last: list[dict[str, Any]] = []
     fallback_attempted = False
     for i, vendor in enumerate(order):
         if web_is_interrupted():

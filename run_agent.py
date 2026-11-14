@@ -517,7 +517,7 @@ class AIAgent(
             detail = detail[:217].rstrip() + "..."
         self._emit_warning(f"⚠ Auxiliary {task} failed: {detail}")
 
-    def _current_main_runtime(self) -> Dict[str, Any]:
+    def _current_main_runtime(self) -> dict[str, Any]:
         """Return the live main runtime for session-scoped auxiliary routing."""
         return {
             "model": getattr(self, "model", "") or "",
@@ -902,7 +902,7 @@ class AIAgent(
             _quietly(lambda: self._memory_manager.shutdown_all())
         _notify_context_engine_session_end(self, messages)
 
-    def commit_memory_session(self, messages: list = None, *, notify_context_engine: bool = True) -> None:
+    def commit_memory_session(self, messages: Optional[list] = None, *, notify_context_engine: bool = True) -> None:
         """Flush end-of-session extraction on session_id rotation (/new, compression) without tearing providers
         down. Set ``notify_context_engine=False`` when extraction does not end the active engine session."""
         if self._memory_manager:

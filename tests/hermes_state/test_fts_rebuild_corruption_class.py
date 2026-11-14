@@ -17,7 +17,7 @@ from hermes_state import SessionDB
 
 @pytest.fixture
 def db(tmp_path):
-    d = SessionDB(db_path=tmp_path / "state.db")
+    d = SessionDB(db_path=tmp_path / "state.db", allow_fts_rebuild=True)
     if not d._fts_enabled:
         d.close()
         pytest.skip("FTS5 unavailable in this build")
