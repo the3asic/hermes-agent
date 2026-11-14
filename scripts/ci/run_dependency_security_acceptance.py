@@ -92,6 +92,7 @@ def main() -> None:
     args = parser.parse_args()
     os.umask(0o077)
     root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(root))
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
     receipt = out / "acceptance.json"
