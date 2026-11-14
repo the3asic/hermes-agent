@@ -26,8 +26,7 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional
 from hermes_cli.process_identity import (
     own_process_groups, register_child, release_process_group_once_empty, spawn_env, spawned_by_this_process)
 from hermes_constants import get_hermes_home, hermes_home_key
-from tools.browser_harness_dirs import (daemon_env, daemon_identity, fit_default_socket_dir, harness_pid_file,
-                                        namespace_harness_dirs)
+from tools.browser_harness_dirs import daemon_env, daemon_identity, harness_pid_file, namespace_harness_dirs
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -157,7 +156,9 @@ def _base_subprocess_env() -> dict:
         env.pop("PYTHONPATH", None)
     env["PATH"] = _floor_subprocess_path(env.get("PATH", ""))
     env.setdefault("ANONYMIZED_TELEMETRY", "false")
-    namespace_harness_dirs(env, _served_profile_tag())  # a served profile's own harness runtime/tmp dirs
+    # The harness reuses any live daemon of a BU_NAME in its runtime dir, and that dir is per OS user:
+    # every profile (served, CLI, cron) gets its own, or one drives another's attached browser (#149829).
+    namespace_harness_dirs(env, hermes_home_key())
     # A daemon the CLI starts inherits this tag; _own_harness_daemon owns only one that names us.
     env.update(spawn_env("browser-harness-daemon"))
     return env
@@ -746,13 +747,22 @@ def _take_real_profile_note(route_key: str) -> dict:
     return {"real_profile_unavailable": _real_profile_fallback[route_key]}
 
 
+def _no_code_error(code: str) -> Optional[str]:
+    if not code or not code.strip():
+        return ("No code provided. Pass Python that uses the pre-imported helpers, e.g. "
+                "new_tab(\"https://example.com\") then print(page_info()).")
+    return None
+
+
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
                  task_id: Optional[str] = None, local: bool = False):
     """Run Python code through the browser-use CLI, and return its output"""
     from agent.redact import redact_sensitive_text
+    from tools.hosted_tool_policy import hosted_tool_refusal
     from tools.registry import tool_error, tool_result
-    if not code or not code.strip():
-        return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
+    # A direct (non-dispatch) entry meets the same allowlist, before any setup.
+    if refusal := hosted_tool_refusal("browser_exec") or _no_code_error(code):
+        return tool_error(refusal)
 
     from tools.browser_use_sessions import capture_task
     task = capture_task(task_id)
@@ -870,7 +880,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
 
 _HEADER_BASE = (
     "Drive a real browser for JS pages, logins, forms and clicks (Browser Use CLI). `code` runs as full "
-    "Python (stdlib available) with pre-imported browser helpers; stdout comes back in the result. Start `code` with a one-line "
+    "Python (stdlib available); print(...) any data you need back. Start `code` with a one-line "
     "comment describing the step for the user in plain language, max 60 chars "
     "(e.g. `# Searching Amazon for paper towels`) — the UI shows it as the step label.\n\n"
     "STATE: the browser session and workspace persist across calls; Python variables do NOT (fresh "
@@ -879,8 +889,8 @@ _HEADER_BASE = (
     "('all N products / every entry'), append each batch to a JSON/CSV file in the workspace, then read it "
     "back and aggregate in code — dedupe/count/sort with Python, not in your head — and verify the "
     "collected count against what was asked before answering.\n\n"
-    "Batch each sub-procedure (navigate, wait, extract, act) into one call — do not spend a call per "
-    "action — but for long extractions prefer several medium calls that append to workspace files over "
+    "Batch each sub-procedure (navigate, wait, extract, act) into one call, but for long extractions "
+    "prefer several medium calls that append to workspace files over "
     "one giant call, so progress survives timeouts."
 )
 
@@ -970,7 +980,7 @@ BROWSER_EXEC_SCHEMA = {
             "code": {"type": "string", "description": "Python code to execute using the pre-imported browser helpers. Use print(...) for any data you need back."},
             "session": {"type": "string", "description": "Optional reusable workflow name. Omit for an automatic page scoped to this task and cleaned up when it ends. Explicit names persist across tasks; the same name shares a session. The name 'default' and the 'hermes-' prefix are reserved."},
             "timeout_s": {"type": "integer", "default": _DEFAULT_TIMEOUT_S,
-                          "description": f"Max seconds to wait for the code to finish (default {_DEFAULT_TIMEOUT_S}, max {_MAX_TIMEOUT_S})."},
+                          "description": f"Max seconds to wait for the code to finish (max {_MAX_TIMEOUT_S})."},
         },
         "required": ["code"],
     },
@@ -1013,4 +1023,5 @@ registry.register(
     check_fn=browser_exec_available,
     dynamic_schema_overrides=_dynamic_schema_overrides,
     emoji="🌐",
+    compat_args=("local",),  # advertised only when a local browser is on offer
 )

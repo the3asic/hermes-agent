@@ -1,71 +1,28 @@
-"""Gateway runtime-metadata footer.
+"""Gateway runtime footer with model, usage, context, timing and working-directory fields.
 
-Renders a compact footer showing runtime state (model, context %, cwd) and
-appends it to the FINAL message of an agent turn when enabled.  Off by default
-to keep replies minimal.
+Configure display.runtime_footer globally or display.platforms.<platform>.runtime_footer
+per adapter. The default fields are model, context_pct and cwd; /footer toggles display.
+Opt-in fields include model_last, served_model, context_window, latency, tokens_in,
+tokens_out, tokens_turn, cache_hit and reasoning_effort.
 
-Config (``~/.hermes/config.yaml``)::
+Model and effort describe the final route. Token totals are this turn's provider-reported
+uncached input and completion deltas; partial coverage is labelled explicitly. Cache hits
+use cache-read / (uncached + cache-read + cache-write). Missing telemetry stays unknown.
+Context fields require usage-covered final-call provenance. served_model shows the
+requested alias and reported deployment only when they differ.
 
-    display:
-      runtime_footer:
-        enabled: true                       # off by default
-        fields: [model, context_pct, cwd]   # order shown; drop any to hide
-
-Available fields:
-    model             — bare model id, vendor prefix dropped (``gpt-5.4``)
-    model_last        — explicitly labelled final model (``model(last):gpt-5.4``)
-    context_pct       — last-call context occupancy as a percent (``5%``)
-    context_window    — last-call context used/total plus percent
-                        (``ctx(last):123.0k/1.0M (12%)``)
-    latency           — wall-clock duration of the turn (``22s``, ``1m05s``)
-    cwd               — home-relative working dir (``~``)
-    tokens_in         — this turn's summed non-cached provider input (``15.9k in``)
-    tokens_out        — this turn's summed provider completion tokens (``1.2k out``)
-    tokens_turn       — labelled non-cached turn usage
-                        (``tokens(turn,uncached):15.9k in/1.2k out``)
-    cache_hit         — this turn's provider-reported prompt cache hit ratio
-                        (``cache(turn):87%``)
-    reasoning_effort  — final model's request intent (``effort(req,last):max``)
-
-``model_last``, ``latency``, ``tokens_in``, ``tokens_out``, ``tokens_turn``, and
-``reasoning_effort`` are opt-in: they are NOT in the default field set, so a
-footer whose ``fields`` are unset renders exactly as before.
-
-``model_last`` and ``reasoning_effort`` are deliberately labelled ``last``:
-fallback can change both during a turn. The effort is Hermes' request intent
-for that final model, not a provider claim about how much reasoning was
-ultimately performed. ``tokens_in`` and ``tokens_out`` are known
-provider-reported non-cached deltas and can include calls made before a
-fallback; they are not the final model's exclusive usage and are not the
-cached agent's cumulative session counters. Cached input is excluded from
-``tokens_turn`` but remains part of ``context_window`` because cached tokens
-still occupy the model context. ``tokens_turn`` becomes
-``tokens(turn,uncached,partial)`` when Hermes sees logical calls without usable usage.
-``cache_hit`` uses cache-read tokens divided by all prompt-input buckets
-(``uncached + cache-read + cache-write``); cache writes are prompt tokens but
-are not cache hits. It becomes ``cache(turn,partial)`` under partial coverage.
-Providers without trustworthy cache-read telemetry omit it instead of showing
-a synthetic 0%. Context fields are likewise omitted unless the gateway proves
-the value came from this turn's fully usage-covered final call.
-When no usable positive-prompt usage exists, it is skipped rather than shown
-as a synthetic zero.
-
-Per-platform overrides live under ``display.platforms.<platform>.runtime_footer``.
-Users can toggle the global setting with ``/footer on|off`` from both the CLI
-and any gateway platform.
-
-The footer is appended to the final response text in ``gateway/run.py`` right
-before returning the response to the adapter send path — so it only lands on
-the final message a user sees, not on tool-progress updates or streaming
-partials.  When streaming is on and the final text has already been delivered
-piecemeal, the delivery path sends the footer as a separate trailing message.
+The final response carries the footer. Streaming sends it after the reply; a footer-only
+reply can use the last delivered photo's caption when the adapter's UTF-16 limit permits.
+FooteredReply preserves the footer through the adapter's media delivery path.
 """
-
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Optional
+from urllib.parse import quote
 
 if TYPE_CHECKING:
     from gateway.session import SessionSource
@@ -291,6 +248,8 @@ def _gateway_runtime_footer_line(
         cache_usage_status=agent_result.get("cache_usage_status"),
         context_usage_status=agent_result.get("context_usage_status"),
         reasoning_effort=agent_result.get("reasoning_effort"),
+        requested_model=agent_result.get("requested_model"),
+        served_model=agent_result.get("served_model"),
     )
 
 
@@ -407,6 +366,8 @@ def format_runtime_footer(
     cache_usage_status: Optional[str] = None,
     context_usage_status: Optional[str] = "reported",
     reasoning_effort: Optional[str] = None,
+    requested_model: Optional[str] = None,
+    served_model: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
@@ -518,6 +479,11 @@ def format_runtime_footer(
         elif field == "reasoning_effort":
             if reasoning_effort:
                 parts.append(f"effort(req,last):{reasoning_effort}")
+        elif field == "served_model":
+            requested = requested_model or model
+            alias = _model_short(requested)
+            if served_model and served_model not in (alias, requested):
+                parts.append(f"{alias} → {served_model}")
         # Unknown field names are silently ignored.
 
     if not parts:
@@ -543,6 +509,8 @@ def build_footer_line(
     cache_usage_status: Optional[str] = None,
     context_usage_status: Optional[str] = "reported",
     reasoning_effort: Optional[str] = None,
+    requested_model: Optional[str] = None,
+    served_model: Optional[str] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -571,5 +539,81 @@ def build_footer_line(
         cache_usage_status=cache_usage_status,
         context_usage_status=context_usage_status,
         reasoning_effort=reasoning_effort,
+        requested_model=requested_model,
+        served_model=served_model,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )
+
+
+class FooteredReply(str):
+    """A final reply whose text ends with ``\n\n<runtime_footer>``. Plain text everywhere; any
+    rewrite yields a plain ``str`` again, so the footer then simply stays in the text."""
+    runtime_footer: str
+
+    def __new__(cls, text: str, footer: str):
+        instance = super().__new__(cls, f"{text}\n\n{footer}")
+        instance.runtime_footer = footer
+        return instance
+
+
+class _FooterCaption(str):
+    """A photo caption that carries the runtime footer (``caption_with_footer``)."""
+    runtime_footer: str
+
+
+def caption_with_footer(adapter: Any, images: list, footer: str) -> tuple[list, bool]:
+    """``(images, True)`` with ``footer`` on the last ``(url, alt)`` photo's caption when the
+    adapter declares ``media_caption_limit`` and the caption fits it (UTF-16 units). Never on an
+    animation: a GIF goes out on its own path, whose failure the batch result does not list."""
+    limit = int(getattr(adapter, "media_caption_limit", 0) or 0)
+    target = next((i for i in range(len(images) - 1, -1, -1)
+                   if not adapter._is_animation_url(images[i][0])), None) if footer and limit > 0 else None
+    if target is None:
+        return images, False
+    url, alt = images[target]
+    caption = _FooterCaption(f"{alt}\n\n{footer}" if alt else footer)
+    if len(caption.encode("utf-16-le")) // 2 > limit:
+        return images, False
+    caption.runtime_footer = footer
+    return [*images[:target], (url, caption), *images[target + 1:]], True
+
+
+def caption_landed(result: Any, images: list) -> bool:
+    """The photo whose caption carries the footer was delivered, or is queued for a re-upload that
+    carries it (``raw_response["deferred"]``: flood control; a separate footer would repeat it).
+    ``success`` means at least one photo landed, so that photo listed in ``raw_response["failed"]``
+    (``(path_or_url, error)``) took the footer with it. False when no caption carries it."""
+    url = next((u for u, alt in images if getattr(alt, "runtime_footer", "")), None)
+    raw = getattr(result, "raw_response", None)
+    raw = raw if isinstance(raw, dict) else {}
+    if url is None or url in (raw.get("deferred") or ()):
+        return url is not None
+    if not getattr(result, "success", False):
+        return False
+    from urllib.parse import unquote
+    lost = {str(item[0]) for item in raw.get("failed") or () if item}
+    return url not in lost and unquote(url.removeprefix("file://")) not in lost
+
+
+async def send_footer_unless_captioned(adapter: Any, chat_id: str, images: list, result: Any,
+                                       metadata: Any, record_delivery: Any) -> None:
+    """Non-streamed send path: the footer a photo caption carried, sent as its own message (as
+    before #74547) when that photo did not land."""
+    footer = next((alt.runtime_footer for _u, alt in images if getattr(alt, "runtime_footer", "")), "")
+    if footer and not caption_landed(result, images):
+        record_delivery(await adapter._send_with_retry(chat_id=chat_id, content=footer, metadata=metadata))
+
+
+def footer_onto_photo_caption(adapter: Any, extracted: Any, image_exts: Iterable[str]) -> Any:
+    """The adapter send path's ``_ExtractedResponse``, with a footer-only text moved onto the last
+    photo's caption (MEDIA photos join the photo batch): otherwise the footer is its own message."""
+    footer = getattr(extracted.pre_extract, "runtime_footer", "")
+    if not footer or extracted.force_document_attachments or extracted.text_content.strip() != footer.strip():
+        return extracted
+    photos = [p for p, voice in extracted.media_files if not voice and Path(p).suffix.lower() in image_exts]
+    images, attached = caption_with_footer(
+        adapter, [*extracted.images, *((f"file://{quote(p)}", "") for p in photos)], footer)
+    if not attached:
+        return extracted
+    return dataclasses.replace(extracted, text_content="", images=images,
+                               media_files=[m for m in extracted.media_files if m[0] not in photos])
