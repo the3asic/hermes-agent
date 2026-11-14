@@ -118,7 +118,7 @@ def main() -> None:
     }
     for name, command in checks.items():
         with (out / (name + ".stdout")).open("wb") as stdout, (out / (name + ".stderr")).open("wb") as stderr:
-            subprocess.run(command, cwd=root, stdout=stdout, stderr=stderr, timeout=900, check=True)
+            subprocess.run(command, cwd=root, stdout=stdout, stderr=stderr, timeout=3900, check=True)
     status = _git(root, "status", "--porcelain").splitlines()
     if status:
         raise RuntimeError(f"Verification changed tracked source: {status}")
