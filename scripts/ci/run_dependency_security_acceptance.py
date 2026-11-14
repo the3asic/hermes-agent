@@ -109,17 +109,24 @@ def main() -> None:
     from pm.install import env_for
     os.environ.update(env_for("python", "node", "npm", "pnpm", "uv", "ripgrep"))
     actual = _locked_runtime_versions(root)
+    (out / "environment.json").write_text(json.dumps({
+        "commit": head, "tree": tree, "python": sys.executable,
+        "python_version": sys.version, "versions": actual,
+    }, indent=2) + "\n", encoding="utf-8")
     results = []
     for name in _TRANSPORT_TESTS:
         results.append(_transport_check(root, out, args.bash, name))
         (out / "test-progress.json").write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
     checks = {
-        "repository": [sys.executable, "scripts/check", "--base", args.base],
         "lock": [sys.executable, "-m", "pm.build_env", "--source", str(root), "--check-lock"],
+        "repository": [sys.executable, "scripts/check", "--base", args.base],
     }
+    passed_checks = []
     for name, command in checks.items():
         with (out / (name + ".stdout")).open("wb") as stdout, (out / (name + ".stderr")).open("wb") as stderr:
             subprocess.run(command, cwd=root, stdout=stdout, stderr=stderr, timeout=3900, check=True)
+        passed_checks.append({"check": name, "command": command})
+        (out / "check-progress.json").write_text(json.dumps(passed_checks, indent=2) + "\n", encoding="utf-8")
     status = _git(root, "status", "--porcelain").splitlines()
     if status:
         raise RuntimeError(f"Verification changed tracked source: {status}")
