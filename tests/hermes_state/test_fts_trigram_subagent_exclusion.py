@@ -14,7 +14,7 @@ from hermes_state_common import SCHEMA_VERSION
 
 @pytest.fixture
 def db(tmp_path):
-    session_db = SessionDB(db_path=tmp_path / "state.db")
+    session_db = SessionDB(db_path=tmp_path / "state.db", allow_fts_rebuild=True)
     if not session_db._trigram_available:
         session_db.close()
         pytest.skip("trigram tokenizer unavailable in this SQLite build")
@@ -131,7 +131,7 @@ def test_v29_install_purges_child_rows_on_upgrade(tmp_path):
     old._conn.commit()
     old.close()
 
-    migrated = SessionDB(db_path=db_path)
+    migrated = SessionDB(db_path=db_path, allow_fts_rebuild=True)
     try:
         assert _trigram_rowids(migrated) == {ids["root"], ids["cont"]}
         assert migrated._conn.execute(

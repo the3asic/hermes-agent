@@ -6,7 +6,7 @@ import json
 import threading
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 from agent import auxiliary_client as aux
 

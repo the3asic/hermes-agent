@@ -61,7 +61,7 @@ def configured(monkeypatch):
     # Discover and resolve the real provider through the actual config loader.
     web_tools._ensure_web_plugins_loaded()
     sdk = Mock()
-    monkeypatch.setattr(firecrawl, "_get_firecrawl_client", lambda: sdk)
+    monkeypatch.setattr(firecrawl, "_get_firecrawl_client", lambda _capability=None: sdk)
     rescue = Mock(side_effect=AssertionError("Refusal must not enter cloud rescue"))
     monkeypatch.setattr(keyless_mcp, "extract_with_failover", rescue)
     interrupt.set_interrupt(False)

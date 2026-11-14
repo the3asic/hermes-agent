@@ -63,7 +63,7 @@ def _agent_with_lifecycle(db, *, in_place, monkeypatch, plugin=True):
 
 @pytest.mark.parametrize("outcome", ["committed", "refused", "archive_failed"])
 def test_in_place_compaction_preserves_live_engine_ownership(tmp_path, monkeypatch, outcome):
-    """Extraction still runs, but refusal/rollback cannot end the live engine."""
+    """Refusal has no memory side effects; an admitted commit preserves engine ownership."""
     db = SessionDB(db_path=tmp_path / "state.db")
     agent, messages, memory, events, owner = _agent_with_lifecycle(
         db, in_place=True, monkeypatch=monkeypatch,
@@ -82,11 +82,14 @@ def test_in_place_compaction_preserves_live_engine_ownership(tmp_path, monkeypat
 
     returned, _prompt = agent._compress_context(messages, "sys", approx_tokens=100_000, force=True)
 
-    memory.on_session_end.assert_called_once()
-    extracted = memory.on_session_end.call_args.args[0]
-    assert [(m["role"], m["content"]) for m in extracted] == [
-        (m["role"], m["content"]) for m in messages
-    ]
+    if outcome == "refused":
+        memory.on_session_end.assert_not_called()
+    else:
+        memory.on_session_end.assert_called_once()
+        extracted = memory.on_session_end.call_args.args[0]
+        assert [(m["role"], m["content"]) for m in extracted] == [
+            (m["role"], m["content"]) for m in messages
+        ]
     assert owner["session_id"] == agent.session_id == "live-context-engine-session"
     assert not [event for event in events if event[0] == "end"]
     assert db.get_session(agent.session_id)["ended_at"] is None

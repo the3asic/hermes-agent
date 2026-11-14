@@ -61,7 +61,7 @@ def test_fresh_fts_bootstrap_does_not_publish_schema_without_admission(tmp_path,
         proc.kill()
         proc.wait(timeout=10)
 
-    recovered = SessionDB(db_path=db_path)
+    recovered = SessionDB(db_path=db_path, allow_fts_rebuild=True)
     try:
         assert recovered._fts_stale is False
         assert recovered._fts_enabled is True

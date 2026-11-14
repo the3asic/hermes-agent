@@ -112,30 +112,18 @@ def test_repaired_db_search_works(tmp_path):
 
 
 
-def test_auto_heal_attempted_once_per_process(tmp_path, monkeypatch):
-    """A still-broken DB must not loop: the second open just raises."""
+def test_malformed_open_requires_explicit_offline_repair(tmp_path):
+    """Ordinary opens preserve the malformed image; explicit offline repair restores it."""
     db_path = tmp_path / "state.db"
     _build_healthy_db(db_path)
     _corrupt_duplicate_fts(db_path)
-    monkeypatch.setattr(hermes_state, "_repair_attempted_paths", set())
-
-    calls = {"n": 0}
-    real_repair = hermes_state.repair_state_db_schema
-
-    def fake_repair(path, **kw):
-        calls["n"] += 1
-        # Pretend repair failed so the guard's one-shot behavior is exercised.
-        return {"repaired": False, "strategy": None, "backup_path": None, "error": "x"}
-
-    monkeypatch.setattr(hermes_state, "repair_state_db_schema", fake_repair)
-
-    with pytest.raises(sqlite3.DatabaseError):
-        SessionDB(db_path=db_path)
-    with pytest.raises(sqlite3.DatabaseError):
-        SessionDB(db_path=db_path)
-    assert calls["n"] == 1  # repair attempted only once across both opens
-
-    monkeypatch.setattr(hermes_state, "repair_state_db_schema", real_repair)
+    for _ in range(2):
+        with pytest.raises(sqlite3.DatabaseError):
+            SessionDB(db_path=db_path)
+    report = repair_state_db_schema(db_path)
+    assert report["repaired"] is True
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 10
 
 
 

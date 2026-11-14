@@ -137,7 +137,7 @@ def test_existing_external_layout_rebuilds_trigram_on_upgrade(tmp_path, old_vers
     old._conn.commit()
     old.close()
 
-    migrated = SessionDB(db_path=db_path)
+    migrated = SessionDB(db_path=db_path, allow_fts_rebuild=True)
     try:
         assert _trigram_rowids(migrated) == {cli_id}
         view_sql = migrated._conn.execute(
@@ -183,7 +183,7 @@ def test_install_already_at_v28_still_gets_the_cron_exclusion_migration(tmp_path
     old._conn.commit()
     old.close()
 
-    migrated = SessionDB(db_path=db_path)
+    migrated = SessionDB(db_path=db_path, allow_fts_rebuild=True)
     try:
         assert _trigram_rowids(migrated) == {cli_id}, (
             "a v28 database kept cron rows in the trigram index: the migration gate did not fire"
@@ -213,7 +213,7 @@ def test_v1_tool_calls_layout_is_left_for_optimize_storage(tmp_path):
     old._conn.commit()
     old.close()
 
-    migrated = SessionDB(db_path=db_path)  # must not raise
+    migrated = SessionDB(db_path=db_path, allow_fts_rebuild=True)  # must not raise
     try:
         # Startup left the v1 layout alone (cron row still there) …
         assert _trigram_rowids(migrated) == {cli_id, cron_id}
@@ -258,7 +258,7 @@ def test_partial_upgrade_view_does_not_skip_historical_rebuild(tmp_path, old_ver
     old._conn.commit()
     old.close()
 
-    migrated = SessionDB(db_path=db_path)
+    migrated = SessionDB(db_path=db_path, allow_fts_rebuild=True)
     try:
         assert _trigram_rowids(migrated) == {cli_id}
         assert [row["id"] for row in migrated.search_messages("互迁移")] == [cli_id]

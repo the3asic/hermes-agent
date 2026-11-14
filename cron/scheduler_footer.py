@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 
 def append_runtime_footer(response: str, agent: Any, result: dict, cfg: dict, *, seconds: float) -> str:
     """Cron creates a fresh agent per fire, so all main-call counter baselines are zero."""
+    from cron.scheduler import _cron_failure_marker_error, _is_cron_silence_response
+
+    if not response.strip() or _is_cron_silence_response(response) or _cron_failure_marker_error(response) is not None:
+        return response
     if not resolve_footer_config(cfg, "cron").get("enabled"):
         return response
     try:

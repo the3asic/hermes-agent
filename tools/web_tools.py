@@ -392,11 +392,11 @@ def _memoized_search(provider, query: str, limit: int) -> dict:
             fallback = _managed_search_fallback(provider, error, query, _fetch_limit)
             if fallback is not None:
                 return fallback
-            return _rescue_search(provider.name, error, query, _fetch_limit) if _rescue_eligible(provider) else None
+            return _rescue_search(provider.name, error, query, _fetch_limit) if _rescue_eligible(provider, "search") else None
 
         try:
             _resp = provider.search(query, _fetch_limit)
-        except Exception as exc:  # noqa: BLE001 — candidate for rescue
+        except Exception as exc:
             if web_is_interrupted():
                 _resp = {"success": False, "error": "Interrupted"}
             else:
@@ -576,7 +576,7 @@ async def web_extract_tool(urls: list[Any], format: str | None = None, char_limi
         _finish_debug("web_extract_tool", debug_call_data)
         return cleaned_result
     except Exception as e:
-        error = f"Error extracting content: {str(e)}"
+        error = f"Error extracting content: {e!s}"
         _finish_debug("web_extract_tool", debug_call_data, error)
         return _extract_error_response(error, **facts)
 

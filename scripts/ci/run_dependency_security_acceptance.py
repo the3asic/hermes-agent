@@ -1,4 +1,5 @@
-"""Run real maintained-release dependency checks with verifiable source receipts."""
+"""Verify maintained dependencies and real transports on an exact source revision."""
+from __future__ import annotations
 
 import argparse
 import hashlib
@@ -6,72 +7,136 @@ import json
 import os
 import subprocess
 import sys
+import tomllib
 from importlib import metadata
 from pathlib import Path
 from xml.etree import ElementTree
 
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
-def main():
+_RUNTIME_PACKAGES = (
+    "aiohttp", "anyio", "httpcore2", "httpx2", "mcp", "multidict",
+    "oauthlib", "pyjwt", "pynacl", "urllib3",
+)
+_TRANSPORT_TESTS = (
+    "test_mcp_http_transport.py", "test_jwt_options.py", "test_network_clients.py",
+    "test_auth_crypto.py", "test_cache_diagnostic.py",
+)
+
+
+def _git(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=root, check=True, capture_output=True,
+        text=True, encoding="utf-8", timeout=30,
+    ).stdout.strip()
+
+
+def _locked_runtime_versions(root: Path) -> dict[str, str]:
+    """Require installed versions to belong to this source's lock and direct constraints."""
+    lock = tomllib.loads((root / "uv.lock").read_text(encoding="utf-8-sig"))
+    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8-sig"))["project"]
+    versions: dict[str, set[str]] = {}
+    for package in lock["package"]:
+        versions.setdefault(canonicalize_name(package["name"]), set()).add(package["version"])
+    actual = {name: metadata.version(name) for name in _RUNTIME_PACKAGES}
+    for name, version in actual.items():
+        if version not in versions.get(canonicalize_name(name), set()):
+            raise RuntimeError(f"Installed {name} {version} does not match the committed lock")
+    requirements = list(project["dependencies"])
+    requirements.extend(
+        requirement for group in project.get("optional-dependencies", {}).values() for requirement in group
+    )
+    for text in requirements:
+        requirement = Requirement(text)
+        name = canonicalize_name(requirement.name)
+        if name not in actual or (requirement.marker and not requirement.marker.evaluate()):
+            continue
+        if requirement.specifier and not requirement.specifier.contains(actual[name]):
+            raise RuntimeError(f"Installed {name} {actual[name]} violates {requirement}")
+    return actual
+
+
+def _transport_check(root: Path, out: Path, bash: str, name: str) -> dict:
+    path = "tests/tools/live_dependencies/" + name
+    junit = out / (name + ".xml")
+    command = [
+        bash, "scripts/run_tests.sh", path, "--file-timeout", "300", "--file-retries", "0",
+        "--", "--noconftest", "--basetemp=" + str(out / (name + "-cases")),
+        "--junitxml=" + str(junit), "-q",
+    ]
+    with (out / (name + ".stdout")).open("wb") as stdout, (out / (name + ".stderr")).open("wb") as stderr:
+        process = subprocess.run(
+            command, cwd=root, stdout=stdout, stderr=stderr, timeout=360, check=False,
+        )
+    xml = ElementTree.parse(junit)
+    counts = {
+        key: sum(int(suite.get(key, "0")) for suite in xml.iter("testsuite"))
+        for key in ("tests", "failures", "errors", "skipped")
+    }
+    result = {
+        "test": path, "sha256": hashlib.sha256((root / path).read_bytes()).hexdigest(),
+        "exit_code": process.returncode, "counts": counts,
+    }
+    if process.returncode or counts["tests"] <= 0 or any(counts[key] for key in ("failures", "errors", "skipped")):
+        raise RuntimeError(f"Real dependency verification failed: {result}")
+    return result
+
+
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bash", required=True)
-    parser.add_argument("--uv", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--expected-commit", required=True)
+    parser.add_argument("--base", required=True)
     args = parser.parse_args()
     os.umask(0o077)
     root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(root))
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
     receipt = out / "acceptance.json"
-    assert not receipt.exists(), "Read the existing acceptance before repeating it"
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True, encoding="utf-8").stdout.strip()
-    tree = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=root, check=True, capture_output=True, text=True, encoding="utf-8").stdout.strip()
-    assert head == args.expected_commit
-    assert os.path.samefile(os.environ["HERMES_PYTHON"], sys.executable)
-    targets = {"aiohttp": "3.14.4", "anyio": "4.14.2", "httpcore2": "2.12.0", "httpx2": "2.12.0", "mcp": "2.2.0",
-               "multidict": "6.9.1", "oauthlib": "4.0.0", "pip": "26.2", "pyjwt": "2.15.0",
-               "pynacl": "1.6.2", "setuptools": "83.0.0", "tornado": "6.5.9", "urllib3": "2.8.0"}
-    actual = {name: metadata.version(name) for name in targets}
-    assert actual == targets, actual
-    files = {"test_mcp_http_transport.py": 2, "test_jwt_options.py": 1,
-             "test_network_clients.py": 1, "test_auth_crypto.py": 1, "test_cache_diagnostic.py": 2}
+    if receipt.exists():
+        raise RuntimeError("Read the existing acceptance before repeating it")
+    head = _git(root, "rev-parse", "HEAD")
+    tree = _git(root, "rev-parse", "HEAD^{tree}")
+    if head != args.expected_commit:
+        raise RuntimeError("The checkout does not match the expected commit")
+    if not os.path.samefile(os.environ["HERMES_PYTHON"], sys.executable):
+        raise RuntimeError("Acceptance and the canonical runner must use the same interpreter")
+    if _git(root, "status", "--porcelain"):
+        raise RuntimeError("Acceptance requires a clean source revision")
+    from pm.install import env_for
+    os.environ.update(env_for("python", "node", "npm", "pnpm", "uv", "ripgrep"))
+    actual = _locked_runtime_versions(root)
+    (out / "environment.json").write_text(json.dumps({
+        "commit": head, "tree": tree, "python": sys.executable,
+        "python_version": sys.version, "versions": actual,
+    }, indent=2) + "\n", encoding="utf-8")
     results = []
-    for name, expected in files.items():
-        path = "tests/tools/live_dependencies/" + name
-        junit = out / (name + ".xml")
-        command = [args.bash, "scripts/run_tests.sh", path, "--file-timeout", "300", "--file-retries", "0",
-                   "--", "--noconftest", "--basetemp=" + str(out / (name + "-cases")), "--junitxml=" + str(junit), "-q"]
-        with (out / (name + ".stdout")).open("wb") as stdout, (out / (name + ".stderr")).open("wb") as stderr:
-            process = subprocess.run(command, cwd=root, stdout=stdout, stderr=stderr, timeout=360)
-        xml = ElementTree.parse(junit)
-        counts = {key: sum(int(suite.get(key, "0")) for suite in xml.iter("testsuite"))
-                  for key in ("tests", "failures", "errors", "skipped")}
-        result = {"test": path, "sha256": hashlib.sha256((root / path).read_bytes()).hexdigest(),
-                  "exit_code": process.returncode, "counts": counts}
-        results.append(result)
+    for name in _TRANSPORT_TESTS:
+        results.append(_transport_check(root, out, args.bash, name))
         (out / "test-progress.json").write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
-        assert process.returncode == 0 and counts == {"tests": expected, "failures": 0, "errors": 0, "skipped": 0}, result
     checks = {
-        "ruff": [sys.executable, "-m", "ruff", "check", "."],
-        "windows": [sys.executable, "scripts/check-windows-footguns.py", "--all"],
-        "compat": [sys.executable, "scripts/check_compat_pointers.py"],
-        "temp_paths": [sys.executable, "scripts/check_no_tmp_literals.py"],
-        "yaml_writers": [sys.executable, "scripts/check_config_yaml_writers.py"],
-        "os_markers": [sys.executable, "scripts/ci/check_os_marker_fakes.py"],
-        "profile_scope": [sys.executable, "scripts/check_profile_scope_patterns.py", "--base", "ed063b312be2f1f50c470c70c8b96900ea4f3fc3", "--head", head],
-        "public_surface": [sys.executable, "scripts/ci/check_public_surface.py", "--base", "ed063b312be2f1f50c470c70c8b96900ea4f3fc3", "--head", head],
-        "lock": [args.uv, "lock", "--check", "--python", sys.executable],
+        "lock": [sys.executable, "-m", "pm.build_env", "--source", str(root), "--check-lock"],
+        "repository": [sys.executable, "scripts/check", "--base", args.base],
     }
+    passed_checks = []
     for name, command in checks.items():
         with (out / (name + ".stdout")).open("wb") as stdout, (out / (name + ".stderr")).open("wb") as stderr:
-            subprocess.run(command, cwd=root, stdout=stdout, stderr=stderr, timeout=300, check=True)
-    status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=root, check=True, capture_output=True, text=True, encoding="utf-8").stdout.splitlines()
-    assert status == []
-    record = {"commit": head, "tree": tree, "python": sys.executable, "python_version": sys.version,
-              "versions": actual, "tests": results, "checks": list(checks), "tracked_status": status,
-              "actual_tests_passed": sum(row["counts"]["tests"] for row in results), "accepted": True}
+            subprocess.run(command, cwd=root, stdout=stdout, stderr=stderr, timeout=3900, check=True)
+        passed_checks.append({"check": name, "command": command})
+        (out / "check-progress.json").write_text(json.dumps(passed_checks, indent=2) + "\n", encoding="utf-8")
+    status = _git(root, "status", "--porcelain").splitlines()
+    if status:
+        raise RuntimeError(f"Verification changed tracked source: {status}")
+    record = {
+        "commit": head, "tree": tree, "python": sys.executable, "python_version": sys.version,
+        "versions": actual, "tests": results, "checks": list(checks), "tracked_status": status,
+        "actual_tests_passed": sum(row["counts"]["tests"] for row in results), "accepted": True,
+    }
     receipt.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({"commit": head, "accepted": True, "actual_tests_passed": record["actual_tests_passed"], "checks_passed": len(checks)}))
+    print(json.dumps({"commit": head, "accepted": True, "actual_tests_passed": record["actual_tests_passed"]}))
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ def _long_message(prefix: str, tail: str) -> str:
 
 @pytest.fixture
 def db(tmp_path):
-    session_db = SessionDB(db_path=tmp_path / "state.db")
+    session_db = SessionDB(db_path=tmp_path / "state.db", allow_fts_rebuild=True)
     if not session_db._fts_enabled:
         session_db.close()
         pytest.skip("SQLite FTS5 unavailable")

@@ -116,7 +116,7 @@ def test_index_reading_raw_messages_realigns_once_on_open(tmp_path):
         _strict_integrity_probe(first)
     first.close()
 
-    migrated = SessionDB(db_path=path)
+    migrated = SessionDB(db_path=path, allow_fts_rebuild=True)
     try:
         assert migrated.get_meta("fts_storage_version") == str(FTS_STORAGE_VERSION)
         assert migrated.get_meta("fts_tool_full_content_high_water") is None

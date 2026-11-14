@@ -268,11 +268,12 @@ def _extract_scrape_payload(scrape_result: Any) -> dict[str, Any]:
     return plain["data"] if isinstance(plain.get("data"), dict) else plain
 
 
-def _website_refusal(url: str) -> Optional[Dict[str, Any]]:
+def _website_refusal(url: str) -> Optional[dict[str, Any]]:
     """Return an explicit refusal, including policy-loader failures."""
     try:
         blocked = check_website_access(url)
     except Exception as exc:
+        logger.warning("Website policy check failed", exc_info=True)
         return {
             "url": url, "title": "", "content": "",
             "error": f"Website policy check failed: {exc}",
@@ -343,37 +344,39 @@ async def _scrape_one(url: str, formats: list[str], format: Optional[str]) -> di
         if web_is_interrupted():
             from plugins.web.keyless_mcp import interrupted_extract_results
             return interrupted_extract_results([url])[0]
-        payload = _extract_scrape_payload(scrape_result)
-        metadata = payload.get("metadata", {})
-        # SDK may return a typed object for metadata (raw __dict__ here, unlike _to_plain_object).
-        if not isinstance(metadata, dict):
-            metadata = metadata.model_dump() if hasattr(metadata, "model_dump") else getattr(metadata, "__dict__", {})
-        # The v4 SDK names it ``source_url``; the extract cache keys a redirected page by ``sourceURL``.
-        metadata.setdefault("sourceURL", metadata.get("source_url") or url)
-        from tools.web_tools_extract import _EXTRACT_RESULT_MAPPING_ERROR, _extract_url_identity
-        for key in ("sourceURL", "source_url"):
-            source = metadata.get(key)
-            if source is not None and (
-                not isinstance(source, str)
-                or not source.strip()
-                or _extract_url_identity(source) != _extract_url_identity(url)
-            ):
-                return {"url": url, "title": "", "content": "", "raw_content": "",
-                        "error": _EXTRACT_RESULT_MAPPING_ERROR, "blocked_by_security": True}
-        title, final_url = metadata.get("title", ""), _final_url(metadata, url)
-        if not is_safe_url(final_url):
-            logger.info("Blocked redirected web_extract for unsafe final URL: %s", final_url)
-            return _error_entry(final_url, _UNSAFE_REDIRECT_MSG, title=title, raw=True)
-        refusal = _website_refusal(final_url)
-        if refusal is not None:
-            return {**refusal, "title": title, "raw_content": ""}
-        markdown, html = payload.get("markdown"), payload.get("html")
-        content = markdown if format == "markdown" or (format is None and markdown) else html or markdown or ""
-        entry = {"url": final_url, "title": title, "content": content, "raw_content": content, "metadata": metadata}
-        return _with_scrape_status(entry, metadata)
+        return _scrape_entry(url, scrape_result, format)
     except Exception as scrape_err:
-        logger.debug("Firecrawl scrape failed for %s: %s", url, scrape_err)
+        logger.debug("Firecrawl scrape failed for %s: %s", url, scrape_err, exc_info=True)
         return _error_entry(url, str(scrape_err), raw=True)
+
+
+def _scrape_entry(url: str, scrape_result: Any, format: Optional[str]) -> dict[str, Any]:
+    """Validate keyed and keyless pages through the same source and redirect gates."""
+    payload = _extract_scrape_payload(scrape_result)
+    metadata = _to_plain_object(payload.get("metadata", {}))
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    metadata.setdefault("sourceURL", metadata.get("source_url") or url)
+    from tools.web_tools_extract import _EXTRACT_RESULT_MAPPING_ERROR, _extract_url_identity
+    for key in ("sourceURL", "source_url"):
+        source = metadata.get(key)
+        if source is not None and (
+            not isinstance(source, str) or not source.strip()
+            or _extract_url_identity(source) != _extract_url_identity(url)
+        ):
+            return {"url": url, "title": "", "content": "", "raw_content": "",
+                    "error": _EXTRACT_RESULT_MAPPING_ERROR, "blocked_by_security": True}
+    title, final_url = metadata.get("title", ""), _final_url(metadata, url)
+    if not is_safe_url(final_url):
+        return {**_error_entry(url, _UNSAFE_REDIRECT_MSG, title=title, raw=True),
+                "blocked_by_security": True, "metadata": metadata}
+    refusal = _website_refusal(final_url)
+    if refusal is not None:
+        return {**refusal, "url": url, "title": title, "raw_content": "", "metadata": metadata}
+    markdown, html = payload.get("markdown"), payload.get("html")
+    content = markdown if format == "markdown" or (format is None and markdown) else html or markdown or ""
+    return _with_scrape_status(
+        {"url": url, "title": title, "content": content, "raw_content": content, "metadata": metadata}, metadata,
+    )
 
 
 class FirecrawlWebSearchProvider(BaseWebSearchProvider):
@@ -390,15 +393,17 @@ class FirecrawlWebSearchProvider(BaseWebSearchProvider):
     def search(self, query: str, limit: int = 5) -> dict[str, Any]:
         """Pre-flight errors (ValueError / ImportError) propagate so the dispatcher emits
         the legacy ``tool_error`` envelope; in-flight errors become failure dicts."""
-        from tools.interrupt import is_interrupted
-        if is_interrupted():
+        if web_is_interrupted():
             return search_fail("Interrupted")
         if _use_keyless_ring("search"):
             return keyless_search("Firecrawl", "firecrawl", query, limit, logger)
         logger.info("Firecrawl search: '%s' (limit=%d)", query, limit)
         client = _get_firecrawl_client("search")
         try:
-            web_results = _extract_web_search_results(client.search(query=query, limit=limit))
+            response = client.search(query=query, limit=limit)
+            if web_is_interrupted():
+                return search_fail("Interrupted")
+            web_results = _extract_web_search_results(response)
             logger.info("Firecrawl: found %d search results", len(web_results))
             return search_ok(web_results)
         except Exception as exc:

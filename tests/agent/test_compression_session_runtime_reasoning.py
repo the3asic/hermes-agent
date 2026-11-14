@@ -243,7 +243,9 @@ async def test_request_fallback_uses_target_reasoning(monkeypatch, async_mode):
 
     if async_mode:
         result = await aux._call_fallback_candidate_async(
-            client, fallback["model"], label, **kwargs
+            client, fallback["model"], label,
+            classify_as=aux._candidate_classification_provider(client, fallback["model"], label, "compression"),
+            **kwargs
         )
     else:
         result = aux._call_fallback_candidate_sync(

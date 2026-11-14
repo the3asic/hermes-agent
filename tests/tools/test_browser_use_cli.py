@@ -9,6 +9,7 @@ Covers the seams the integration relies on:
 * ``browser_exec`` execution — code is piped on stdin, ``session`` becomes
   ``BU_NAME``, bad session names and a missing CLI produce actionable errors.
 """
+import ipaddress
 import json
 import os
 import socket
@@ -422,7 +423,6 @@ class TestBackendCdpResolution:
 
 
 
-
 class TestProviderPickerIntegration:
     """The `hermes tools` Browser Automation picker rows."""
 
@@ -768,3 +768,27 @@ class TestTimeoutProcessGroupKill:
         monkeypatch.setattr(bu_cli, "_kill_cli_process_group", lambda proc: None)
         with pytest.raises(subprocess.TimeoutExpired):
             bu_cli._run_cli_killing_process_group(["x"], "code", {}, 5)
+
+
+@pytest.mark.parametrize(("url", "auto_local", "refusal"), [
+    ("http://192.168.0.1:9120/login", True, None),
+    ("http://192.168.0.1:9120/login", False, "private or internal"),
+    ("http://169.254.169.254/latest/meta-data/", True, "cloud metadata"),
+    ("http://169.254.169.254/latest/meta-data/", False, "cloud metadata"),
+    ("http://93.184.216.34/", False, None),
+])
+def test_hybrid_url_floor_uses_the_dispatch_verdict(url, auto_local, refusal):
+    """A local-routing verdict relaxes private addresses while preserving the metadata floor."""
+    from hermes_cli.config import save_config
+    from tools.browser_session_cdp import set_live_cdp_override
+    from tools.browser_url_policy import evaluate_url_safety
+
+    save_config({"browser": {"cloud_provider": "local", "cdp_url": "http://93.184.216.34:9222",
+                             "allow_private_urls": False}})
+    set_live_cdp_override(None)
+    bs_cloud.reset_caches()
+    result = evaluate_url_safety(url, auto_local=auto_local)
+    if refusal is None:
+        assert result is None
+    else:
+        assert refusal in result["error"]

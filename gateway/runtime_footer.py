@@ -1,71 +1,28 @@
-"""Gateway runtime-metadata footer.
+"""Gateway runtime footer with model, usage, context, timing and working-directory fields.
 
-Renders a compact footer showing runtime state (model, context %, cwd) and
-appends it to the FINAL message of an agent turn when enabled.  Off by default
-to keep replies minimal.
+Configure display.runtime_footer globally or display.platforms.<platform>.runtime_footer
+per adapter. The default fields are model, context_pct and cwd; /footer toggles display.
+Opt-in fields include model_last, served_model, context_window, latency, tokens_in,
+tokens_out, tokens_turn, cache_hit and reasoning_effort.
 
-Config (``~/.hermes/config.yaml``)::
+Model and effort describe the final route. Token totals are this turn's provider-reported
+uncached input and completion deltas; partial coverage is labelled explicitly. Cache hits
+use cache-read / (uncached + cache-read + cache-write). Missing telemetry stays unknown.
+Context fields require usage-covered final-call provenance. served_model shows the
+requested alias and reported deployment only when they differ.
 
-    display:
-      runtime_footer:
-        enabled: true                       # off by default
-        fields: [model, context_pct, cwd]   # order shown; drop any to hide
-
-Available fields:
-    model             — bare model id, vendor prefix dropped (``gpt-5.4``)
-    model_last        — explicitly labelled final model (``model(last):gpt-5.4``)
-    context_pct       — last-call context occupancy as a percent (``5%``)
-    context_window    — last-call context used/total plus percent
-                        (``ctx(last):123.0k/1.0M (12%)``)
-    latency           — wall-clock duration of the turn (``22s``, ``1m05s``)
-    cwd               — home-relative working dir (``~``)
-    tokens_in         — this turn's summed non-cached provider input (``15.9k in``)
-    tokens_out        — this turn's summed provider completion tokens (``1.2k out``)
-    tokens_turn       — labelled non-cached turn usage
-                        (``tokens(turn,uncached):15.9k in/1.2k out``)
-    cache_hit         — this turn's provider-reported prompt cache hit ratio
-                        (``cache(turn):87%``)
-    reasoning_effort  — final model's request intent (``effort(req,last):max``)
-
-``model_last``, ``latency``, ``tokens_in``, ``tokens_out``, ``tokens_turn``, and
-``reasoning_effort`` are opt-in: they are NOT in the default field set, so a
-footer whose ``fields`` are unset renders exactly as before.
-
-``model_last`` and ``reasoning_effort`` are deliberately labelled ``last``:
-fallback can change both during a turn. The effort is Hermes' request intent
-for that final model, not a provider claim about how much reasoning was
-ultimately performed. ``tokens_in`` and ``tokens_out`` are known
-provider-reported non-cached deltas and can include calls made before a
-fallback; they are not the final model's exclusive usage and are not the
-cached agent's cumulative session counters. Cached input is excluded from
-``tokens_turn`` but remains part of ``context_window`` because cached tokens
-still occupy the model context. ``tokens_turn`` becomes
-``tokens(turn,uncached,partial)`` when Hermes sees logical calls without usable usage.
-``cache_hit`` uses cache-read tokens divided by all prompt-input buckets
-(``uncached + cache-read + cache-write``); cache writes are prompt tokens but
-are not cache hits. It becomes ``cache(turn,partial)`` under partial coverage.
-Providers without trustworthy cache-read telemetry omit it instead of showing
-a synthetic 0%. Context fields are likewise omitted unless the gateway proves
-the value came from this turn's fully usage-covered final call.
-When no usable positive-prompt usage exists, it is skipped rather than shown
-as a synthetic zero.
-
-Per-platform overrides live under ``display.platforms.<platform>.runtime_footer``.
-Users can toggle the global setting with ``/footer on|off`` from both the CLI
-and any gateway platform.
-
-The footer is appended to the final response text in ``gateway/run.py`` right
-before returning the response to the adapter send path — so it only lands on
-the final message a user sees, not on tool-progress updates or streaming
-partials.  When streaming is on and the final text has already been delivered
-piecemeal, the delivery path sends the footer as a separate trailing message.
+The final response carries the footer. Streaming sends it after the reply; a footer-only
+reply can use the last delivered photo's caption when the adapter's UTF-16 limit permits.
+FooteredReply preserves the footer through the adapter's media delivery path.
 """
-
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Optional
+from urllib.parse import quote
 
 if TYPE_CHECKING:
     from gateway.session import SessionSource
@@ -261,7 +218,7 @@ def _gateway_turn_runtime_metadata(
 
 def _gateway_runtime_footer_line(
     agent_result: dict[str, Any],
-    source: "SessionSource",
+    source: SessionSource,
     *,
     turn_seconds: Optional[float] = None,
 ) -> str:
@@ -291,6 +248,8 @@ def _gateway_runtime_footer_line(
         cache_usage_status=agent_result.get("cache_usage_status"),
         context_usage_status=agent_result.get("context_usage_status"),
         reasoning_effort=agent_result.get("reasoning_effort"),
+        requested_model=agent_result.get("requested_model"),
+        served_model=agent_result.get("served_model"),
     )
 
 
@@ -392,138 +351,79 @@ def _format_latency(seconds: float) -> str:
     return f"{m}m{sec:02d}s"
 
 
+def _reported_counter(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _context_field(field: str, tokens: int, length: Optional[int], status: Optional[str]) -> str:
+    if status != "reported" or not length or length <= 0 or tokens < 0:
+        return ""
+    percent = max(0, min(100, round(tokens / length * 100)))
+    if field == "context_pct":
+        return f"{percent}%"
+    return f"ctx(last):{_format_token_count(tokens)}/{_format_token_count(length)} ({percent}%)"
+
+
+def _counter_field(value: Any, unit: str, status: Optional[str]) -> str:
+    return f"{_format_token_count(value)} {unit}" if status == "reported" and _reported_counter(value) else ""
+
+
+def _turn_tokens_field(tokens_in: Any, tokens_out: Any, status: Optional[str]) -> str:
+    if status not in {"reported", "reported_partial"}:
+        return ""
+    reported = [
+        f"{_format_token_count(value)} {unit}"
+        for value, unit in ((tokens_in, "in"), (tokens_out, "out")) if _reported_counter(value)
+    ]
+    if not reported:
+        return ""
+    label = "tokens(turn,uncached,partial)" if status == "reported_partial" else "tokens(turn,uncached)"
+    return f"{label}:{'/'.join(reported)}"
+
+
+def _cache_field(tokens_in: Any, read: Any, written: Any, status: Optional[str]) -> str:
+    buckets = tokens_in, read, written
+    if status not in {"reported", "reported_partial"} or not all(_reported_counter(value) for value in buckets):
+        return ""
+    total = sum(buckets)
+    if total <= 0:
+        return ""
+    label = "cache(turn,partial)" if status == "reported_partial" else "cache(turn)"
+    return f"{label}:{round(read / total * 100)}%"
+
+
+def _served_field(model: Optional[str], requested: Optional[str], served: Optional[str]) -> str:
+    requested = requested or model
+    alias = _model_short(requested)
+    return f"{alias} → {served}" if served and served not in (alias, requested) else ""
+
+
 def format_runtime_footer(
-    *,
-    model: Optional[str],
-    context_tokens: int,
-    context_length: Optional[int],
-    cwd: Optional[str] = None,
-    turn_seconds: Optional[float] = None,
-    tokens_in: Optional[int] = None,
-    tokens_out: Optional[int] = None,
-    cache_read_tokens: Optional[int] = None,
-    cache_write_tokens: Optional[int] = None,
-    token_usage_status: Optional[str] = None,
-    cache_usage_status: Optional[str] = None,
-    context_usage_status: Optional[str] = "reported",
-    reasoning_effort: Optional[str] = None,
+    *, model: Optional[str], context_tokens: int, context_length: Optional[int],
+    cwd: Optional[str] = None, turn_seconds: Optional[float] = None,
+    tokens_in: Optional[int] = None, tokens_out: Optional[int] = None,
+    cache_read_tokens: Optional[int] = None, cache_write_tokens: Optional[int] = None,
+    token_usage_status: Optional[str] = None, cache_usage_status: Optional[str] = None,
+    context_usage_status: Optional[str] = "reported", reasoning_effort: Optional[str] = None,
+    requested_model: Optional[str] = None, served_model: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
-    """Render the footer line, or return "" if no fields have data.
-
-    Fields are skipped silently when their underlying data is missing — a
-    partially-populated footer is better than a line with ``?%`` or empty slots.
-    """
-    parts: list[str] = []
-    for field in fields:
-        if field == "model":
-            m = _model_short(model)
-            if m:
-                parts.append(m)
-        elif field == "model_last":
-            m = _model_short(model)
-            if m:
-                parts.append(f"model(last):{m}")
-        elif field == "context_pct":
-            if (
-                context_usage_status == "reported"
-                and context_length
-                and context_length > 0
-                and context_tokens >= 0
-            ):
-                pct = max(0, min(100, round((context_tokens / context_length) * 100)))
-                parts.append(f"{pct}%")
-        elif field == "context_window":
-            if (
-                context_usage_status == "reported"
-                and context_length
-                and context_length > 0
-                and context_tokens >= 0
-            ):
-                pct = max(0, min(100, round((context_tokens / context_length) * 100)))
-                parts.append(
-                    "ctx(last):"
-                    f"{_format_token_count(context_tokens)}/"
-                    f"{_format_token_count(context_length)} ({pct}%)"
-                )
-        elif field == "latency":
-            # Wall-clock turn duration. Skipped when the caller supplied no
-            # timing (call sites that don't measure) or the value is negative.
-            if turn_seconds is not None and turn_seconds >= 0:
-                parts.append(_format_latency(turn_seconds))
-        elif field == "cwd":
-            rel = _home_relative_cwd(cwd or _env_cwd())
-            if rel:
-                parts.append(rel)
-        elif field == "tokens_in":
-            if (
-                token_usage_status == "reported"
-                and isinstance(tokens_in, int)
-                and not isinstance(tokens_in, bool)
-                and tokens_in >= 0
-            ):
-                parts.append(f"{_format_token_count(tokens_in)} in")
-        elif field == "tokens_out":
-            if (
-                token_usage_status == "reported"
-                and isinstance(tokens_out, int)
-                and not isinstance(tokens_out, bool)
-                and tokens_out >= 0
-            ):
-                parts.append(f"{_format_token_count(tokens_out)} out")
-        elif field == "tokens_turn":
-            reported: list[str] = []
-            if (
-                isinstance(tokens_in, int)
-                and not isinstance(tokens_in, bool)
-                and tokens_in >= 0
-            ):
-                reported.append(f"{_format_token_count(tokens_in)} in")
-            if (
-                isinstance(tokens_out, int)
-                and not isinstance(tokens_out, bool)
-                and tokens_out >= 0
-            ):
-                reported.append(f"{_format_token_count(tokens_out)} out")
-            if reported and token_usage_status in {
-                "reported",
-                "reported_partial",
-            }:
-                label = (
-                    "tokens(turn,uncached,partial)"
-                    if token_usage_status == "reported_partial"
-                    else "tokens(turn,uncached)"
-                )
-                parts.append(f"{label}:{'/'.join(reported)}")
-        elif field == "cache_hit":
-            cache_buckets = (tokens_in, cache_read_tokens, cache_write_tokens)
-            if (
-                cache_usage_status in {"reported", "reported_partial"}
-                and all(
-                    isinstance(value, int)
-                    and not isinstance(value, bool)
-                    and value >= 0
-                    for value in cache_buckets
-                )
-            ):
-                prompt_tokens = sum(cache_buckets)
-                if prompt_tokens > 0:
-                    cache_pct = round((cache_read_tokens / prompt_tokens) * 100)
-                    label = (
-                        "cache(turn,partial)"
-                        if cache_usage_status == "reported_partial"
-                        else "cache(turn)"
-                    )
-                    parts.append(f"{label}:{cache_pct}%")
-        elif field == "reasoning_effort":
-            if reasoning_effort:
-                parts.append(f"effort(req,last):{reasoning_effort}")
-        # Unknown field names are silently ignored.
-
-    if not parts:
-        return ""
-
-    return _SEP.join(parts)
+    """Render configured fields only when their underlying telemetry is available."""
+    renderers = {
+        "model": lambda: _model_short(model),
+        "model_last": lambda: f"model(last):{_model_short(model)}" if model else "",
+        "served_model": lambda: _served_field(model, requested_model, served_model),
+        "context_pct": lambda: _context_field("context_pct", context_tokens, context_length, context_usage_status),
+        "context_window": lambda: _context_field("context_window", context_tokens, context_length, context_usage_status),
+        "latency": lambda: _format_latency(turn_seconds) if turn_seconds is not None and turn_seconds >= 0 else "",
+        "cwd": lambda: _home_relative_cwd(cwd or _env_cwd()),
+        "tokens_in": lambda: _counter_field(tokens_in, "in", token_usage_status),
+        "tokens_out": lambda: _counter_field(tokens_out, "out", token_usage_status),
+        "tokens_turn": lambda: _turn_tokens_field(tokens_in, tokens_out, token_usage_status),
+        "cache_hit": lambda: _cache_field(tokens_in, cache_read_tokens, cache_write_tokens, cache_usage_status),
+        "reasoning_effort": lambda: f"effort(req,last):{reasoning_effort}" if reasoning_effort else "",
+    }
+    return _SEP.join(value for field in fields if (render := renderers.get(field)) and (value := render()))
 
 
 def build_footer_line(
@@ -543,6 +443,8 @@ def build_footer_line(
     cache_usage_status: Optional[str] = None,
     context_usage_status: Optional[str] = "reported",
     reasoning_effort: Optional[str] = None,
+    requested_model: Optional[str] = None,
+    served_model: Optional[str] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -571,5 +473,81 @@ def build_footer_line(
         cache_usage_status=cache_usage_status,
         context_usage_status=context_usage_status,
         reasoning_effort=reasoning_effort,
+        requested_model=requested_model,
+        served_model=served_model,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )
+
+
+class FooteredReply(str):
+    """A final reply whose text ends with ``\n\n<runtime_footer>``. Plain text everywhere; any
+    rewrite yields a plain ``str`` again, so the footer then simply stays in the text."""
+    runtime_footer: str
+
+    def __new__(cls, text: str, footer: str):
+        instance = super().__new__(cls, f"{text}\n\n{footer}")
+        instance.runtime_footer = footer
+        return instance
+
+
+class _FooterCaption(str):
+    """A photo caption that carries the runtime footer (``caption_with_footer``)."""
+    runtime_footer: str
+
+
+def caption_with_footer(adapter: Any, images: list, footer: str) -> tuple[list, bool]:
+    """``(images, True)`` with ``footer`` on the last ``(url, alt)`` photo's caption when the
+    adapter declares ``media_caption_limit`` and the caption fits it (UTF-16 units). Never on an
+    animation: a GIF goes out on its own path, whose failure the batch result does not list."""
+    limit = int(getattr(adapter, "media_caption_limit", 0) or 0)
+    target = next((i for i in range(len(images) - 1, -1, -1)
+                   if not adapter._is_animation_url(images[i][0])), None) if footer and limit > 0 else None
+    if target is None:
+        return images, False
+    url, alt = images[target]
+    caption = _FooterCaption(f"{alt}\n\n{footer}" if alt else footer)
+    if len(caption.encode("utf-16-le")) // 2 > limit:
+        return images, False
+    caption.runtime_footer = footer
+    return [*images[:target], (url, caption), *images[target + 1:]], True
+
+
+def caption_landed(result: Any, images: list) -> bool:
+    """The photo whose caption carries the footer was delivered, or is queued for a re-upload that
+    carries it (``raw_response["deferred"]``: flood control; a separate footer would repeat it).
+    ``success`` means at least one photo landed, so that photo listed in ``raw_response["failed"]``
+    (``(path_or_url, error)``) took the footer with it. False when no caption carries it."""
+    url = next((u for u, alt in images if getattr(alt, "runtime_footer", "")), None)
+    raw = getattr(result, "raw_response", None)
+    raw = raw if isinstance(raw, dict) else {}
+    if url is None or url in (raw.get("deferred") or ()):
+        return url is not None
+    if not getattr(result, "success", False):
+        return False
+    from urllib.parse import unquote
+    lost = {str(item[0]) for item in raw.get("failed") or () if item}
+    return url not in lost and unquote(url.removeprefix("file://")) not in lost
+
+
+async def send_footer_unless_captioned(adapter: Any, chat_id: str, images: list, result: Any,
+                                       metadata: Any, record_delivery: Any) -> None:
+    """Non-streamed send path: the footer a photo caption carried, sent as its own message (as
+    before #74547) when that photo did not land."""
+    footer = next((alt.runtime_footer for _u, alt in images if getattr(alt, "runtime_footer", "")), "")
+    if footer and not caption_landed(result, images):
+        record_delivery(await adapter._send_with_retry(chat_id=chat_id, content=footer, metadata=metadata))
+
+
+def footer_onto_photo_caption(adapter: Any, extracted: Any, image_exts: Iterable[str]) -> Any:
+    """The adapter send path's ``_ExtractedResponse``, with a footer-only text moved onto the last
+    photo's caption (MEDIA photos join the photo batch): otherwise the footer is its own message."""
+    footer = getattr(extracted.pre_extract, "runtime_footer", "")
+    if not footer or extracted.force_document_attachments or extracted.text_content.strip() != footer.strip():
+        return extracted
+    photos = [p for p, voice in extracted.media_files if not voice and Path(p).suffix.lower() in image_exts]
+    images, attached = caption_with_footer(
+        adapter, [*extracted.images, *((f"file://{quote(p)}", "") for p in photos)], footer)
+    if not attached:
+        return extracted
+    return dataclasses.replace(extracted, text_content="", images=images,
+                               media_files=[m for m in extracted.media_files if m[0] not in photos])

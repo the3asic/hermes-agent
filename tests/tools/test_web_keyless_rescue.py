@@ -88,7 +88,7 @@ class TestEligibility:
             name = "firecrawl"
 
         monkeypatch.setattr(
-            "agent.web_search_provider.get_provider_env",
+            "plugins.web.firecrawl.provider._env",
             lambda name: (
                 "http://127.0.0.1:3002"
                 if name == "FIRECRAWL_API_URL"

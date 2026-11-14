@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import inspect
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -52,15 +53,16 @@ class SummaryDispatchMixin:
         from agent.auxiliary_task_config import authoritative_auxiliary_task
 
         call_kwargs["task"] = authoritative_auxiliary_task(call_kwargs.get("task") or "compression")
-        for key, value in (
-            ("provider", self.provider),
-            ("model", self.model),
-            ("base_url", self.base_url),
-            ("api_key", self.api_key),
-            ("api_mode", getattr(self, "api_mode", "")),
-        ):
-            if value:
+        runtime = call_kwargs.get("main_runtime")
+        if not isinstance(runtime, dict):
+            runtime = self._summary_main_runtime()
+        route = {key: runtime.get(key) for key in ("provider", "model", "base_url", "api_key", "api_mode")}
+        route["reasoning_config"] = copy.deepcopy(runtime.get("reasoning_config"))
+        for key, value in route.items():
+            call_kwargs.pop(key, None)
+            if value or key == "reasoning_config":
                 call_kwargs[key] = value
+        call_kwargs["_pinned_compression_route"] = route
 
     def _summarize_window(
         self, messages: list[dict[str, Any]], turns_to_summarize: list[dict[str, Any]], scan: _HandoffScan,

@@ -10,7 +10,7 @@ import threading
 
 import httpx
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 import agent.auxiliary_client as aux
 from agent.context_compressor import ContextCompressor, pin_summary_route
@@ -308,7 +308,7 @@ def test_nested_disabled_override_wins_over_profile_effort(wire):
     make, requests, configure, _ = wire
     configure({"extra_body": {"reasoning": {"enabled": False}}})
     compress(make())
-    assert "reasoning" not in requests[0]
+    assert requests[0]["reasoning"]["effort"] == "none"
 
 
 def test_turn_finalizer_micro_summary_uses_current_session(wire):

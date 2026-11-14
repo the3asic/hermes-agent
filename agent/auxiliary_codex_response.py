@@ -45,13 +45,14 @@ def _parse_codex_final_response(
     tool_calls_raw = message.tool_calls
     usage = None
     resp_usage = getattr(final, "usage", None)
-    if resp_usage:
-        def _u(key: str) -> int:
-            return getattr(resp_usage, key, 0) or (resp_usage.get(key, 0) if isinstance(resp_usage, dict) else 0)
-        usage = SimpleNamespace(
-            prompt_tokens=_u("input_tokens"), completion_tokens=_u("output_tokens"),
-            total_tokens=_u("total_tokens"))
+    if resp_usage is not None:
+        usage = SimpleNamespace()
+        # SDK schema defaults are not provider telemetry. Preserve field presence
+        # for totals and details, including explicitly reported null and zero.
         for source_field, target_field in (
+            ("input_tokens", "prompt_tokens"),
+            ("output_tokens", "completion_tokens"),
+            ("total_tokens", "total_tokens"),
             ("input_tokens_details", "prompt_tokens_details"),
             ("output_tokens_details", "completion_tokens_details"),
         ):

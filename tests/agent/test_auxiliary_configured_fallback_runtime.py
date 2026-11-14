@@ -175,7 +175,8 @@ def test_sync_persistent_5xx_walks_configured_chain_and_preserves_image(
     assert route_info["provider"] == _PROVIDER
     assert route_info["model"] == _FINAL_MODEL
     assert route_info["failed_model"] == _PRIMARY_MODEL
-    assert "transient HTTP error" in route_info["failure"]
+    expected_reason = "server error" if status_code == 502 else "provider overloaded"
+    assert route_info["failure"] == f"{expected_reason}: persistent upstream failure"
     main_fallback.assert_not_called()
 
 
@@ -230,7 +231,7 @@ async def test_async_persistent_503_walks_configured_chain_and_preserves_image()
     assert route_info["provider"] == _PROVIDER
     assert route_info["model"] == _FINAL_MODEL
     assert route_info["failed_model"] == _PRIMARY_MODEL
-    assert "transient HTTP error" in route_info["failure"]
+    assert route_info["failure"] == "provider overloaded: upstream service unavailable"
     main_fallback.assert_not_called()
 
 

@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import logging
-import os
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional
+
+from gateway.platforms._shared import get_scoped_secret, platform_gate_env
 
 if TYPE_CHECKING:
     from discord import Message as DiscordMessage
@@ -19,7 +20,7 @@ class DiscordContextMixin:
         text avoids duplicating large or credential-bearing text in the model
         transcript while preserving tool access to the attachment.
         """
-        env_value = os.getenv("DISCORD_INLINE_TEXT_ATTACHMENTS")
+        env_value = get_scoped_secret("DISCORD_INLINE_TEXT_ATTACHMENTS")
         if env_value is not None:
             return env_value.lower() not in {"false", "0", "no", "off", ""}
         configured = self.config.extra.get("inline_text_attachments")
@@ -36,7 +37,7 @@ class DiscordContextMixin:
         Voice-linked free-response is transient and intentionally excluded;
         this setting applies only to channels named in free_response_channels.
         """
-        env_value = os.getenv("DISCORD_HISTORY_BACKFILL_FREE_RESPONSE")
+        env_value = get_scoped_secret("DISCORD_HISTORY_BACKFILL_FREE_RESPONSE")
         if env_value is not None:
             return env_value.lower() in {"true", "1", "yes", "on"}
         configured = self.config.extra.get("history_backfill_free_response")
@@ -52,7 +53,7 @@ class DiscordContextMixin:
         configured = self.config.extra.get("history_backfill")
         if configured is not None:
             return self._extra_or_env_flag("history_backfill", "DISCORD_HISTORY_BACKFILL", "true", truthy=True)
-        return os.getenv("DISCORD_HISTORY_BACKFILL", "true").lower() in {"true", "1", "yes"}
+        return platform_gate_env("DISCORD_HISTORY_BACKFILL", "true").lower() in {"true", "1", "yes"}
 
 
     def _discord_history_backfill_limit(self) -> int:
@@ -63,7 +64,7 @@ class DiscordContextMixin:
                 return int(configured)
             except (ValueError, TypeError):
                 pass
-        raw = os.getenv("DISCORD_HISTORY_BACKFILL_LIMIT", "50")
+        raw = platform_gate_env("DISCORD_HISTORY_BACKFILL_LIMIT", "50")
         try:
             return int(raw)
         except (ValueError, TypeError):
@@ -71,13 +72,16 @@ class DiscordContextMixin:
 
 
     async def _fetch_channel_context(
-        self, channel: Any, before: "DiscordMessage", reply_target: Optional[Any] = None,
+        self, channel: Any, before: DiscordMessage, reply_target: Optional[Any] = None,
         include_self_boundary: bool = False,
     ) -> str:
         """Fetch recent channel messages; returns a ``[Recent channel messages]`` block or "".
         Scans back from *before* to the bot's own message or ``history_backfill_limit``; with
         ``reply_target`` a second scan ending at the target is merged chronologically, deduped by ID."""
-        from plugins.platforms.discord.adapter import discord, _looks_like_nonconversational_history_message, _Snowflake
+        from plugins.platforms.discord.adapter import (
+            discord, _looks_like_nonconversational_history_message, _Snowflake,
+            is_automated_message, tag_safe_display_name,
+        )
 
         limit = self._discord_history_backfill_limit()
         if limit <= 0:
@@ -109,7 +113,7 @@ class DiscordContextMixin:
                 ):
                     return None
                 # DISCORD_ALLOW_BOTS: for history, "mentions" counts as "all" (context, not response).
-                is_bot_author = getattr(msg.author, "bot", False)
+                is_bot_author = is_automated_message(msg)
                 if (is_bot_author and msg.author != self._client.user and not include_other_bots):
                     return None
                 if not content and msg.attachments:
@@ -117,8 +121,9 @@ class DiscordContextMixin:
                 if not content:
                     return None
                 name = (
-                    getattr(msg.author, "display_name", None)
-                    or getattr(msg.author, "name", None)
+                    tag_safe_display_name(getattr(msg.author, "display_name", None) or "")
+                    or tag_safe_display_name(getattr(msg.author, "name", None) or "")
+                    or str(getattr(msg.author, "id", "") or "")
                     or "unknown"
                 )
                 if is_bot_author:
@@ -136,7 +141,7 @@ class DiscordContextMixin:
                         has_unverified = True
                 return f"{trust_tag}[{name}] {content}"
             # ── Primary window: recent channel activity since the last bot turn ──
-            collected: List[Tuple[str, str]] = []  # (message_id, line)
+            collected: list[tuple[str, str]] = []  # (message_id, line)
             seen_ids: set = set()
             included_self_boundary = seen_nonself_after_boundary = False
             # oldest_first=False explicitly — discord.py 2.x flips the default to True when `after=`
@@ -176,7 +181,7 @@ class DiscordContextMixin:
                 if mid:
                     seen_ids.add(mid)
             # Reply window: context around the replied-to message; deliberately NOT self-partitioned.
-            reply_collected: List[Tuple[str, str]] = []
+            reply_collected: list[tuple[str, str]] = []
             reply_target_id = str(getattr(reply_target, "id", "")) if reply_target else ""
             if reply_target is not None and reply_target_id and reply_target_id not in seen_ids:
                 # Modest cap: anchored context, not a full backfill.
@@ -204,7 +209,7 @@ class DiscordContextMixin:
             # history is newest-first; reverse each window, reply context (older) first.
             collected.reverse()
             reply_collected.reverse()
-            blocks: List[str] = []
+            blocks: list[str] = []
             if has_unverified:
                 blocks.append(
                     "[Messages prefixed with [unverified] are from people whose "

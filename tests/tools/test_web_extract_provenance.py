@@ -48,7 +48,7 @@ def _failed(urls, *, error="upstream exploded"):
 
 
 def _assert_timestamp(value):
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(value)
     assert parsed.utcoffset() is not None
 
 
@@ -76,13 +76,13 @@ def _install(
     monkeypatch.setattr(
         "agent.web_search_registry.get_provider", lambda name: provider
     )
-    monkeypatch.setattr(web_tools_extract, "_rescue_eligible", lambda selected: rescue_eligible)
+    monkeypatch.setattr(web_tools_extract, "_rescue_eligible", lambda selected, capability=None: rescue_eligible)
 
     async def _safe(_url):
         return True
 
     monkeypatch.setattr(web_tools, "async_is_safe_url", _safe)
-    monkeypatch.setattr(web_tools_extract, "async_is_safe_url", _safe)
+    monkeypatch.setattr("tools.url_safety.async_is_safe_url", _safe)
     monkeypatch.setattr(
         "tools.website_policy.check_website_access", lambda url: None
     )

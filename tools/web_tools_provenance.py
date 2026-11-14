@@ -357,7 +357,7 @@ _EXTRACT_CACHE_RETRIEVED_AT_FIELD = "_hermes_extract_cache_retrieved_at"
 
 
 def _build_extract_provenance(
-    results: List[Dict[str, Any]],
+    results: list[dict[str, Any]],
     *,
     requested_backend: Optional[str],
     requested_count: int,
@@ -367,7 +367,7 @@ def _build_extract_provenance(
     network_retrieved_at: str,
     fallback_attempted: bool,
     fallback_used: bool,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build model-visible extract routing facts without copying page data.
 
     ``retrieved_at`` is the oldest successful source-retrieval time represented
@@ -476,7 +476,7 @@ def _extract_error_response(
     success_false: bool = False,
 ) -> str:
     """Return a legacy-compatible error envelope with mandatory provenance."""
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "provenance": _build_extract_provenance(
             [],
             requested_backend=requested_backend,

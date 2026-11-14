@@ -152,7 +152,7 @@ class TestNormalizeTavilyDocuments:
 class TestWebExtractCacheAttribution:
     """Only cache content under the URL reported by the extract provider."""
 
-    def test_partial_result_caches_under_its_own_requested_url(self):
+    def test_unexpected_result_refuses_the_batch_without_cache_writes(self):
         from tools import web_tools_extract as wte
 
         class _PartialProvider:
@@ -166,13 +166,14 @@ class TestWebExtractCacheAttribution:
 
         urls = ["https://example.com/first", "https://example.com/second"]
         with patch("tools.web_result_cache.extract_cache_put") as cache_put:
-            asyncio.run(wte._dispatch_extract(_PartialProvider(), urls, None))
+            results = asyncio.run(wte._dispatch_extract(_PartialProvider(), urls, None))
 
-        cache_put.assert_called_once_with(
-            "https://example.com/second", "second page", "Second", format=None, provider="tavily"
-        )
+        assert [row["url"] for row in results] == urls
+        assert all(row["error"] == wte._EXTRACT_RESULT_MAPPING_ERROR for row in results)
+        assert all(row["content"] == "" for row in results)
+        cache_put.assert_not_called()
 
-    def test_redirected_page_caches_under_requested_source_url(self):
+    def test_redirected_page_caches_under_requested_source_url(self, public_dns):
         """Keenable/Firecrawl report the post-redirect address in ``url`` and the requested URL in
         ``metadata.sourceURL``; the cache key must stay the requested URL, never the redirect target.
         The first requested page is omitted, so positional pairing would file the redirected page
@@ -190,9 +191,14 @@ class TestWebExtractCacheAttribution:
         with patch("tools.web_result_cache.extract_cache_put") as cache_put:
             asyncio.run(wte._dispatch_extract(_RedirectProvider(), urls, None))
 
-        cache_put.assert_called_once_with(
-            "https://example.com/old", "moved page", "Moved", format=None, provider="keenable"
-        )
+        cache_put.assert_called_once()
+        assert cache_put.call_args.args == ("https://example.com/old", "moved page")
+        facts = cache_put.call_args.kwargs
+        assert facts["title"] == "Moved"
+        assert facts["provider"] == facts["served_by"] == "keenable"
+        assert facts["final_url"] == "https://www.example.com/moved"
+        from datetime import datetime
+        assert datetime.fromisoformat(facts["retrieved_at"]).utcoffset() is not None
 
 
 # ─── availability / auto-detect ───────────────────────────────────────────────

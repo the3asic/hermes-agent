@@ -7,7 +7,7 @@ import re
 import socket
 import threading
 import time
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from hermes_constants import get_hermes_home
 
@@ -145,7 +145,7 @@ class ProcessObservabilityMixin:
     def _write_observability_snapshot(
         self,
         *,
-        extra_sessions: Optional[List[ProcessSession]] = None,
+        extra_sessions: Optional[list[ProcessSession]] = None,
     ) -> None:
         """Atomically publish the ProcessRegistry-owned read-only snapshot.
 
